@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "path-planning-visualizer"
+version = "0.1.0b1"
+description = "Interactive desktop app for comparing path-planning algorithms on occupancy-grid maps."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "PyQt6",
+]
+
+[project.scripts]
+path-planning-visualizer = "path_planning_visualizer:main"
+
+[tool.setuptools]
+py-modules = ["path_planning_visualizer"]
