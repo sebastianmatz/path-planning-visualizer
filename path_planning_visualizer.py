@@ -1,5 +1,5 @@
 """
-Path Planning Visualizer Beta
+Path Planning Visualizer Beta (0.1.0b2)
 =============================
 
 Interactive desktop application for exploring and comparing path-planning
@@ -131,15 +131,37 @@ def clamp_point(p: Point, w: int, h: int) -> Point:
     return (x, y)
 
 
+def segment_points(a: Point, b: Point, samples: Optional[int] = None) -> List[Point]:
+    """Return rasterized sample points along a segment.
+
+    The default sampling is adaptive to segment length so collision checks do not
+    become looser on long segments.
+    """
+    dx = abs(int(b[0]) - int(a[0]))
+    dy = abs(int(b[1]) - int(a[1]))
+    adaptive_samples = max(dx, dy)
+    total_samples = max(1, adaptive_samples, samples or 0)
+
+    pts: List[Point] = []
+    for i in range(total_samples + 1):
+        t = i / total_samples
+        x = int(round(a[0] + t * (b[0] - a[0])))
+        y = int(round(a[1] + t * (b[1] - a[1])))
+        p = (x, y)
+        if not pts or pts[-1] != p:
+            pts.append(p)
+    return pts
+
+
 def line_collision_free(
     a: Point, 
     b: Point, 
     occ: OccupancyGrid, 
-    samples: int = 60
+    samples: Optional[int] = None
 ) -> bool:
     """Check if line segment from a to b is collision-free.
     
-    Uses linear interpolation to check multiple points along the line.
+    Uses adaptive rasterization to cover long segments robustly.
     
     Args:
         a: Start point of line segment
@@ -151,15 +173,165 @@ def line_collision_free(
         True if the entire line is collision-free
     """
     h, w = occ.shape
-    for i in range(samples + 1):
-        t = i / samples
-        x = int(round(a[0] + t * (b[0] - a[0])))
-        y = int(round(a[1] + t * (b[1] - a[1])))
+    for x, y in segment_points(a, b, samples=samples):
         if x < 0 or x >= w or y < 0 or y >= h:
             return False
         if occ[y, x]:
             return False
     return True
+
+
+def compute_path_length(path: List[Point]) -> float:
+    """Return geometric path length in pixels."""
+    if len(path) < 2:
+        return 0.0
+    return float(sum(dist(path[i], path[i + 1]) for i in range(len(path) - 1)))
+
+
+def compute_path_min_clearance(path: List[Point], clearance_field: np.ndarray) -> float:
+    """Return the minimum obstacle clearance along a path in pixels."""
+    if len(path) < 2:
+        return 0.0
+
+    min_clearance = float("inf")
+    for i in range(len(path) - 1):
+        for x, y in segment_points(path[i], path[i + 1]):
+            min_clearance = min(min_clearance, float(clearance_field[y, x]))
+
+    return 0.0 if min_clearance == float("inf") else min_clearance
+
+
+def iter_path_pixels(path: List[Point]) -> List[Point]:
+    """Return deduplicated rasterized pixels along a path."""
+    if not path:
+        return []
+    if len(path) == 1:
+        return [path[0]]
+
+    pts: List[Point] = []
+    for i in range(len(path) - 1):
+        for p in segment_points(path[i], path[i + 1]):
+            if not pts or pts[-1] != p:
+                pts.append(p)
+    return pts
+
+
+def compute_path_mean_clearance(path: List[Point], clearance_field: np.ndarray) -> float:
+    """Return the mean obstacle clearance along a path in pixels."""
+    pixels = iter_path_pixels(path)
+    if not pixels:
+        return 0.0
+    values = [float(clearance_field[y, x]) for x, y in pixels]
+    return float(np.mean(values))
+
+
+def resample_path_points(path: List[Point], spacing: float = 4.0) -> List[Tuple[float, float]]:
+    """Resample a path polyline with approximately uniform spacing."""
+    if not path:
+        return []
+    if len(path) == 1:
+        return [(float(path[0][0]), float(path[0][1]))]
+
+    pts = np.array(path, dtype=np.float64)
+    deltas = np.diff(pts, axis=0)
+    seg_lens = np.linalg.norm(deltas, axis=1)
+    total_len = float(np.sum(seg_lens))
+    if total_len <= 1e-6:
+        return [(float(path[0][0]), float(path[0][1]))]
+
+    sample_count = max(2, int(np.ceil(total_len / max(1e-6, spacing))) + 1)
+    targets = np.linspace(0.0, total_len, sample_count)
+    cum = np.concatenate(([0.0], np.cumsum(seg_lens)))
+    resampled = np.zeros((sample_count, 2), dtype=np.float64)
+
+    seg_idx = 0
+    for i, t in enumerate(targets):
+        while seg_idx < len(seg_lens) - 1 and t > cum[seg_idx + 1]:
+            seg_idx += 1
+        seg_len = seg_lens[seg_idx]
+        if seg_len <= 1e-6:
+            resampled[i] = pts[seg_idx]
+            continue
+        local_t = (t - cum[seg_idx]) / seg_len
+        resampled[i] = pts[seg_idx] + local_t * deltas[seg_idx]
+
+    return [(float(p[0]), float(p[1])) for p in resampled]
+
+
+def compute_path_smoothness(path: List[Point], spacing: float = 4.0) -> float:
+    """Return an average squared turning-angle smoothness score in rad^2.
+
+    Lower is smoother. The path is resampled first so the metric is less
+    dependent on the original waypoint density.
+    """
+    samples = resample_path_points(path, spacing=spacing)
+    if len(samples) < 3:
+        return 0.0
+
+    turn_angles: List[float] = []
+    for i in range(1, len(samples) - 1):
+        p_prev = np.array(samples[i - 1], dtype=np.float64)
+        p_curr = np.array(samples[i], dtype=np.float64)
+        p_next = np.array(samples[i + 1], dtype=np.float64)
+
+        v1 = p_curr - p_prev
+        v2 = p_next - p_curr
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+        if n1 <= 1e-6 or n2 <= 1e-6:
+            continue
+
+        cos_angle = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+        turn_angles.append(float(np.arccos(cos_angle)))
+
+    if not turn_angles:
+        return 0.0
+    return float(np.mean(np.square(turn_angles)))
+
+
+def compute_path_metrics(path: List[Point], clearance_field: Optional[np.ndarray]) -> PathMetrics:
+    """Compute the main path-quality metrics used in the UI."""
+    length_px = compute_path_length(path)
+    if clearance_field is None:
+        return PathMetrics(length_px=length_px, smoothness=compute_path_smoothness(path))
+
+    return PathMetrics(
+        length_px=length_px,
+        min_clearance_px=compute_path_min_clearance(path, clearance_field),
+        mean_clearance_px=compute_path_mean_clearance(path, clearance_field),
+        smoothness=compute_path_smoothness(path),
+    )
+
+
+def shortcut_path(path: List[Point], occ: OccupancyGrid, max_passes: int = 2) -> List[Point]:
+    """Greedily shortcut a polyline while keeping it collision-free."""
+    if len(path) < 3:
+        return list(path)
+
+    shortened = list(path)
+    for _ in range(max_passes):
+        improved = False
+        new_path = [shortened[0]]
+        i = 0
+
+        while i < len(shortened) - 1:
+            next_idx = i + 1
+            for j in range(len(shortened) - 1, i + 1, -1):
+                if line_collision_free(shortened[i], shortened[j], occ):
+                    next_idx = j
+                    break
+
+            if next_idx > i + 1:
+                improved = True
+            new_path.append(shortened[next_idx])
+            i = next_idx
+
+        shortened = new_path
+        if not improved:
+            break
+
+    return shortened
+
 
 # =============================================================================
 # Step Result Data Class
@@ -183,6 +355,16 @@ class StepResult:
     done: bool = False
     found_path: bool = False
     path_improved: bool = False
+
+
+@dataclass(frozen=True)
+class PathMetrics:
+    """Summary metrics for a final path."""
+
+    length_px: float
+    min_clearance_px: Optional[float] = None
+    mean_clearance_px: Optional[float] = None
+    smoothness: Optional[float] = None
 
 
 # =============================================================================
@@ -1036,7 +1218,7 @@ class CHOMPParamsWidget(QWidget):
         self.spin_smoothness_weight.setRange(0.0, 100.0)
         self.spin_smoothness_weight.setSingleStep(0.1)
         self.spin_smoothness_weight.setValue(1.0)
-        self.spin_smoothness_weight.setToolTip("Weight for smoothness cost (lower = smoother)")
+        self.spin_smoothness_weight.setToolTip("Weight for curvature reduction and smoothness")
         
         self.spin_obstacle_weight = QDoubleSpinBox()
         self.spin_obstacle_weight.setRange(0.0, 1000.0)
@@ -1048,6 +1230,12 @@ class CHOMPParamsWidget(QWidget):
         self.spin_obstacle_epsilon.setRange(1, 100)
         self.spin_obstacle_epsilon.setValue(20)
         self.spin_obstacle_epsilon.setToolTip("Distance field epsilon (obstacle influence range)")
+
+        self.spin_path_length_weight = QDoubleSpinBox()
+        self.spin_path_length_weight.setRange(0.0, 10.0)
+        self.spin_path_length_weight.setSingleStep(0.05)
+        self.spin_path_length_weight.setValue(0.0)
+        self.spin_path_length_weight.setToolTip("Optional penalty for overly long detours")
         
         layout.addRow("Waypoints:", self.spin_num_points)
         layout.addRow("Max iterations:", self.spin_max_iters)
@@ -1055,6 +1243,7 @@ class CHOMPParamsWidget(QWidget):
         layout.addRow("Smoothness weight:", self.spin_smoothness_weight)
         layout.addRow("Obstacle weight:", self.spin_obstacle_weight)
         layout.addRow("Obstacle epsilon:", self.spin_obstacle_epsilon)
+        layout.addRow("Path length weight:", self.spin_path_length_weight)
         
         self.setLayout(layout)
     
@@ -1066,6 +1255,7 @@ class CHOMPParamsWidget(QWidget):
             'smoothness_weight': self.spin_smoothness_weight.value(),
             'obstacle_weight': self.spin_obstacle_weight.value(),
             'obstacle_epsilon': self.spin_obstacle_epsilon.value(),
+            'path_length_weight': self.spin_path_length_weight.value(),
         }
 
 
@@ -1083,7 +1273,7 @@ class CHOMPPlanner(BasePlanner):
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 50, max_iters: int = 500, learning_rate: float = 1.0,
                  smoothness_weight: float = 1.0, obstacle_weight: float = 100.0,
-                 obstacle_epsilon: int = 20,
+                 obstacle_epsilon: int = 20, path_length_weight: float = 0.2,
                  init_trajectory: Optional[List[Tuple[int, int]]] = None):
         super().__init__(occ, start, goal)
         
@@ -1093,6 +1283,7 @@ class CHOMPPlanner(BasePlanner):
         self.smoothness_weight = smoothness_weight
         self.obstacle_weight = obstacle_weight
         self.obstacle_epsilon = obstacle_epsilon
+        self.path_length_weight = path_length_weight
         
         # Random generator for perturbations
         self.rng = np.random.default_rng(42)
@@ -1113,6 +1304,17 @@ class CHOMPPlanner(BasePlanner):
         self.converged = False
         self.best_trajectory = self.trajectory.copy()
         self.best_cost = float('inf')
+        self.best_valid_trajectory: Optional[np.ndarray] = None
+        self.best_valid_cost = float('inf')
+        self.best_valid_length = float('inf')
+        self.path_length = self._trajectory_length(self.trajectory)
+        initial_total_cost, initial_obs_cost, initial_smooth_cost, _ = self._evaluate_trajectory(self.trajectory)
+        self.total_cost = initial_total_cost
+        self.obs_cost = initial_obs_cost
+        self.smooth_cost = initial_smooth_cost
+        self.best_cost = initial_total_cost
+        self._check_path_validity()
+        self._store_best_valid_trajectory(initial_total_cost)
         
     def _compute_distance_field(self) -> np.ndarray:
         """Compute signed distance field from obstacles."""
@@ -1230,6 +1432,116 @@ class CHOMPPlanner(BasePlanner):
         if resampled is None:
             return self._initialize_trajectory()
         return resampled
+
+    def _trajectory_length(self, trajectory: Optional[np.ndarray] = None) -> float:
+        """Return the geometric length of a trajectory polyline."""
+        traj = self.trajectory if trajectory is None else trajectory
+        if len(traj) < 2:
+            return 0.0
+        return float(np.sum(np.linalg.norm(np.diff(traj, axis=0), axis=1)))
+
+    def _trajectory_point_to_pixel(self, point: np.ndarray) -> Point:
+        """Convert a floating-point waypoint to the nearest valid pixel."""
+        x = int(np.clip(np.rint(point[0]), 0, self.w - 1))
+        y = int(np.clip(np.rint(point[1]), 0, self.h - 1))
+        return (x, y)
+
+    def _rounded_trajectory_point(self, index: int) -> Point:
+        """Return a trajectory waypoint rounded to the nearest pixel."""
+        return self._trajectory_point_to_pixel(self.trajectory[index])
+
+    def _is_local_trajectory_segment_valid(self, trajectory: np.ndarray, index: int) -> bool:
+        """Check local segment validity around a trajectory waypoint."""
+        prev_point = self._trajectory_point_to_pixel(trajectory[index - 1])
+        current_point = self._trajectory_point_to_pixel(trajectory[index])
+        next_point = self._trajectory_point_to_pixel(trajectory[index + 1])
+        return (
+            line_collision_free(prev_point, current_point, self.occ)
+            and line_collision_free(current_point, next_point, self.occ)
+        )
+
+    def _polish_valid_trajectory(self, trajectory: np.ndarray, passes: int = 20, alpha: float = 0.3) -> np.ndarray:
+        """Apply a light collision-checked smoothing pass to an already valid trajectory."""
+        polished = trajectory.copy()
+        n = len(polished)
+        if n < 3:
+            return polished
+
+        for _ in range(passes):
+            improved = False
+            for i in range(1, n - 1):
+                candidate = polished.copy()
+                candidate[i] = (1.0 - alpha) * polished[i] + alpha * 0.5 * (polished[i - 1] + polished[i + 1])
+                if self._is_local_trajectory_segment_valid(candidate, i):
+                    old_bend = np.linalg.norm(polished[i - 1] - 2 * polished[i] + polished[i + 1])
+                    new_bend = np.linalg.norm(candidate[i - 1] - 2 * candidate[i] + candidate[i + 1])
+                    if new_bend <= old_bend + 1e-6:
+                        polished[i] = candidate[i]
+                        improved = True
+            if not improved:
+                break
+
+        return polished
+
+    def _evaluate_trajectory(self, trajectory: np.ndarray) -> Tuple[float, float, float, float]:
+        """Return total, obstacle, smoothness, and path-length costs for a trajectory."""
+        n = len(trajectory)
+        total_smooth_cost = 0.0
+        total_obs_cost = 0.0
+
+        for i in range(1, n - 1):
+            x, y = trajectory[i]
+            accel_x = trajectory[i + 1, 0] - 2 * x + trajectory[i - 1, 0]
+            accel_y = trajectory[i + 1, 1] - 2 * y + trajectory[i - 1, 1]
+            total_smooth_cost += accel_x ** 2 + accel_y ** 2
+
+            obs_cost, _, _ = self._get_obstacle_cost_and_grad(x, y)
+            total_obs_cost += obs_cost
+
+        avg_smooth_cost = total_smooth_cost / max(1, n - 2)
+        avg_obs_cost = total_obs_cost / max(1, n - 2)
+        avg_path_segment_length = self._trajectory_length(trajectory) / max(1, n - 1)
+        total_cost = (
+            self.smoothness_weight * avg_smooth_cost
+            + self.obstacle_weight * avg_obs_cost
+            + self.path_length_weight * avg_path_segment_length
+        )
+        return total_cost, avg_obs_cost, avg_smooth_cost, avg_path_segment_length
+
+    def _store_best_valid_trajectory(self, total_cost: float) -> bool:
+        """Keep the best collision-free trajectory seen so far."""
+        if not self.found_path:
+            return False
+
+        current_length = self._trajectory_length(self.trajectory)
+        better = (
+            self.best_valid_trajectory is None
+            or current_length < self.best_valid_length - 1.0
+            or (
+                abs(current_length - self.best_valid_length) <= 1.0
+                and total_cost < self.best_valid_cost - 1e-6
+            )
+        )
+        if better:
+            self.best_valid_trajectory = self.trajectory.copy()
+            self.best_valid_cost = total_cost
+            self.best_valid_length = current_length
+            return True
+        return False
+
+    def _finalize_best_trajectory(self) -> None:
+        """Restore the best valid trajectory if one was found."""
+        if self.best_valid_trajectory is not None:
+            self.trajectory = self._polish_valid_trajectory(self.best_valid_trajectory.copy())
+            self._check_path_validity()
+            if not self.found_path:
+                self.trajectory = self.best_valid_trajectory.copy()
+                self.found_path = True
+            self.found_path = True
+            return
+
+        self.trajectory = self.best_trajectory.copy()
+        self._check_path_validity()
     
     def _get_obstacle_cost_and_grad(self, x: float, y: float) -> Tuple[float, float, float]:
         """Get obstacle cost and gradient at a point."""
@@ -1264,9 +1576,7 @@ class CHOMPPlanner(BasePlanner):
         
         if self.iteration >= self.max_iters:
             self.done = True
-            # Use best trajectory found
-            self.trajectory = self.best_trajectory.copy()
-            self._check_path_validity()
+            self._finalize_best_trajectory()
             return StepResult(done=True, found_path=self.found_path)
         
         self.iteration += 1
@@ -1275,36 +1585,35 @@ class CHOMPPlanner(BasePlanner):
         
         # Compute gradients for all internal points (not start/goal)
         grad = np.zeros((n, 2), dtype=np.float64)
-        
-        total_smooth_cost = 0.0
-        total_obs_cost = 0.0
-        
+
         for i in range(1, n - 1):  # Skip start and goal
             x, y = self.trajectory[i]
             
             # Smoothness gradient (using finite differences of acceleration)
             smooth_grad_x = 2 * (2 * x - self.trajectory[i-1, 0] - self.trajectory[i+1, 0])
             smooth_grad_y = 2 * (2 * y - self.trajectory[i-1, 1] - self.trajectory[i+1, 1])
-            
-            # Smoothness cost (acceleration magnitude squared)
-            accel_x = self.trajectory[i+1, 0] - 2 * x + self.trajectory[i-1, 0]
-            accel_y = self.trajectory[i+1, 1] - 2 * y + self.trajectory[i-1, 1]
-            smooth_cost = accel_x ** 2 + accel_y ** 2
-            
+
             # Obstacle gradient and cost
-            obs_cost, obs_grad_x, obs_grad_y = self._get_obstacle_cost_and_grad(x, y)
-            
+            _, obs_grad_x, obs_grad_y = self._get_obstacle_cost_and_grad(x, y)
+
+            prev_vec = self.trajectory[i] - self.trajectory[i - 1]
+            next_vec = self.trajectory[i] - self.trajectory[i + 1]
+            prev_len = np.linalg.norm(prev_vec) + 1e-6
+            next_len = np.linalg.norm(next_vec) + 1e-6
+            length_grad_x = prev_vec[0] / prev_len + next_vec[0] / next_len
+            length_grad_y = prev_vec[1] / prev_len + next_vec[1] / next_len
+
             # Combine gradients
-            grad[i, 0] = self.smoothness_weight * smooth_grad_x + self.obstacle_weight * obs_grad_x
-            grad[i, 1] = self.smoothness_weight * smooth_grad_y + self.obstacle_weight * obs_grad_y
-            
-            total_smooth_cost += smooth_cost
-            total_obs_cost += obs_cost
-        
-        # Normalize costs by number of points for stable convergence
-        avg_smooth_cost = total_smooth_cost / max(1, n - 2)
-        avg_obs_cost = total_obs_cost / max(1, n - 2)
-        total_cost = self.smoothness_weight * avg_smooth_cost + self.obstacle_weight * avg_obs_cost
+            grad[i, 0] = (
+                self.smoothness_weight * smooth_grad_x
+                + self.obstacle_weight * obs_grad_x
+                + self.path_length_weight * length_grad_x
+            )
+            grad[i, 1] = (
+                self.smoothness_weight * smooth_grad_y
+                + self.obstacle_weight * obs_grad_y
+                + self.path_length_weight * length_grad_y
+            )
         
         # Adaptive learning rate - reduce if oscillating
         lr = self.learning_rate
@@ -1324,20 +1633,19 @@ class CHOMPPlanner(BasePlanner):
         # Clamp to image bounds
         self.trajectory[:, 0] = np.clip(self.trajectory[:, 0], 0, self.w - 1)
         self.trajectory[:, 1] = np.clip(self.trajectory[:, 1], 0, self.h - 1)
-        
-        # Track best trajectory (based on low obstacle cost AND being collision-free)
+
+        total_cost, avg_obs_cost, avg_smooth_cost, avg_path_segment_length = self._evaluate_trajectory(self.trajectory)
+        self.path_length = avg_path_segment_length * max(1, n - 1)
+
         if total_cost < self.best_cost:
             self.best_cost = total_cost
             self.best_trajectory = self.trajectory.copy()
-        
+
         # Check if current path is valid (for live visualization)
         path_improved = False
         if self.iteration % 10 == 0 or avg_obs_cost < 0.5:
-            old_found = self.found_path
             self._check_path_validity()
-            if self.found_path and not old_found:
-                path_improved = True
-                self.best_trajectory = self.trajectory.copy()  # Save valid path
+            path_improved = self._store_best_valid_trajectory(total_cost)
         
         # Check convergence
         cost_change = abs(self.total_cost - total_cost) if self.total_cost != float('inf') else float('inf')
@@ -1349,32 +1657,36 @@ class CHOMPPlanner(BasePlanner):
         if cost_change < 0.01 and avg_obs_cost < 0.5 and self.iteration > 20:
             self.converged = True
             self.done = True
-            self._check_path_validity()
+            self._finalize_best_trajectory()
         
         # Create edge for visualization
         point_idx = (self.iteration % (n - 1))
         if point_idx < n - 1:
-            p1 = (int(self.trajectory[point_idx, 0]), int(self.trajectory[point_idx, 1]))
-            p2 = (int(self.trajectory[point_idx + 1, 0]), int(self.trajectory[point_idx + 1, 1]))
+            p1 = self._rounded_trajectory_point(point_idx)
+            p2 = self._rounded_trajectory_point(point_idx + 1)
             edge = (p1, p2)
         else:
             edge = None
         
-        return StepResult(edge=edge, path_improved=True)
+        return StepResult(edge=edge, path_improved=path_improved)
     
     def _check_path_validity(self):
         """Check if the final trajectory is collision-free."""
         for i in range(len(self.trajectory) - 1):
-            p1 = (int(self.trajectory[i, 0]), int(self.trajectory[i, 1]))
-            p2 = (int(self.trajectory[i + 1, 0]), int(self.trajectory[i + 1, 1]))
-            if not line_collision_free(p1, p2, self.occ, samples=20):
+            p1 = self._rounded_trajectory_point(i)
+            p2 = self._rounded_trajectory_point(i + 1)
+            if not line_collision_free(p1, p2, self.occ):
                 self.found_path = False
                 return
         self.found_path = True
     
     def extract_path(self) -> List[Tuple[int, int]]:
         """Extract the current trajectory as a path."""
-        return [(int(p[0]), int(p[1])) for p in self.trajectory]
+        return [self._rounded_trajectory_point(i) for i in range(len(self.trajectory))]
+
+    def extract_display_path(self) -> List[Tuple[float, float]]:
+        """Extract the floating-point trajectory for rendering."""
+        return [(float(p[0]), float(p[1])) for p in self.trajectory]
     
     def get_status(self) -> str:
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
@@ -1442,6 +1754,11 @@ class STOMPParamsWidget(QWidget):
         self.spin_temperature.setSingleStep(1.0)
         self.spin_temperature.setValue(10.0)
         self.spin_temperature.setToolTip("Temperature for probability weighting (lower = more greedy)")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
         
         layout.addRow("Waypoints:", self.spin_num_points)
         layout.addRow("Max iterations:", self.spin_max_iters)
@@ -1450,6 +1767,7 @@ class STOMPParamsWidget(QWidget):
         layout.addRow("Smoothness weight:", self.spin_smoothness_weight)
         layout.addRow("Obstacle weight:", self.spin_obstacle_weight)
         layout.addRow("Temperature:", self.spin_temperature)
+        layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
     
@@ -1462,6 +1780,7 @@ class STOMPParamsWidget(QWidget):
             'smoothness_weight': self.spin_smoothness_weight.value(),
             'obstacle_weight': self.spin_obstacle_weight.value(),
             'temperature': self.spin_temperature.value(),
+            'seed': self.spin_seed.value(),
         }
 
 
@@ -1760,7 +2079,7 @@ class STOMPPlanner(BasePlanner):
         for i in range(len(self.trajectory) - 1):
             p1 = (int(self.trajectory[i, 0]), int(self.trajectory[i, 1]))
             p2 = (int(self.trajectory[i + 1, 0]), int(self.trajectory[i + 1, 1]))
-            if not line_collision_free(p1, p2, self.occ, samples=20):
+            if not line_collision_free(p1, p2, self.occ):
                 self.found_path = False
                 return
         self.found_path = True
@@ -1809,10 +2128,16 @@ class PRMParamsWidget(QWidget):
         self.spin_max_edge_dist.setRange(10, 500)
         self.spin_max_edge_dist.setValue(100)
         self.spin_max_edge_dist.setToolTip("Maximum edge length")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
         
         layout.addRow("Num samples:", self.spin_num_samples)
         layout.addRow("K neighbors:", self.spin_k_neighbors)
         layout.addRow("Max edge dist:", self.spin_max_edge_dist)
+        layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
     
@@ -1821,6 +2146,7 @@ class PRMParamsWidget(QWidget):
             'num_samples': self.spin_num_samples.value(),
             'k_neighbors': self.spin_k_neighbors.value(),
             'max_edge_dist': self.spin_max_edge_dist.value(),
+            'seed': self.spin_seed.value(),
         }
 
 
@@ -1852,8 +2178,10 @@ class PRMPlanner(BasePlanner):
         self.phase = "sampling"  # sampling -> connecting -> searching -> done
         self.sample_idx = 0
         self.connect_idx = 0
-        self.search_open: List[Tuple[float, int, List[int]]] = []  # (f_cost, node, path)
+        self.search_open: List[Tuple[float, float, int]] = []  # (f_cost, g_cost, node)
         self.search_closed: Set[int] = set()
+        self.search_parent: Dict[int, int] = {}
+        self.search_g: Dict[int, float] = {0: 0.0}
         self.current_path: List[int] = []
         
     def step_once(self) -> StepResult:
@@ -1902,7 +2230,7 @@ class PRMPlanner(BasePlanner):
             # Initialize A* search
             self.phase = "searching"
             h = self._heuristic(0)
-            self.search_open = [(h, 0, [0])]
+            self.search_open = [(h, 0.0, 0)]
             import heapq
             heapq.heapify(self.search_open)
             return StepResult()
@@ -1943,10 +2271,14 @@ class PRMPlanner(BasePlanner):
             self.done = True
             return StepResult(done=True, found_path=False)
         
-        f_cost, current, path = heapq.heappop(self.search_open)
-        
+        _, current_g, current = heapq.heappop(self.search_open)
+
         if current == 1:  # Reached goal
-            self.current_path = path
+            self.current_path = [current]
+            while current in self.search_parent:
+                current = self.search_parent[current]
+                self.current_path.append(current)
+            self.current_path.reverse()
             self.found_path = True
             self.done = True
             return StepResult(done=True, found_path=True)
@@ -1958,11 +2290,15 @@ class PRMPlanner(BasePlanner):
         
         edge = None
         for neighbor, cost in self.edges[current]:
-            if neighbor not in self.search_closed:
-                g_cost = f_cost - self._heuristic(current) + cost
+            if neighbor in self.search_closed:
+                continue
+
+            tentative_g = current_g + cost
+            if tentative_g < self.search_g.get(neighbor, float('inf')):
+                self.search_parent[neighbor] = current
+                self.search_g[neighbor] = tentative_g
                 h_cost = self._heuristic(neighbor)
-                new_path = path + [neighbor]
-                heapq.heappush(self.search_open, (g_cost + h_cost, neighbor, new_path))
+                heapq.heappush(self.search_open, (tentative_g + h_cost, tentative_g, neighbor))
                 edge = (self.nodes[current], self.nodes[neighbor])
         
         return StepResult(edge=edge)
@@ -2037,10 +2373,16 @@ class AStarPlanner(BasePlanner):
         self.allow_diagonal = allow_diagonal
         
         # Convert to grid coordinates
-        self.grid_w = self.w // grid_size
-        self.grid_h = self.h // grid_size
-        self.start_grid = (start[0] // grid_size, start[1] // grid_size)
-        self.goal_grid = (goal[0] // grid_size, goal[1] // grid_size)
+        self.grid_w = int(np.ceil(self.w / grid_size))
+        self.grid_h = int(np.ceil(self.h / grid_size))
+        self.start_grid = (
+            min(start[0] // grid_size, self.grid_w - 1),
+            min(start[1] // grid_size, self.grid_h - 1),
+        )
+        self.goal_grid = (
+            min(goal[0] // grid_size, self.grid_w - 1),
+            min(goal[1] // grid_size, self.grid_h - 1),
+        )
         
         # Pre-compute grid occupancy
         self.grid_occ = np.zeros((self.grid_h, self.grid_w), dtype=bool)
@@ -2080,9 +2422,18 @@ class AStarPlanner(BasePlanner):
         for dx, dy in directions:
             nx, ny = pos[0] + dx, pos[1] + dy
             if 0 <= nx < self.grid_w and 0 <= ny < self.grid_h:
-                if not self.grid_occ[ny, nx]:
-                    cost = self.grid_size * np.sqrt(dx*dx + dy*dy)
-                    neighbors.append(((nx, ny), cost))
+                if self.grid_occ[ny, nx]:
+                    continue
+
+                # Block diagonal corner cutting through occupied orthogonal neighbors.
+                if dx != 0 and dy != 0:
+                    side_a = (pos[0] + dx, pos[1])
+                    side_b = (pos[0], pos[1] + dy)
+                    if self.grid_occ[side_a[1], side_a[0]] or self.grid_occ[side_b[1], side_b[0]]:
+                        continue
+
+                cost = self.grid_size * np.sqrt(dx*dx + dy*dy)
+                neighbors.append(((nx, ny), cost))
         
         return neighbors
     
@@ -2204,10 +2555,16 @@ class DijkstraPlanner(BasePlanner):
         self.allow_diagonal = allow_diagonal
         
         # Convert to grid coordinates
-        self.grid_w = self.w // grid_size
-        self.grid_h = self.h // grid_size
-        self.start_grid = (start[0] // grid_size, start[1] // grid_size)
-        self.goal_grid = (goal[0] // grid_size, goal[1] // grid_size)
+        self.grid_w = int(np.ceil(self.w / grid_size))
+        self.grid_h = int(np.ceil(self.h / grid_size))
+        self.start_grid = (
+            min(start[0] // grid_size, self.grid_w - 1),
+            min(start[1] // grid_size, self.grid_h - 1),
+        )
+        self.goal_grid = (
+            min(goal[0] // grid_size, self.grid_w - 1),
+            min(goal[1] // grid_size, self.grid_h - 1),
+        )
         
         # Pre-compute grid occupancy
         self.grid_occ = np.zeros((self.grid_h, self.grid_w), dtype=bool)
@@ -2236,9 +2593,17 @@ class DijkstraPlanner(BasePlanner):
         for dx, dy in directions:
             nx, ny = pos[0] + dx, pos[1] + dy
             if 0 <= nx < self.grid_w and 0 <= ny < self.grid_h:
-                if not self.grid_occ[ny, nx]:
-                    cost = self.grid_size * np.sqrt(dx*dx + dy*dy)
-                    neighbors.append(((nx, ny), cost))
+                if self.grid_occ[ny, nx]:
+                    continue
+
+                if dx != 0 and dy != 0:
+                    side_a = (pos[0] + dx, pos[1])
+                    side_b = (pos[0], pos[1] + dy)
+                    if self.grid_occ[side_a[1], side_a[0]] or self.grid_occ[side_b[1], side_b[0]]:
+                        continue
+
+                cost = self.grid_size * np.sqrt(dx*dx + dy*dy)
+                neighbors.append(((nx, ny), cost))
         
         return neighbors
     
@@ -2349,12 +2714,18 @@ class APFParamsWidget(QWidget):
         self.spin_obstacle_dist.setRange(5, 100)
         self.spin_obstacle_dist.setValue(30)
         self.spin_obstacle_dist.setToolTip("Obstacle influence distance")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducible escape perturbations")
         
         layout.addRow("Step size:", self.spin_step_size)
         layout.addRow("Max iterations:", self.spin_max_iters)
         layout.addRow("Goal gain:", self.spin_goal_gain)
         layout.addRow("Obstacle gain:", self.spin_obstacle_gain)
         layout.addRow("Obstacle dist:", self.spin_obstacle_dist)
+        layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
     
@@ -2365,6 +2736,7 @@ class APFParamsWidget(QWidget):
             'goal_gain': self.spin_goal_gain.value(),
             'obstacle_gain': self.spin_obstacle_gain.value(),
             'obstacle_dist': self.spin_obstacle_dist.value(),
+            'seed': self.spin_seed.value(),
         }
 
 
@@ -2379,7 +2751,8 @@ class APFPlanner(BasePlanner):
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  step_size: float = 5.0, max_iters: int = 2000,
-                 goal_gain: float = 5.0, obstacle_gain: float = 1000.0, obstacle_dist: int = 30):
+                 goal_gain: float = 5.0, obstacle_gain: float = 1000.0,
+                 obstacle_dist: int = 30, seed: int = 42):
         super().__init__(occ, start, goal)
         
         self.step_size = step_size
@@ -2387,6 +2760,7 @@ class APFPlanner(BasePlanner):
         self.goal_gain = goal_gain
         self.obstacle_gain = obstacle_gain
         self.obstacle_dist = obstacle_dist
+        self.rng = np.random.default_rng(seed)
         
         # Current position
         self.pos = np.array([float(start[0]), float(start[1])])
@@ -2466,7 +2840,7 @@ class APFPlanner(BasePlanner):
         
         # Add random perturbation if stuck
         if self.stuck_counter > 20:
-            force += np.random.randn(2) * 5.0
+            force += self.rng.normal(0.0, 5.0, 2)
             self.stuck_counter = 0
         
         # Normalize and step
@@ -2550,10 +2924,16 @@ class FMTStarParamsWidget(QWidget):
         self.spin_goal_tolerance.setRange(5, 100)
         self.spin_goal_tolerance.setValue(30)
         self.spin_goal_tolerance.setToolTip("Distance to goal for direct connection attempt")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
         
         layout.addRow("Num samples:", self.spin_num_samples)
         layout.addRow("Radius (0=auto):", self.spin_radius)
         layout.addRow("Goal tolerance:", self.spin_goal_tolerance)
+        layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
     
@@ -2562,6 +2942,7 @@ class FMTStarParamsWidget(QWidget):
             'num_samples': self.spin_num_samples.value(),
             'radius': self.spin_radius.value() if self.spin_radius.value() > 0 else None,
             'goal_tolerance': self.spin_goal_tolerance.value(),
+            'seed': self.spin_seed.value(),
         }
 
 
@@ -2831,10 +3212,16 @@ class BITStarParamsWidget(QWidget):
         self.spin_rewire_radius.setSingleStep(5.0)
         self.spin_rewire_radius.setValue(120.0)
         self.spin_rewire_radius.setToolTip("Rewiring radius")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
         
         layout.addRow("Batch size:", self.spin_batch_size)
         layout.addRow("Max iterations:", self.spin_max_iters)
         layout.addRow("Rewire radius:", self.spin_rewire_radius)
+        layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
     
@@ -2843,6 +3230,7 @@ class BITStarParamsWidget(QWidget):
             'batch_size': self.spin_batch_size.value(),
             'max_iters': self.spin_max_iters.value(),
             'rewire_radius': self.spin_rewire_radius.value(),
+            'seed': self.spin_seed.value(),
         }
 
 
@@ -3369,15 +3757,15 @@ class TrajOptPlanner(BasePlanner):
     def _check_path_validity(self):
         """Check if trajectory is collision-free."""
         for i in range(len(self.trajectory) - 1):
-            p1 = (int(self.trajectory[i, 0]), int(self.trajectory[i, 1]))
-            p2 = (int(self.trajectory[i + 1, 0]), int(self.trajectory[i + 1, 1]))
-            if not line_collision_free(p1, p2, self.occ, samples=20):
+            p1 = (int(np.rint(self.trajectory[i, 0])), int(np.rint(self.trajectory[i, 1])))
+            p2 = (int(np.rint(self.trajectory[i + 1, 0])), int(np.rint(self.trajectory[i + 1, 1])))
+            if not line_collision_free(p1, p2, self.occ):
                 self.found_path = False
                 return
         self.found_path = True
     
     def extract_path(self) -> List[Tuple[int, int]]:
-        return [(int(p[0]), int(p[1])) for p in self.trajectory]
+        return [(int(np.rint(p[0])), int(np.rint(p[1]))) for p in self.trajectory]
     
     def get_status(self) -> str:
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
@@ -3419,10 +3807,16 @@ class PSOParamsWidget(QWidget):
         self.spin_max_iters.setRange(50, 5000)
         self.spin_max_iters.setValue(1200)
         self.spin_max_iters.setToolTip("Maximum iterations")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
         
         layout.addRow("Particles:", self.spin_num_particles)
         layout.addRow("Waypoints:", self.spin_num_points)
         layout.addRow("Max iters:", self.spin_max_iters)
+        layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
     
@@ -3431,6 +3825,7 @@ class PSOParamsWidget(QWidget):
             'num_particles': self.spin_num_particles.value(),
             'num_points': self.spin_num_points.value(),
             'max_iters': self.spin_max_iters.value(),
+            'seed': self.spin_seed.value(),
         }
 
 
@@ -3950,11 +4345,17 @@ class GeneticParamsWidget(QWidget):
         self.spin_mutation_rate.setSingleStep(0.05)
         self.spin_mutation_rate.setValue(0.2)
         self.spin_mutation_rate.setToolTip("Mutation rate")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
         
         layout.addRow("Population:", self.spin_pop_size)
         layout.addRow("Waypoints:", self.spin_num_points)
         layout.addRow("Generations:", self.spin_max_iters)
         layout.addRow("Mutation rate:", self.spin_mutation_rate)
+        layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
     
@@ -3964,6 +4365,7 @@ class GeneticParamsWidget(QWidget):
             'num_points': self.spin_num_points.value(),
             'max_iters': self.spin_max_iters.value(),
             'mutation_rate': self.spin_mutation_rate.value(),
+            'seed': self.spin_seed.value(),
         }
 
 
@@ -4378,10 +4780,16 @@ class ITOMPParamsWidget(QWidget):
         self.spin_replan_interval.setRange(5, 100)
         self.spin_replan_interval.setValue(20)
         self.spin_replan_interval.setToolTip("Replanning interval")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
         
         layout.addRow("Waypoints:", self.spin_num_points)
         layout.addRow("Max iters:", self.spin_max_iters)
         layout.addRow("Replan interval:", self.spin_replan_interval)
+        layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
     
@@ -4390,6 +4798,7 @@ class ITOMPParamsWidget(QWidget):
             'num_points': self.spin_num_points.value(),
             'max_iters': self.spin_max_iters.value(),
             'replan_interval': self.spin_replan_interval.value(),
+            'seed': self.spin_seed.value(),
         }
 
 
@@ -4519,7 +4928,7 @@ class ITOMPPlanner(BasePlanner):
         for i in range(len(self.trajectory) - 1):
             p1 = (int(self.trajectory[i, 0]), int(self.trajectory[i, 1]))
             p2 = (int(self.trajectory[i + 1, 0]), int(self.trajectory[i + 1, 1]))
-            if not line_collision_free(p1, p2, self.occ, samples=15):
+            if not line_collision_free(p1, p2, self.occ):
                 self.found_path = False
                 return
         self.found_path = True
@@ -4566,13 +4975,13 @@ class GPMPParamsWidget(QWidget):
         
         self.spin_sigma = QDoubleSpinBox()
         self.spin_sigma.setRange(0.1, 50.0)
-        self.spin_sigma.setSingleStep(1.0)
-        self.spin_sigma.setValue(10.0)
-        self.spin_sigma.setToolTip("GP kernel lengthscale")
+        self.spin_sigma.setSingleStep(0.5)
+        self.spin_sigma.setValue(6.0)
+        self.spin_sigma.setToolTip("GP prior sigma. Higher values make the prior softer.")
         
         layout.addRow("Waypoints:", self.spin_num_points)
         layout.addRow("Max iters:", self.spin_max_iters)
-        layout.addRow("Sigma:", self.spin_sigma)
+        layout.addRow("Prior sigma:", self.spin_sigma)
         
         self.setLayout(layout)
     
@@ -4596,72 +5005,136 @@ class GPMPPlanner(BasePlanner):
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 25, max_iters: int = 800, sigma: float = 10.0,
-                 obstacle_weight: float = 100.0, seed: int = 42):
+                 obstacle_weight: float = 100.0):
         super().__init__(occ, start, goal)
         
         self.num_points = num_points
         self.max_iters = max_iters
         self.sigma = sigma
         self.obstacle_weight = obstacle_weight
-        self.rng = np.random.default_rng(seed)
-        
-        # Initialize trajectory
-        self.trajectory = np.zeros((num_points, 2))
-        for i in range(num_points):
-            t = i / (num_points - 1)
-            self.trajectory[i] = np.array(start) * (1 - t) + np.array(goal) * t
-        
-        # Build GP prior covariance (RBF kernel)
-        times = np.linspace(0, 1, num_points)
-        self.K = np.zeros((num_points, num_points))
-        for i in range(num_points):
-            for j in range(num_points):
-                self.K[i, j] = np.exp(-0.5 * ((times[i] - times[j]) / 0.2) ** 2)
-        
-        # Add small diagonal for numerical stability
-        self.K += np.eye(num_points) * 0.01
-        
-        # Inverse covariance (precision matrix)
-        self.K_inv = np.linalg.inv(self.K)
+        self.epsilon = 14.0
+        self.learning_rate = 0.2
+        self.interp_samples = 4
+        self.prior_weight = 1.0 / max(1e-6, self.sigma ** 2)
         
         # Distance field
         free_space = (self.occ == 0).astype(np.uint8)
         self.dist_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        self.grad_x = cv2.Sobel(self.dist_field, cv2.CV_64F, 1, 0, ksize=3) / 8.0
+        self.grad_y = cv2.Sobel(self.dist_field, cv2.CV_64F, 0, 1, ksize=3) / 8.0
+
+        self.mean_trajectory = np.zeros((num_points, 2), dtype=np.float64)
+        start_vec = np.array(start, dtype=np.float64)
+        goal_vec = np.array(goal, dtype=np.float64)
+        for i in range(num_points):
+            t = i / (num_points - 1)
+            self.mean_trajectory[i] = start_vec * (1.0 - t) + goal_vec * t
+
+        self.trajectory = self.mean_trajectory.copy()
+        self.prior_precision = self._build_prior_precision()
+        self.prior_system = self.prior_precision[1:-1, 1:-1] + 1e-6 * np.eye(self.num_points - 2, dtype=np.float64)
         
         self.converged = False
-        self.learning_rate = 0.5
+        self.best_trajectory = self.trajectory.copy()
+        self.best_cost = float("inf")
+        self.best_valid_trajectory: Optional[np.ndarray] = None
+        self.best_valid_cost = float("inf")
+        self.prev_total_cost: Optional[float] = None
+        self.obs_cost = float("inf")
+        self.prior_cost = float("inf")
+        self._check_path_validity()
+        initial_total_cost = self._trajectory_cost(self.trajectory)
+        if self.found_path:
+            self.best_valid_trajectory = self.trajectory.copy()
+            self.best_valid_cost = initial_total_cost
+        self.best_cost = initial_total_cost
     
+    def _build_prior_precision(self) -> np.ndarray:
+        """Build a banded precision approximation for the GP prior."""
+        n = self.num_points
+        P = np.zeros((n, n), dtype=np.float64)
+        for i in range(1, n - 1):
+            P[i, i] += 2.0
+            P[i, i - 1] -= 1.0
+            P[i, i + 1] -= 1.0
+        P[0, 0] = 1.0
+        P[-1, -1] = 1.0
+        return P
+
     def _obstacle_cost_and_grad(self, point: np.ndarray) -> Tuple[float, np.ndarray]:
         """Compute obstacle cost and gradient."""
         x, y = int(np.clip(point[0], 0, self.w - 1)), int(np.clip(point[1], 0, self.h - 1))
         dist = self.dist_field[y, x]
-        
-        if dist > 15:
+
+        if dist >= self.epsilon:
             return 0.0, np.zeros(2)
-        
-        # Cost increases as we get closer to obstacles
-        epsilon = 15.0
-        if dist < epsilon:
-            cost = 0.5 * self.obstacle_weight * (dist - epsilon) ** 2
-        else:
-            cost = 0.0
-        
-        # Numerical gradient
-        grad = np.zeros(2)
-        delta = 1.0
+
+        sdf_grad = np.array([self.grad_x[y, x], self.grad_y[y, x]], dtype=np.float64)
+        grad_norm = float(np.linalg.norm(sdf_grad))
+        if grad_norm > 1e-6:
+            sdf_grad = sdf_grad / grad_norm
+
+        cost = 0.5 * self.obstacle_weight * (self.epsilon - dist) ** 2
+        grad = -self.obstacle_weight * (self.epsilon - dist) * sdf_grad
+        return cost, grad
+
+    def _compute_interpolated_obstacle_factors(self) -> Tuple[float, np.ndarray]:
+        """Evaluate obstacle factors on interpolated states and project them back."""
+        grad = np.zeros_like(self.trajectory)
+        total_cost = 0.0
+
+        for i in range(self.num_points - 1):
+            p0 = self.trajectory[i]
+            p1 = self.trajectory[i + 1]
+
+            for j in range(1, self.interp_samples + 1):
+                tau = j / (self.interp_samples + 1)
+                point = (1.0 - tau) * p0 + tau * p1
+                cost, point_grad = self._obstacle_cost_and_grad(point)
+                if cost <= 0.0:
+                    continue
+                total_cost += cost
+                grad[i] += (1.0 - tau) * point_grad
+                grad[i + 1] += tau * point_grad
+
+        return total_cost, grad
+
+    def _compute_prior_cost(self, trajectory: Optional[np.ndarray] = None) -> float:
+        """Compute the GP prior cost around the deterministic mean trajectory."""
+        traj = self.trajectory if trajectory is None else trajectory
+        diff = traj - self.mean_trajectory
+        total_cost = 0.0
         for dim in range(2):
-            point_plus = point.copy()
-            point_plus[dim] += delta
-            x_p = int(np.clip(point_plus[0], 0, self.w - 1))
-            y_p = int(np.clip(point_plus[1], 0, self.h - 1))
-            dist_plus = self.dist_field[y_p, x_p]
-            
-            if dist < epsilon:
-                cost_plus = 0.5 * self.obstacle_weight * (dist_plus - epsilon) ** 2
-                grad[dim] = (cost_plus - cost) / delta
-        
-        # Gradient points toward obstacles, we want to push away
-        return cost, -grad * (epsilon - dist) if dist < epsilon else np.zeros(2)
+            total_cost += 0.5 * float(diff[:, dim] @ (self.prior_precision @ diff[:, dim]))
+        return self.prior_weight * total_cost
+
+    def _precondition_obstacle_gradient(self, obstacle_grad: np.ndarray) -> np.ndarray:
+        """Approximate the GP covariance action K_w * g from the paper's update rule."""
+        if self.num_points <= 2:
+            return np.zeros_like(obstacle_grad)
+
+        covariant_grad = np.zeros_like(obstacle_grad)
+        for dim in range(2):
+            covariant_grad[1:-1, dim] = np.linalg.solve(self.prior_system, obstacle_grad[1:-1, dim])
+        return covariant_grad
+
+    def _trajectory_cost(self, trajectory: np.ndarray) -> float:
+        """Compute the GPMP objective for selecting the best iterate."""
+        old_traj = self.trajectory
+        self.trajectory = trajectory
+        obstacle_cost, _ = self._compute_interpolated_obstacle_factors()
+        prior_cost = self._compute_prior_cost(trajectory)
+        self.trajectory = old_traj
+        return prior_cost + obstacle_cost
+
+    def _finalize_best_trajectory(self) -> None:
+        """Restore the best valid trajectory if one exists."""
+        if self.best_valid_trajectory is not None:
+            self.trajectory = self.best_valid_trajectory.copy()
+            self.found_path = True
+            return
+        self.trajectory = self.best_trajectory.copy()
+        self._check_path_validity()
     
     def step_once(self) -> StepResult:
         if self.done:
@@ -4670,71 +5143,75 @@ class GPMPPlanner(BasePlanner):
         self.iteration += 1
         
         if self.iteration >= self.max_iters:
-            self._check_path_validity()
+            self._finalize_best_trajectory()
             self.done = True
             return StepResult(done=True, found_path=self.found_path)
         
-        # Compute obstacle gradients
-        obs_grad = np.zeros((self.num_points, 2))
-        total_obs_cost = 0.0
-        for i in range(1, self.num_points - 1):
-            cost, grad = self._obstacle_cost_and_grad(self.trajectory[i])
-            obs_grad[i] = grad
-            total_obs_cost += cost
-        
-        # GP prior gradient (pulls toward smooth trajectory)
-        # Prior cost = 0.5 * (x - mean)^T * K_inv * (x - mean)
-        mean_traj = np.zeros((self.num_points, 2))
-        for i in range(self.num_points):
-            t = i / (self.num_points - 1)
-            mean_traj[i] = np.array(self.start) * (1 - t) + np.array(self.goal) * t
-        
-        diff = self.trajectory - mean_traj
-        gp_grad = np.zeros((self.num_points, 2))
-        for dim in range(2):
-            gp_grad[:, dim] = self.K_inv @ diff[:, dim] / self.sigma ** 2
-        
-        # Combined gradient descent
-        total_grad = gp_grad + obs_grad
+        _, obs_grad = self._compute_interpolated_obstacle_factors()
+        total_grad = self.prior_weight * (self.trajectory - self.mean_trajectory)
+        total_grad += self._precondition_obstacle_gradient(obs_grad)
+
+        total_grad[0] = 0.0
+        total_grad[-1] = 0.0
+        grad_norm = float(np.linalg.norm(total_grad))
+        if grad_norm > 25.0:
+            total_grad *= 25.0 / grad_norm
+
+        step_size = self.learning_rate * (0.995 ** min(self.iteration, 400))
         
         # Update (don't move start and goal)
         for i in range(1, self.num_points - 1):
-            self.trajectory[i] -= self.learning_rate * total_grad[i]
+            self.trajectory[i] -= step_size * total_grad[i]
             self.trajectory[i, 0] = np.clip(self.trajectory[i, 0], 0, self.w - 1)
             self.trajectory[i, 1] = np.clip(self.trajectory[i, 1], 0, self.h - 1)
         
         # Check validity
         self._check_path_validity()
+        obs_cost, _ = self._compute_interpolated_obstacle_factors()
+        prior_cost = self._compute_prior_cost()
+        total_cost = prior_cost + obs_cost
+        self.obs_cost = obs_cost
+        self.prior_cost = prior_cost
+        if total_cost < self.best_cost:
+            self.best_cost = total_cost
+            self.best_trajectory = self.trajectory.copy()
+        if self.found_path and total_cost < self.best_valid_cost:
+            self.best_valid_cost = total_cost
+            self.best_valid_trajectory = self.trajectory.copy()
         
         # Convergence
-        grad_norm = np.linalg.norm(total_grad)
-        if grad_norm < 0.5 and self.found_path:
+        cost_change = (
+            abs(self.prev_total_cost - total_cost)
+            if self.prev_total_cost is not None
+            else float("inf")
+        )
+        self.prev_total_cost = total_cost
+        if self.found_path and cost_change < 1e-3 and grad_norm < 1.0 and self.iteration > 40:
             self.converged = True
+            self._finalize_best_trajectory()
             self.done = True
-        
-        # Visualization
-        idx = self.iteration % (self.num_points - 1)
-        p1 = (int(self.trajectory[idx, 0]), int(self.trajectory[idx, 1]))
-        p2 = (int(self.trajectory[idx + 1, 0]), int(self.trajectory[idx + 1, 1]))
-        
-        return StepResult(edge=(p1, p2))
+
+        return StepResult()
     
     def _check_path_validity(self):
         """Check if trajectory is collision-free."""
         for i in range(len(self.trajectory) - 1):
             p1 = (int(self.trajectory[i, 0]), int(self.trajectory[i, 1]))
             p2 = (int(self.trajectory[i + 1, 0]), int(self.trajectory[i + 1, 1]))
-            if not line_collision_free(p1, p2, self.occ, samples=15):
+            if not line_collision_free(p1, p2, self.occ):
                 self.found_path = False
                 return
         self.found_path = True
     
     def extract_path(self) -> List[Tuple[int, int]]:
         return [(int(p[0]), int(p[1])) for p in self.trajectory]
+
+    def extract_display_path(self) -> List[Tuple[float, float]]:
+        return [(float(p[0]), float(p[1])) for p in self.trajectory]
     
     def get_status(self) -> str:
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
-        return f"GPMP: iter {self.iteration}, {status}"
+        return f"GPMP: iter {self.iteration}, prior: {self.prior_cost:.1f}, obs: {self.obs_cost:.1f}, {status}"
     
     @staticmethod
     def get_params_widget() -> QWidget:
@@ -4753,11 +5230,11 @@ class GPMPPlanner(BasePlanner):
 
 # Algorithms grouped by category for UI organization
 ALGORITHM_GROUPS: List[Tuple[str, List[str]]] = [
-    ('Sampling-Based', ['RRT', 'RRT-Connect', 'RRT*', 'PRM', 'FMT*', 'BIT*']),
+    ('Sampling-Based', ['RRT', 'RRT-Connect', 'RRT*', 'PRM']),
     ('Graph Search', ['A*', 'Dijkstra']),
     ('Potential Field', ['APF']),
-    ('Trajectory Optimization', ['CHOMP', 'STOMP', 'TrajOpt', 'ITOMP', 'GPMP']),
-    ('Metaheuristic', ['PSO', 'Genetic']),
+    ('Trajectory Optimization', ['CHOMP']),
+    ('Approximate / Experimental', ['FMT*', 'BIT*', 'STOMP', 'TrajOpt', 'ITOMP', 'GPMP', 'PSO', 'Genetic']),
 ]
 
 # Register all available planners here
@@ -4807,11 +5284,11 @@ ALGORITHM_INFO: Dict[str, Tuple[str, str]] = {
         "Kavraki et al., 1996"
     ),
     'FMT*': (
-        "Fast Marching Tree. Optimal sampling-based planner using lazy collision checking.",
+        "FMT*-inspired visual approximation with informed sampling and lazy collision checking.",
         "Janson et al., 2015"
     ),
     'BIT*': (
-        "Batch Informed Trees. Combines graph-based and sampling-based planning with heuristics.",
+        "BIT*-inspired visual approximation with batch sampling and heuristic edge ordering.",
         "Gammell et al., 2015"
     ),
     'A*': (
@@ -4831,27 +5308,27 @@ ALGORITHM_INFO: Dict[str, Tuple[str, str]] = {
         "Zucker et al., 2013"
     ),
     'STOMP': (
-        "Stochastic Trajectory Optimization. Uses noisy rollouts to optimize paths.",
+        "STOMP-inspired stochastic optimizer using noisy rollout averaging for visualization.",
         "Kalakrishnan et al., 2011"
     ),
     'TrajOpt': (
-        "Sequential convex optimization for trajectory planning with constraints.",
+        "TrajOpt-style trust-region optimizer rather than a full sequential convex solver.",
         "Schulman et al., 2014"
     ),
     'ITOMP': (
-        "Incremental Trajectory Optimization. Replans continuously for dynamic environments.",
+        "ITOMP-inspired incremental smoother for visual replanning demonstrations.",
         "Park et al., 2012"
     ),
     'GPMP': (
-        "Gaussian Process Motion Planning. Uses GP interpolation for smooth trajectories.",
+        "Gaussian Process Motion Planning as a deterministic local optimizer with GP prior and interpolated obstacle factors.",
         "Mukadam et al., 2016"
     ),
     'PSO': (
-        "Particle Swarm Optimization. Swarm intelligence finds paths through collective search.",
+        "Experimental waypoint-path optimizer based on Particle Swarm Optimization.",
         "Kennedy & Eberhart, 1995"
     ),
     'Genetic': (
-        "Genetic Algorithm. Evolves a population of paths through selection and mutation.",
+        "Experimental waypoint-path optimizer based on a Genetic Algorithm.",
         "Holland, 1975"
     ),
 }
@@ -4909,6 +5386,30 @@ class ImageCanvas(QLabel):
         self.rejected_highlights: List[Tuple[int, int, int]] = []  # (x, y, alpha)
         self.edge_highlights: List[Tuple[int, int, int, int, int]] = []  # (x1, y1, x2, y2, alpha)
         self.current_path: List[Point] = []
+
+    def _make_pen(self, color: Union[Qt.GlobalColor, QColor], width: int) -> QPen:
+        """Create a pen with rounded joins for cleaner path rendering."""
+        pen = QPen(color, width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        return pen
+
+    def _draw_polyline(
+        self,
+        painter: QPainter,
+        path: List[Tuple[Union[int, float], Union[int, float]]],
+        color: Union[Qt.GlobalColor, QColor],
+        width: int,
+    ) -> None:
+        """Draw a path with anti-aliasing and rounded joins."""
+        if len(path) < 2:
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(self._make_pen(color, width))
+        for i in range(len(path) - 1):
+            p1 = QPointF(float(path[i][0]), float(path[i][1]))
+            p2 = QPointF(float(path[i + 1][0]), float(path[i + 1][1]))
+            painter.drawLine(p1, p2)
     
     def set_image(self, qpix: QPixmap):
         self.base_pixmap = qpix
@@ -4965,10 +5466,7 @@ class ImageCanvas(QLabel):
         
         # Draw current path (for RRT* live updates)
         if len(self.current_path) >= 2:
-            painter.setPen(QPen(Qt.GlobalColor.yellow, 4))
-            for i in range(len(self.current_path) - 1):
-                p1, p2 = self.current_path[i], self.current_path[i + 1]
-                painter.drawLine(p1[0], p1[1], p2[0], p2[1])
+            self._draw_polyline(painter, self.current_path, Qt.GlobalColor.yellow, 4)
         
         # Draw edge highlights
         for (x1, y1, x2, y2, alpha) in self.edge_highlights:
@@ -5031,8 +5529,9 @@ class ImageCanvas(QLabel):
         if self.overlay is None:
             return
         painter = QPainter(self.overlay)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         color = Qt.GlobalColor.green if kind == "start" else Qt.GlobalColor.red
-        painter.setPen(QPen(color, 4))
+        painter.setPen(self._make_pen(color, 4))
         painter.drawEllipse(QPointF(p[0], p[1]), 6, 6)
         painter.end()
         self._update_display()
@@ -5070,9 +5569,7 @@ class ImageCanvas(QLabel):
             if self.overlay is None:
                 return
             painter = QPainter(self.overlay)
-            painter.setPen(QPen(color, 4))
-            for i in range(len(path) - 1):
-                painter.drawLine(path[i][0], path[i][1], path[i+1][0], path[i+1][1])
+            self._draw_polyline(painter, list(path), color, 4)
             painter.end()
         else:
             # Set as current path for live display
@@ -5106,7 +5603,7 @@ class MainWindow(QMainWindow):
     
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Path Planning Visualizer Beta")
+        self.setWindowTitle("Path Planning Visualizer Beta (0.1.0b2)")
         
         self._setup_canvas()
         self._setup_algorithm_controls()
@@ -5175,14 +5672,26 @@ class MainWindow(QMainWindow):
         self.lbl_iteration = QLabel("-")
         self.lbl_status_state = QLabel("Idle")
         self.lbl_path_length = QLabel("-")
+        self.lbl_min_clearance = QLabel("-")
+        self.lbl_mean_clearance = QLabel("-")
+        self.lbl_smoothness = QLabel("-")
         self.lbl_stopwatch = QLabel("-")
+        self.lbl_total_compute_time = QLabel("-")
         self.lbl_info = QLabel("Load an image, then click START and GOAL.")
         self.lbl_info.setWordWrap(True)
+        self.lbl_path_length.setToolTip("Geometric path length in pixels. Lower is usually better.")
+        self.lbl_min_clearance.setToolTip("Smallest obstacle distance anywhere along the path in pixels. Higher is safer.")
+        self.lbl_mean_clearance.setToolTip("Average obstacle distance along the full path in pixels. Higher means the path stays farther from walls overall.")
+        self.lbl_smoothness.setToolTip("Average squared turning angle in rad^2 on a uniformly resampled path. Lower is smoother.")
+        self.lbl_stopwatch.setToolTip("Planner compute time until the first valid path is found")
+        self.lbl_total_compute_time.setToolTip("Accumulated planner compute time for the current run")
         
         # Style for status labels
         status_labels = [
             self.lbl_algorithm, self.lbl_iteration, 
-            self.lbl_status_state, self.lbl_path_length, self.lbl_stopwatch
+            self.lbl_status_state, self.lbl_path_length, self.lbl_min_clearance,
+            self.lbl_mean_clearance, self.lbl_smoothness, self.lbl_stopwatch,
+            self.lbl_total_compute_time
         ]
         for lbl in status_labels:
             lbl.setStyleSheet("font-weight: bold;")
@@ -5216,7 +5725,11 @@ class MainWindow(QMainWindow):
         status_layout.addRow("Iteration:", self.lbl_iteration)
         status_layout.addRow("State:", self.lbl_status_state)
         status_layout.addRow("Path length:", self.lbl_path_length)
-        status_layout.addRow("Time to path:", self.lbl_stopwatch)
+        status_layout.addRow("Min clearance:", self.lbl_min_clearance)
+        status_layout.addRow("Mean clearance:", self.lbl_mean_clearance)
+        status_layout.addRow("Smoothness:", self.lbl_smoothness)
+        status_layout.addRow("Compute time to first path:", self.lbl_stopwatch)
+        status_layout.addRow("Total compute time:", self.lbl_total_compute_time)
         status_layout.addRow(self.lbl_info)
         status_box.setLayout(status_layout)
         
@@ -5255,10 +5768,15 @@ class MainWindow(QMainWindow):
     def _setup_state(self) -> None:
         """Initialize application state variables."""
         self.occ: Optional[OccupancyGrid] = None
+        self.clearance_field: Optional[np.ndarray] = None
         self.planner: Optional[BasePlanner] = None
         self.running_algo_name: Optional[str] = None
         self.stopwatch_start: Optional[float] = None
         self.stopwatch_stopped: bool = False
+        self.solve_elapsed: float = 0.0
+        self.time_to_first_path: Optional[float] = None
+        self._metrics_cache_key: Optional[Tuple[Point, ...]] = None
+        self._metrics_cache_value: Optional[PathMetrics] = None
         
         # Timers
         self.timer = QTimer()
@@ -5274,6 +5792,83 @@ class MainWindow(QMainWindow):
         self.last_found_path: Optional[List[Point]] = None
         self.last_found_algo: Optional[str] = None
         self.optimizing_from_sampling: bool = False
+
+    def _reset_solver_metrics(self) -> None:
+        """Reset runtime metrics for a fresh planning attempt."""
+        self.stopwatch_start = None
+        self.stopwatch_stopped = False
+        self.solve_elapsed = 0.0
+        self.time_to_first_path = None
+        self._metrics_cache_key = None
+        self._metrics_cache_value = None
+        self.lbl_stopwatch.setText("-")
+        self.lbl_stopwatch.setStyleSheet("font-weight: bold;")
+        self.lbl_total_compute_time.setText("-")
+        self.lbl_total_compute_time.setStyleSheet("font-weight: bold;")
+        self._clear_path_metrics_labels()
+
+    def _record_solver_time(self, elapsed: float) -> None:
+        """Accumulate compute time and freeze first-path timing once available."""
+        self.solve_elapsed += elapsed
+        if self.planner is not None and self.planner.found_path and self.time_to_first_path is None:
+            self.time_to_first_path = self.solve_elapsed
+            self.stopwatch_stopped = True
+        self._update_stopwatch_label()
+
+    def _update_stopwatch_label(self) -> None:
+        """Refresh compute-time labels from accumulated solver time."""
+        if self.solve_elapsed > 0:
+            self.lbl_total_compute_time.setText(f"{self.solve_elapsed:.3f}s")
+            total_color = "blue" if self.planner is not None and not self.planner.done and self.is_playing else "black"
+            self.lbl_total_compute_time.setStyleSheet(f"font-weight: bold; color: {total_color};")
+        else:
+            self.lbl_total_compute_time.setText("-")
+            self.lbl_total_compute_time.setStyleSheet("font-weight: bold;")
+
+        if self.time_to_first_path is not None:
+            self.lbl_stopwatch.setText(f"{self.time_to_first_path:.3f}s")
+            self.lbl_stopwatch.setStyleSheet("font-weight: bold; color: green;")
+            return
+
+        if self.planner is not None and not self.planner.done and (self.is_playing or self.solve_elapsed > 0):
+            self.lbl_stopwatch.setText(f"{self.solve_elapsed:.3f}s")
+            self.lbl_stopwatch.setStyleSheet("font-weight: bold; color: blue;")
+            return
+
+        self.lbl_stopwatch.setText("-")
+        self.lbl_stopwatch.setStyleSheet("font-weight: bold;")
+
+    def _clear_path_metrics_labels(self) -> None:
+        """Reset displayed path-quality metrics."""
+        self.lbl_path_length.setText("-")
+        self.lbl_min_clearance.setText("-")
+        self.lbl_mean_clearance.setText("-")
+        self.lbl_smoothness.setText("-")
+
+    def _set_path_metrics_labels(self, metrics: Optional[PathMetrics]) -> None:
+        """Display path-quality metrics in the status panel."""
+        if metrics is None:
+            self._clear_path_metrics_labels()
+            return
+
+        self.lbl_path_length.setText(f"{metrics.length_px:.1f}px")
+        self.lbl_min_clearance.setText(
+            "-" if metrics.min_clearance_px is None else f"{metrics.min_clearance_px:.1f}px"
+        )
+        self.lbl_mean_clearance.setText(
+            "-" if metrics.mean_clearance_px is None else f"{metrics.mean_clearance_px:.1f}px"
+        )
+        self.lbl_smoothness.setText(
+            "-" if metrics.smoothness is None else f"{metrics.smoothness:.3f} rad^2"
+        )
+
+    def _get_path_metrics(self, path: List[Point]) -> PathMetrics:
+        """Compute path metrics with a small cache for repeated UI refreshes."""
+        key = tuple(path)
+        if key != self._metrics_cache_key:
+            self._metrics_cache_key = key
+            self._metrics_cache_value = compute_path_metrics(path, self.clearance_field)
+        return self._metrics_cache_value
     
     def _connect_signals(self) -> None:
         """Connect all button signals to their handlers."""
@@ -5290,7 +5885,7 @@ class MainWindow(QMainWindow):
         first_algo = None
         for group_name, algos in ALGORITHM_GROUPS:
             # Add group header (disabled, styled)
-            header = QStandardItem(f"── {group_name} ──")
+            header = QStandardItem(f"--- {group_name} ---")
             header.setEnabled(False)
             header_font = QFont()
             header_font.setBold(True)
@@ -5337,7 +5932,7 @@ class MainWindow(QMainWindow):
         """Switch parameter widget when algorithm changes."""
         # Extract actual algo name (without formatting)
         actual_name = name.strip()
-        if actual_name.startswith('──'):
+        if actual_name.startswith('---'):
             # This is a group header, skip
             return
         
@@ -5368,7 +5963,7 @@ class MainWindow(QMainWindow):
         # Update algorithm info box
         self._update_algo_info()
     
-    def _update_status_display(self, state: str = None, info: str = None, path_len: int = None):
+    def _update_status_display(self, state: str = None, info: str = None):
         """Update the status info box."""
         # Algorithm name - show running algorithm, not dropdown selection
         if self.running_algo_name is not None:
@@ -5395,14 +5990,12 @@ class MainWindow(QMainWindow):
             else:
                 self.lbl_status_state.setStyleSheet("font-weight: bold; color: black;")
         
-        # Path length
-        if path_len is not None:
-            self.lbl_path_length.setText(str(path_len))
-        elif self.planner is not None and self.planner.found_path:
+        # Path-quality metrics
+        if self.planner is not None and self.planner.found_path:
             path = self.planner.extract_path()
-            self.lbl_path_length.setText(str(len(path)))
+            self._set_path_metrics_labels(self._get_path_metrics(path))
         else:
-            self.lbl_path_length.setText("-")
+            self._clear_path_metrics_labels()
         
         # Info message
         if info is not None:
@@ -5435,6 +6028,8 @@ class MainWindow(QMainWindow):
         if np.mean(bw == 255) < 0.5:
             bw = 255 - bw
         self.occ = (bw == 0)
+        free_space = (~self.occ).astype(np.uint8)
+        self.clearance_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
         
         rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         h, w, _ = rgb.shape
@@ -5443,6 +6038,7 @@ class MainWindow(QMainWindow):
         
         self._update_status_display(state="Idle", info="Click START then GOAL on a free (white) pixel.")
         self._set_buttons_enabled(False)
+        self._reset_solver_metrics()
         self.planner = None
         self.running_algo_name = None  # Clear running algorithm name
 
@@ -5452,6 +6048,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_image(self.canvas.base_pixmap)
         self.planner = None
         self.running_algo_name = None  # Clear running algorithm name
+        self._reset_solver_metrics()
         info = "Click START then GOAL." if self.occ is not None else "Load an image first."
         self._update_status_display(state="Idle", info=info)
         self._set_buttons_enabled(False)
@@ -5491,6 +6088,7 @@ class MainWindow(QMainWindow):
                 self.occ, self.canvas.start, self.canvas.goal, params_widget
             )
             self.running_algo_name = algo_name  # Save the running algorithm name
+            self._reset_solver_metrics()
             self.btn_pause.setText("Pause")
             self.btn_pause.setEnabled(False)
             self.optimizing_from_sampling = False
@@ -5567,7 +6165,9 @@ class MainWindow(QMainWindow):
         
         if not self._ensure_planner():
             return
+        step_start = time.perf_counter()
         result = self.planner.step_once()
+        self._record_solver_time(time.perf_counter() - step_start)
         self._handle_step_result(result)
         self._check_done()
         if not self.planner.done:
@@ -5590,19 +6190,9 @@ class MainWindow(QMainWindow):
         self.is_playing = True
         self._set_running_state()
         self._update_status_display(state="Running", info="Algorithm is running...")
+        self._update_stopwatch_label()
         # MAX mode (1000) uses minimal interval, normal mode uses 1000/speed
         speed = self.speed_slider.value()
-        
-        # Start stopwatch in MAX mode if not already found a path
-        if speed >= 1000 and not self.planner.found_path:
-            self.stopwatch_start = time.perf_counter()
-            self.stopwatch_stopped = False
-            self.lbl_stopwatch.setText("0.000s")
-            self.lbl_stopwatch.setStyleSheet("font-weight: bold; color: blue;")
-        else:
-            self.lbl_stopwatch.setText("-")
-            self.lbl_stopwatch.setStyleSheet("font-weight: bold;")
-        
         interval_ms = 1 if speed >= 1000 else max(1, 1000 // speed)
         self.timer.start(interval_ms)
     
@@ -5655,6 +6245,7 @@ class MainWindow(QMainWindow):
         if base_path is None or len(base_path) < 2:
             QMessageBox.information(self, "Info", "No valid path to optimize.")
             return
+        base_path = shortcut_path(list(base_path), self.occ)
 
         # Stop any running timers
         self.timer.stop()
@@ -5664,7 +6255,7 @@ class MainWindow(QMainWindow):
         # Bias CHOMP toward smoother trajectories when optimizing an existing path
         chomp_params['num_points'] = max(
             chomp_params.get('num_points', 50),
-            min(120, max(50, len(base_path)))
+            min(90, max(50, len(base_path) * 2))
         )
         # Keep CHOMP Optimize quick for interactive use.
         chomp_params['max_iters'] = 400
@@ -5676,6 +6267,7 @@ class MainWindow(QMainWindow):
             init_trajectory=base_path,
             **chomp_params,
         )
+        self._reset_solver_metrics()
         self.running_algo_name = "CHOMP"
         self.optimizing_from_sampling = True
 
@@ -5732,25 +6324,16 @@ class MainWindow(QMainWindow):
         tick_start = time.perf_counter()
         
         for i in range(num_steps):
+            step_start = time.perf_counter()
             result = self.planner.step_once()
+            self._record_solver_time(time.perf_counter() - step_start)
             self._handle_step_result(result)
-            
-            # Stop stopwatch when first path is found in MAX mode
-            if speed >= 1000 and self.planner.found_path and not self.stopwatch_stopped:
-                if self.stopwatch_start is not None:
-                    elapsed = time.perf_counter() - self.stopwatch_start
-                    self.lbl_stopwatch.setText(f"{elapsed:.3f}s")
-                    self.lbl_stopwatch.setStyleSheet("font-weight: bold; color: green;")
-                self.stopwatch_stopped = True
             
             # In MAX mode, update display periodically for visual feedback
             if speed >= 1000 and (i + 1) % display_interval == 0:
                 self.canvas.fade_highlights(fade_amount=120)  # Extra fade during updates
                 self.canvas._update_display()
-                # Update stopwatch display if still running
-                if self.stopwatch_start is not None and not self.stopwatch_stopped:
-                    elapsed = time.perf_counter() - self.stopwatch_start
-                    self.lbl_stopwatch.setText(f"{elapsed:.3f}s")
+                self._update_stopwatch_label()
                 self._update_status_display(state="Running", info=self.planner.get_status())
                 QApplication.processEvents()  # Allow UI to refresh
             
@@ -5766,21 +6349,27 @@ class MainWindow(QMainWindow):
     
     def _handle_step_result(self, result: StepResult):
         edge_color = QColor(160, 32, 240) if self.optimizing_from_sampling else Qt.GlobalColor.blue
+        is_gpmp = isinstance(self.planner, GPMPPlanner)
         # Handle multiple edges (for batch algorithms like FMT*)
-        if result.edges:
+        if result.edges and not is_gpmp:
             for edge in result.edges:
                 self.canvas.draw_edge(edge[0], edge[1], color=edge_color)
-        elif result.edge:
+        elif result.edge and not is_gpmp:
             self.canvas.draw_edge(result.edge[0], result.edge[1], color=edge_color)
         if result.rejected_point:
             self.canvas.add_rejected_highlight(result.rejected_point)
             self.canvas._update_display()
+        if is_gpmp and self.planner is not None:
+            display_path = self.planner.extract_display_path()
+            if display_path:
+                self.canvas.current_path = list(display_path)
         # For RRT*: always keep the current best path visible
         if self.planner is not None and self.planner.found_path:
             path = self.planner.extract_path()
             if path:
-                if not self.optimizing_from_sampling:
-                    self.canvas.current_path = list(path)
+                if not self.optimizing_from_sampling and not is_gpmp:
+                    display_path = self.planner.extract_display_path() if hasattr(self.planner, "extract_display_path") else path
+                    self.canvas.current_path = list(display_path)
     
     def _check_done(self):
         if self.planner is None:
@@ -5798,20 +6387,23 @@ class MainWindow(QMainWindow):
         
         if not self.planner.found_path:
             self.canvas.clear_path()
-            self._update_status_display(state="No Path", info=self.planner.get_status(), path_len=0)
+            self._update_stopwatch_label()
+            self._update_status_display(state="No Path", info=self.planner.get_status())
             self.btn_pause.setEnabled(False)
             self.btn_pause.setText("Pause")
             return
         
         path = self.planner.extract_path()
         self.canvas.clear_path()  # Clear live path
+        display_path = self.planner.extract_display_path() if hasattr(self.planner, "extract_display_path") else path
         if self.optimizing_from_sampling:
-            self.canvas.draw_path(path, permanent=True, color=QColor(255, 105, 180))
+            self.canvas.draw_path(display_path, permanent=True, color=QColor(255, 105, 180))
         else:
-            self.canvas.draw_path(path, permanent=True, color=Qt.GlobalColor.yellow)
+            self.canvas.draw_path(display_path, permanent=True, color=Qt.GlobalColor.yellow)
             self.last_found_path = list(path)
             self.last_found_algo = self.running_algo_name
-        self._update_status_display(state="Found", info=self.planner.get_status(), path_len=len(path))
+        self._update_stopwatch_label()
+        self._update_status_display(state="Found", info=self.planner.get_status())
 
         if self.optimizing_from_sampling:
             self.btn_pause.setEnabled(False)
