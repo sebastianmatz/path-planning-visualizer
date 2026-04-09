@@ -2,6 +2,32 @@
 
 This file tracks release notes for published versions of the project.
 
+## [Unreleased]
+
+No unreleased changes yet.
+
+## [0.1.0b3] - 2026-04-09
+
+### Added
+
+- Added `SBL` as a bidirectional lazy roadmap-style planner for the 2D occupancy-grid setting
+- Added `BiTRRT` as an OMPL-inspired bidirectional transition-based RRT with a clearance-derived cost map
+- Added `KPIECE` as a single-level geometric adaptation with projection-grid cell exploration for 2D maps
+
+### Changed
+
+- Reworked `PRM` into a cleaner two-phase formulation with query-independent roadmap construction and query-time start/goal attachment
+- Reworked `FMT*` into a cleaner 2D geometric adaptation with uniform free-space sampling, open-wavefront parent selection, and one-shot lazy collision checking
+- Reworked `BIT*` with ordered vertex and edge queues, rewiring, informed batch sampling, incumbent-based pruning, smaller local connection control, and cleaner live/final rendering
+- Improved `KPIECE` by adding motion-based state selection, progress-based cell penalties, cell-boundary motion splitting, and later runtime-focused incremental bookkeeping
+- Clarified algorithm descriptions in the UI and README, especially for grid-optimality claims and approximate or adapted planners
+
+### Fixed
+
+- Corrected `SBL` toward a cleaner paper-aligned 2D adaptation, including `L-infinity` neighborhood logic and a lighter random path optimizer
+- Fixed PRM query connectivity so `start` and `goal` are attached correctly after roadmap construction
+- Improved BIT* visualization so rewiring history no longer accumulates as misleading permanent tree artifacts
+
 ## [0.1.0b2] - 2026-04-08
 
 ### Changed

@@ -1,12 +1,12 @@
 """
-Path Planning Visualizer Beta (0.1.0b2)
+Path Planning Visualizer Beta (0.1.0b3)
 =============================
 
 Interactive desktop application for exploring and comparing path-planning
 algorithms on occupancy-grid maps.
 
 Supported algorithms:
-- Sampling-Based: RRT, RRT-Connect, RRT*, PRM, FMT*, BIT*
+- Sampling-Based: RRT, RRT-Connect, BiTRRT, KPIECE, RRT*, PRM, SBL, FMT*, BIT*
 - Graph Search: A*, Dijkstra
 - Potential Field: APF
 - Trajectory Optimization: CHOMP, STOMP, TrajOpt, ITOMP, GPMP
@@ -23,7 +23,7 @@ import os
 import sys
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Callable,
     Dict,
@@ -94,6 +94,16 @@ def dist(a: Point, b: Point) -> float:
         Euclidean distance between a and b
     """
     return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+
+def l1_dist(a: Point, b: Point) -> float:
+    """Calculate Manhattan distance between two points."""
+    return float(abs(a[0] - b[0]) + abs(a[1] - b[1]))
+
+
+def linf_dist(a: Point, b: Point) -> float:
+    """Calculate Chebyshev / L-infinity distance between two points."""
+    return float(max(abs(a[0] - b[0]), abs(a[1] - b[1])))
 
 
 def steer(from_pt: Point, to_pt: Point, step: float) -> Point:
@@ -333,6 +343,57 @@ def shortcut_path(path: List[Point], occ: OccupancyGrid, max_passes: int = 2) ->
     return shortened
 
 
+def float_polyline_collision_free(
+    path: List[Tuple[float, float]],
+    occ: OccupancyGrid,
+) -> bool:
+    """Check a float polyline by rasterizing each segment onto the occupancy grid."""
+    if len(path) < 2:
+        return True
+
+    for i in range(len(path) - 1):
+        a = (int(round(path[i][0])), int(round(path[i][1])))
+        b = (int(round(path[i + 1][0])), int(round(path[i + 1][1])))
+        if not line_collision_free(a, b, occ):
+            return False
+    return True
+
+
+def smooth_display_path(
+    path: List[Point],
+    occ: OccupancyGrid,
+    spacing: float = 3.0,
+    iterations: int = 2,
+) -> List[Tuple[float, float]]:
+    """Return a denser, cleaner display-only polyline while keeping it collision-free."""
+    if not path:
+        return []
+    if len(path) == 1:
+        return [(float(path[0][0]), float(path[0][1]))]
+
+    smoothed = resample_path_points(path, spacing=max(1.0, spacing))
+    if len(smoothed) < 3:
+        return smoothed
+
+    for _ in range(max(0, iterations)):
+        candidate: List[Tuple[float, float]] = [smoothed[0]]
+        for i in range(len(smoothed) - 1):
+            p0 = np.array(smoothed[i], dtype=np.float64)
+            p1 = np.array(smoothed[i + 1], dtype=np.float64)
+            q = 0.75 * p0 + 0.25 * p1
+            r = 0.25 * p0 + 0.75 * p1
+            candidate.append((float(q[0]), float(q[1])))
+            candidate.append((float(r[0]), float(r[1])))
+        candidate.append(smoothed[-1])
+
+        if float_polyline_collision_free(candidate, occ):
+            smoothed = candidate
+        else:
+            break
+
+    return smoothed
+
+
 # =============================================================================
 # Step Result Data Class
 # =============================================================================
@@ -365,6 +426,24 @@ class PathMetrics:
     min_clearance_px: Optional[float] = None
     mean_clearance_px: Optional[float] = None
     smoothness: Optional[float] = None
+
+
+@dataclass
+class SBLSegmentState:
+    """Lazy collision-check state for an SBL segment."""
+
+    kappa: int = 0
+    safe: bool = False
+
+
+@dataclass
+class SBLNode:
+    """Milestone node used by SBL."""
+
+    point: Point
+    tree_id: int
+    parent: Optional[int] = None
+    children: Set[int] = field(default_factory=set)
 
 
 # =============================================================================
@@ -929,6 +1008,912 @@ class RRTConnectPlanner(BasePlanner):
         return RRTConnectPlanner(occ, start, goal, **params)
 
 # ============================================================================
+# BiTRRT Implementation
+# ============================================================================
+
+
+@dataclass
+class BiTRRTMotion:
+    """Single motion/node in a BiTRRT exploration tree."""
+
+    point: Point
+    parent: Optional[int]
+    state_cost: float
+
+
+class BiTRRTParamsWidget(QWidget):
+    """Widget for BiTRRT parameter configuration."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QFormLayout()
+
+        self.spin_range = QDoubleSpinBox()
+        self.spin_range.setRange(1.0, 500.0)
+        self.spin_range.setSingleStep(1.0)
+        self.spin_range.setValue(24.0)
+        self.spin_range.setToolTip("Maximum expansion range per tree extension")
+
+        self.spin_temp_change = QDoubleSpinBox()
+        self.spin_temp_change.setRange(0.001, 2.0)
+        self.spin_temp_change.setSingleStep(0.01)
+        self.spin_temp_change.setDecimals(3)
+        self.spin_temp_change.setValue(0.10)
+        self.spin_temp_change.setToolTip(
+            "OMPL-style temperature increase factor parameter; the actual multiplier is exp(value)"
+        )
+
+        self.spin_init_temp = QDoubleSpinBox()
+        self.spin_init_temp.setRange(0.001, 100000.0)
+        self.spin_init_temp.setDecimals(3)
+        self.spin_init_temp.setValue(100.0)
+        self.spin_init_temp.setToolTip("Initial transition-test temperature")
+
+        self.spin_frontier_threshold = QDoubleSpinBox()
+        self.spin_frontier_threshold.setRange(0.0, 1000.0)
+        self.spin_frontier_threshold.setDecimals(3)
+        self.spin_frontier_threshold.setSpecialValueText("auto")
+        self.spin_frontier_threshold.setValue(0.0)
+        self.spin_frontier_threshold.setToolTip(
+            "Distance threshold for frontier vs refinement expansion; 0 uses OMPL-style auto scaling"
+        )
+
+        self.spin_frontier_ratio = QDoubleSpinBox()
+        self.spin_frontier_ratio.setRange(0.01, 10.0)
+        self.spin_frontier_ratio.setSingleStep(0.01)
+        self.spin_frontier_ratio.setDecimals(3)
+        self.spin_frontier_ratio.setValue(0.10)
+        self.spin_frontier_ratio.setToolTip(
+            "Maximum allowed ratio of non-frontier to frontier expansions"
+        )
+
+        self.chk_cost_threshold = QCheckBox("Enable")
+        self.chk_cost_threshold.setToolTip(
+            "Enable an upper bound on accepted transition costs"
+        )
+
+        self.spin_cost_threshold = QDoubleSpinBox()
+        self.spin_cost_threshold.setRange(0.0, 1000.0)
+        self.spin_cost_threshold.setSingleStep(0.1)
+        self.spin_cost_threshold.setDecimals(3)
+        self.spin_cost_threshold.setValue(25.0)
+        self.spin_cost_threshold.setEnabled(False)
+        self.spin_cost_threshold.setToolTip(
+            "Maximum motion cost accepted by the transition test when enabled"
+        )
+        self.chk_cost_threshold.toggled.connect(self.spin_cost_threshold.setEnabled)
+
+        cost_threshold_widget = QWidget()
+        cost_threshold_layout = QHBoxLayout(cost_threshold_widget)
+        cost_threshold_layout.setContentsMargins(0, 0, 0, 0)
+        cost_threshold_layout.addWidget(self.chk_cost_threshold)
+        cost_threshold_layout.addWidget(self.spin_cost_threshold)
+
+        self.spin_max_iters = QSpinBox()
+        self.spin_max_iters.setRange(100, 200000)
+        self.spin_max_iters.setValue(25000)
+        self.spin_max_iters.setToolTip("Maximum number of planning iterations")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(1)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
+
+        layout.addRow("Range:", self.spin_range)
+        layout.addRow("Temp change factor:", self.spin_temp_change)
+        layout.addRow("Initial temperature:", self.spin_init_temp)
+        layout.addRow("Frontier threshold:", self.spin_frontier_threshold)
+        layout.addRow("Frontier node ratio:", self.spin_frontier_ratio)
+        layout.addRow("Cost threshold:", cost_threshold_widget)
+        layout.addRow("Max iterations:", self.spin_max_iters)
+        layout.addRow("Seed:", self.spin_seed)
+
+        self.setLayout(layout)
+
+    def get_params(self) -> dict:
+        return {
+            'range': self.spin_range.value(),
+            'temp_change_factor': self.spin_temp_change.value(),
+            'init_temperature': self.spin_init_temp.value(),
+            'frontier_threshold': self.spin_frontier_threshold.value(),
+            'frontier_node_ratio': self.spin_frontier_ratio.value(),
+            'cost_threshold': self.spin_cost_threshold.value() if self.chk_cost_threshold.isChecked() else float('inf'),
+            'max_iters': self.spin_max_iters.value(),
+            'seed': self.spin_seed.value(),
+        }
+
+
+class BiTRRTPlanner(BasePlanner):
+    """BiTRRT - Bidirectional Transition-based Rapidly-exploring Random Trees."""
+
+    name = "BiTRRT"
+    description = "Bidirectional cost-aware RRT with transition tests and frontier control"
+
+    FAILED = 0
+    ADVANCED = 1
+    SUCCESS = 2
+
+    def __init__(
+        self,
+        occ: np.ndarray,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        range: float = 18.0,
+        temp_change_factor: float = 0.10,
+        init_temperature: float = 100.0,
+        frontier_threshold: float = 0.0,
+        frontier_node_ratio: float = 0.10,
+        cost_threshold: float = float('inf'),
+        max_iters: int = 25000,
+        seed: int = 1,
+    ) -> None:
+        super().__init__(occ, start, goal)
+
+        self.max_distance = float(max(1.0, range))
+        self.temp_change_factor_param = float(temp_change_factor)
+        self.temp_change_multiplier = float(np.exp(temp_change_factor))
+        self.init_temperature = float(max(1e-6, init_temperature))
+        self.temp = self.init_temperature
+        self.max_iters = int(max_iters)
+        self.frontier_node_ratio = float(max(0.01, frontier_node_ratio))
+        self.cost_threshold = float(cost_threshold)
+        self.rng = np.random.default_rng(seed)
+
+        free_space = (~occ).astype(np.uint8)
+        self.clearance_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        # Clearance-derived adaptation of OMPL's generic state cost / mechanical-work setup.
+        self.cost_field = 100.0 / (1.0 + self.clearance_field.astype(np.float64))
+
+        self.max_extent = float(np.hypot(max(1, self.w - 1), max(1, self.h - 1)))
+        self.frontier_threshold = (
+            float(frontier_threshold)
+            if frontier_threshold > 0.0
+            else max(1e-6, 0.01 * self.max_extent)
+        )
+        self.connection_range = max(1e-6, 0.10 * self.max_extent)
+
+        start_cost = self._state_cost(start)
+        goal_cost = self._state_cost(goal)
+        self.tree_start: List[BiTRRTMotion] = [BiTRRTMotion(start, None, start_cost)]
+        self.tree_goal: List[BiTRRTMotion] = [BiTRRTMotion(goal, None, goal_cost)]
+
+        self.best_cost = 0.0
+        self.worst_cost = max(start_cost, goal_cost, 0.0)
+        self.frontier_count = 1
+        self.nonfrontier_count = 1
+
+        self.grow_start_tree = True
+        self.connection_start_idx: Optional[int] = None
+        self.connection_goal_idx: Optional[int] = None
+
+    def _state_cost(self, point: Point) -> float:
+        x, y = point
+        return float(self.cost_field[y, x])
+
+    def _motion_cost(self, from_pt: Point, to_pt: Point) -> float:
+        pixels = segment_points(from_pt, to_pt)
+        if len(pixels) < 2:
+            return 0.0
+
+        total = 0.0
+        prev_cost = self._state_cost(pixels[0])
+        for p in pixels[1:]:
+            current_cost = self._state_cost(p)
+            if current_cost > prev_cost:
+                total += current_cost - prev_cost
+            prev_cost = current_cost
+        return total
+
+    def _sample_uniform(self) -> Point:
+        return (
+            int(self.rng.integers(0, self.w)),
+            int(self.rng.integers(0, self.h)),
+        )
+
+    def _nearest_index(self, motions: List[BiTRRTMotion], point: Point) -> int:
+        pts = np.array([motion.point for motion in motions], dtype=np.float32)
+        dx = pts[:, 0] - point[0]
+        dy = pts[:, 1] - point[1]
+        return int(np.argmin(dx * dx + dy * dy))
+
+    def _add_motion(self, point: Point, motions: List[BiTRRTMotion], parent: Optional[int]) -> int:
+        state_cost = self._state_cost(point)
+        motions.append(BiTRRTMotion(point=point, parent=parent, state_cost=state_cost))
+        self.worst_cost = max(self.worst_cost, state_cost)
+        self.best_cost = min(self.best_cost, state_cost)
+        return len(motions) - 1
+
+    def _transition_test(self, motion_cost: float) -> bool:
+        if motion_cost >= self.cost_threshold:
+            return False
+        if motion_cost < 1e-4:
+            return True
+
+        transition_probability = float(np.exp(-motion_cost / max(self.temp, 1e-9)))
+        if transition_probability > 0.5:
+            cost_range = self.worst_cost - self.best_cost
+            if abs(cost_range) > 1e-4:
+                self.temp /= float(np.exp(motion_cost / (0.1 * cost_range)))
+            return True
+
+        self.temp *= self.temp_change_multiplier
+        return False
+
+    def _min_expansion_control(self, distance_from_nearest: float) -> bool:
+        if distance_from_nearest > self.frontier_threshold:
+            self.frontier_count += 1
+            return True
+
+        if (self.nonfrontier_count / max(1, self.frontier_count)) > self.frontier_node_ratio:
+            return False
+
+        self.nonfrontier_count += 1
+        return True
+
+    def _extend_tree(
+        self,
+        nearest_idx: int,
+        motions: List[BiTRRTMotion],
+        target: Point,
+        tree_is_start: bool,
+    ) -> Tuple[int, Optional[int], Optional[Edge], Optional[Point]]:
+        q_near = motions[nearest_idx].point
+        d = dist(q_near, target)
+        reach = d <= self.max_distance
+        q_new = clamp_point(target if reach else steer(q_near, target, self.max_distance), self.w, self.h)
+
+        if q_new == q_near or not self.is_free(q_new):
+            return self.FAILED, None, None, q_new
+
+        if not line_collision_free(q_near, q_new, self.occ):
+            return self.FAILED, None, None, q_new
+
+        motion_cost = self._motion_cost(q_near, q_new) if tree_is_start else self._motion_cost(q_new, q_near)
+        extension_distance = dist(q_near, q_new)
+        if not self._transition_test(motion_cost):
+            return self.FAILED, None, None, q_new
+        if not self._min_expansion_control(extension_distance):
+            return self.FAILED, None, None, q_new
+
+        new_idx = self._add_motion(q_new, motions, nearest_idx)
+        edge = (q_near, q_new)
+        return (self.SUCCESS if reach else self.ADVANCED), new_idx, edge, None
+
+    def _connect_trees(
+        self,
+        source_idx: int,
+        source_motions: List[BiTRRTMotion],
+        target_motions: List[BiTRRTMotion],
+        target_tree_is_start: bool,
+    ) -> Tuple[bool, List[Edge], Optional[int], Optional[Point]]:
+        source_point = source_motions[source_idx].point
+        nearest_idx = self._nearest_index(target_motions, source_point)
+        nearest_point = target_motions[nearest_idx].point
+        if dist(nearest_point, source_point) > self.connection_range:
+            return False, [], None, None
+
+        connect_edges: List[Edge] = []
+        current_nearest_idx = nearest_idx
+        while True:
+            result, new_idx, edge, rejected = self._extend_tree(
+                current_nearest_idx, target_motions, source_point, target_tree_is_start
+            )
+            if edge is not None:
+                connect_edges.append(edge)
+            if result == self.ADVANCED and new_idx is not None:
+                current_nearest_idx = new_idx
+                continue
+            if result == self.SUCCESS and new_idx is not None:
+                return True, connect_edges, new_idx, None
+            return False, connect_edges, None, rejected
+
+    def _backtrack_path(self, motions: List[BiTRRTMotion], index: int) -> List[Point]:
+        path: List[Point] = []
+        visited: Set[int] = set()
+        current: Optional[int] = index
+        while current is not None and current not in visited:
+            visited.add(current)
+            path.append(motions[current].point)
+            current = motions[current].parent
+        return path
+
+    def step_once(self) -> StepResult:
+        if self.done:
+            return StepResult(done=True, found_path=self.found_path)
+
+        if self.iteration >= self.max_iters:
+            self.done = True
+            return StepResult(done=True, found_path=False)
+
+        self.iteration += 1
+        q_rand = self._sample_uniform()
+
+        if self.grow_start_tree:
+            grow_tree = self.tree_start
+            grow_is_start = True
+            other_tree = self.tree_goal
+            other_is_start = False
+        else:
+            grow_tree = self.tree_goal
+            grow_is_start = False
+            other_tree = self.tree_start
+            other_is_start = True
+
+        nearest_idx = self._nearest_index(grow_tree, q_rand)
+        extend_result, new_idx, extend_edge, rejected_point = self._extend_tree(
+            nearest_idx, grow_tree, q_rand, grow_is_start
+        )
+
+        edges: List[Edge] = []
+        if extend_edge is not None:
+            edges.append(extend_edge)
+
+        final_rejected = rejected_point
+        if extend_result != self.FAILED and new_idx is not None:
+            connected, connect_edges, other_idx, connect_rejected = self._connect_trees(
+                new_idx, grow_tree, other_tree, other_is_start
+            )
+            edges.extend(connect_edges)
+            if connect_rejected is not None:
+                final_rejected = connect_rejected
+
+            if connected and other_idx is not None:
+                if grow_is_start:
+                    self.connection_start_idx = new_idx
+                    self.connection_goal_idx = other_idx
+                else:
+                    self.connection_start_idx = other_idx
+                    self.connection_goal_idx = new_idx
+                self.done = True
+                self.found_path = True
+
+                if len(edges) > 1:
+                    result = StepResult(edges=edges, done=True, found_path=True)
+                elif len(edges) == 1:
+                    result = StepResult(edge=edges[0], done=True, found_path=True)
+                else:
+                    result = StepResult(done=True, found_path=True)
+                self.grow_start_tree = not self.grow_start_tree
+                return result
+
+        self.grow_start_tree = not self.grow_start_tree
+        if len(edges) > 1:
+            return StepResult(edges=edges, rejected_point=final_rejected)
+        if len(edges) == 1:
+            return StepResult(edge=edges[0], rejected_point=final_rejected)
+        return StepResult(rejected_point=final_rejected)
+
+    def extract_path(self) -> List[Tuple[int, int]]:
+        if self.connection_start_idx is None or self.connection_goal_idx is None:
+            return []
+
+        path_start = self._backtrack_path(self.tree_start, self.connection_start_idx)
+        path_start.reverse()
+        path_goal = self._backtrack_path(self.tree_goal, self.connection_goal_idx)
+
+        if path_goal and path_start and path_start[-1] == path_goal[0]:
+            return path_start + path_goal[1:]
+        return path_start + path_goal
+
+    def get_status(self) -> str:
+        total_states = len(self.tree_start) + len(self.tree_goal)
+        status = "FOUND" if self.found_path else "searching"
+        threshold = "inf" if not np.isfinite(self.cost_threshold) else f"{self.cost_threshold:.2f}"
+        return (
+            f"BiTRRT: iter {self.iteration}/{self.max_iters}, states {total_states} "
+            f"(S:{len(self.tree_start)}, G:{len(self.tree_goal)}), temp {self.temp:.3f}, "
+            f"f/nf {self.frontier_count}/{self.nonfrontier_count}, cost<= {threshold}, {status}"
+        )
+
+    @staticmethod
+    def get_params_widget() -> QWidget:
+        return BiTRRTParamsWidget()
+
+    @staticmethod
+    def create_from_params(
+        occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int], params_widget: QWidget
+    ) -> 'BiTRRTPlanner':
+        params = params_widget.get_params()
+        return BiTRRTPlanner(occ, start, goal, **params)
+
+
+# ============================================================================
+# KPIECE Implementation
+# ============================================================================
+
+
+@dataclass
+class KPIECEMotion:
+    """Single motion/node in a KPIECE exploration tree."""
+
+    start: Point
+    end: Point
+    parent: Optional[int]
+    cell_coord: Tuple[int, int]
+
+
+@dataclass
+class KPIECECell:
+    """Single projected grid cell used by KPIECE."""
+
+    coord: Tuple[int, int]
+    motion_indices: List[int] = field(default_factory=list)
+    coverage: float = 0.0
+    selections: int = 1
+    score: float = 1.0
+    creation_iteration: int = 1
+    importance: float = 0.0
+    border: bool = True
+    neighbor_count: int = 0
+
+
+class KPIECEParamsWidget(QWidget):
+    """Widget for KPIECE parameter configuration."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QFormLayout()
+
+        self.spin_range = QDoubleSpinBox()
+        self.spin_range.setRange(1.0, 500.0)
+        self.spin_range.setSingleStep(1.0)
+        self.spin_range.setValue(18.0)
+        self.spin_range.setToolTip(
+            "Maximum local expansion radius used when sampling around the selected motion"
+        )
+
+        self.spin_goal_bias = QDoubleSpinBox()
+        self.spin_goal_bias.setRange(0.0, 1.0)
+        self.spin_goal_bias.setSingleStep(0.01)
+        self.spin_goal_bias.setDecimals(3)
+        self.spin_goal_bias.setValue(0.02)
+        self.spin_goal_bias.setToolTip(
+            "Optional goal-directed sampling probability. Small nonzero values often help in this geometric 2D adaptation."
+        )
+
+        self.spin_goal_tol = QSpinBox()
+        self.spin_goal_tol.setRange(1, 200)
+        self.spin_goal_tol.setValue(24)
+        self.spin_goal_tol.setToolTip(
+            "Distance threshold for snapping a newly added state to the goal"
+        )
+
+        self.spin_border_fraction = QDoubleSpinBox()
+        self.spin_border_fraction.setRange(0.0, 1.0)
+        self.spin_border_fraction.setSingleStep(0.01)
+        self.spin_border_fraction.setDecimals(3)
+        self.spin_border_fraction.setValue(0.80)
+        self.spin_border_fraction.setToolTip(
+            "Probability of expanding from a border / exterior cell rather than an interior cell"
+        )
+
+        self.spin_progress_alpha = QDoubleSpinBox()
+        self.spin_progress_alpha.setRange(0.001, 2.0)
+        self.spin_progress_alpha.setSingleStep(0.01)
+        self.spin_progress_alpha.setDecimals(3)
+        self.spin_progress_alpha.setValue(0.10)
+        self.spin_progress_alpha.setToolTip(
+            "Positive progress offset alpha used in P = alpha + beta * (coverage increase / simulated distance)"
+        )
+
+        self.spin_progress_beta = QDoubleSpinBox()
+        self.spin_progress_beta.setRange(0.0, 5.0)
+        self.spin_progress_beta.setSingleStep(0.05)
+        self.spin_progress_beta.setDecimals(3)
+        self.spin_progress_beta.setValue(0.90)
+        self.spin_progress_beta.setToolTip(
+            "Progress scaling beta used in the paper-style score penalty"
+        )
+
+        self.spin_min_valid = QDoubleSpinBox()
+        self.spin_min_valid.setRange(0.01, 1.0)
+        self.spin_min_valid.setSingleStep(0.01)
+        self.spin_min_valid.setDecimals(3)
+        self.spin_min_valid.setValue(0.20)
+        self.spin_min_valid.setToolTip(
+            "Minimum valid fraction required to keep a partial edge when collision stops a motion"
+        )
+
+        self.spin_cell_size = QSpinBox()
+        self.spin_cell_size.setRange(2, 200)
+        self.spin_cell_size.setValue(28)
+        self.spin_cell_size.setToolTip(
+            "Projected grid cell size in pixels for the single-level KPIECE discretization"
+        )
+
+        self.spin_max_iters = QSpinBox()
+        self.spin_max_iters.setRange(100, 200000)
+        self.spin_max_iters.setValue(25000)
+        self.spin_max_iters.setToolTip("Maximum number of planning iterations")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(1)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
+
+        layout.addRow("Range:", self.spin_range)
+        layout.addRow("Goal bias:", self.spin_goal_bias)
+        layout.addRow("Goal tolerance:", self.spin_goal_tol)
+        layout.addRow("Border fraction:", self.spin_border_fraction)
+        layout.addRow("Progress alpha:", self.spin_progress_alpha)
+        layout.addRow("Progress beta:", self.spin_progress_beta)
+        layout.addRow("Min valid fraction:", self.spin_min_valid)
+        layout.addRow("Cell size:", self.spin_cell_size)
+        layout.addRow("Max iterations:", self.spin_max_iters)
+        layout.addRow("Seed:", self.spin_seed)
+
+        self.setLayout(layout)
+
+    def get_params(self) -> dict:
+        return {
+            'range': self.spin_range.value(),
+            'goal_bias': self.spin_goal_bias.value(),
+            'goal_tolerance': self.spin_goal_tol.value(),
+            'border_fraction': self.spin_border_fraction.value(),
+            'progress_alpha': self.spin_progress_alpha.value(),
+            'progress_beta': self.spin_progress_beta.value(),
+            'min_valid_path_fraction': self.spin_min_valid.value(),
+            'cell_size': self.spin_cell_size.value(),
+            'max_iters': self.spin_max_iters.value(),
+            'seed': self.spin_seed.value(),
+        }
+
+
+class KPIECEPlanner(BasePlanner):
+    """KPIECE - projection-guided tree planner with border-cell exploration."""
+
+    name = "KPIECE"
+    description = "Projection-grid planner with state sampling along motions, border-cell preference, and progress-based score penalties"
+
+    def __init__(
+        self,
+        occ: np.ndarray,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        range: float = 24.0,
+        goal_bias: float = 0.02,
+        goal_tolerance: int = 24,
+        border_fraction: float = 0.80,
+        progress_alpha: float = 0.10,
+        progress_beta: float = 0.90,
+        min_valid_path_fraction: float = 0.20,
+        cell_size: int = 28,
+        max_iters: int = 25000,
+        seed: int = 1,
+    ) -> None:
+        super().__init__(occ, start, goal)
+
+        self.max_distance = float(max(1.0, range))
+        self.goal_bias = float(np.clip(goal_bias, 0.0, 1.0))
+        self.goal_tolerance = float(max(1, goal_tolerance))
+        self.border_fraction = float(np.clip(border_fraction, 0.0, 1.0))
+        self.progress_alpha = float(max(1e-6, progress_alpha))
+        self.progress_beta = float(max(0.0, progress_beta))
+        self.min_valid_path_fraction = float(np.clip(min_valid_path_fraction, 1e-6, 1.0))
+        self.cell_size = int(max(2, cell_size))
+        self.max_iters = int(max_iters)
+        self.rng = np.random.default_rng(seed)
+
+        self.motions: List[KPIECEMotion] = []
+        self.cells: Dict[Tuple[int, int], KPIECECell] = {}
+        self.point_set: Set[Point] = set()
+        self.goal_idx: Optional[int] = None
+        self.closest_goal_idx: Optional[int] = None
+        self.closest_goal_dist = float('inf')
+        self.border_cell_count = 0
+
+        start_idx, _ = self._add_motion(start, start, parent=None)
+        self.closest_goal_idx = start_idx
+        self.closest_goal_dist = dist(start, goal)
+
+        if start == goal:
+            self.goal_idx = start_idx
+            self.found_path = True
+            self.done = True
+
+    def _project(self, point: Point) -> Tuple[int, int]:
+        return (int(point[0] // self.cell_size), int(point[1] // self.cell_size))
+
+    @staticmethod
+    def _neighbor_coords(coord: Tuple[int, int]) -> List[Tuple[int, int]]:
+        cx, cy = coord
+        return [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)]
+
+    def _compute_importance(self, cell: KPIECECell) -> None:
+        creation_term = float(np.log(max(2, cell.creation_iteration)))
+        neighbor_term = float(max(1, cell.neighbor_count))
+        coverage_term = max(1.0, cell.coverage)
+        selection_term = float(max(1, cell.selections))
+        cell.importance = creation_term * cell.score / (selection_term * neighbor_term * coverage_term)
+
+    def _recompute_cells(self, coords: Set[Tuple[int, int]]) -> None:
+        for coord in coords:
+            cell = self.cells.get(coord)
+            if cell is None:
+                continue
+            prev_border = cell.border
+            cell.neighbor_count = sum(1 for ncoord in self._neighbor_coords(coord) if ncoord in self.cells)
+            cell.border = cell.neighbor_count < 4
+            if cell.border != prev_border:
+                self.border_cell_count += 1 if cell.border else -1
+            self._compute_importance(cell)
+
+    def _add_motion(
+        self, start: Point, end: Point, parent: Optional[int], coord: Optional[Tuple[int, int]] = None
+    ) -> Tuple[int, float]:
+        coord = self._project(end) if coord is None else coord
+        motion_idx = len(self.motions)
+        self.motions.append(KPIECEMotion(start=start, end=end, parent=parent, cell_coord=coord))
+        self.point_set.add(end)
+
+        cell = self.cells.get(coord)
+        affected_coords: Set[Tuple[int, int]] = {coord}
+        if cell is None:
+            cell = KPIECECell(coord=coord, creation_iteration=max(1, self.iteration))
+            self.cells[coord] = cell
+            self.border_cell_count += 1
+            affected_coords.update(self._neighbor_coords(coord))
+
+        coverage_delta = 1.0 if parent is None else max(1e-6, dist(start, end))
+        cell.coverage += coverage_delta
+        cell.motion_indices.append(motion_idx)
+
+        self._recompute_cells(affected_coords)
+
+        goal_dist = dist(end, self.goal)
+        if goal_dist < self.closest_goal_dist:
+            self.closest_goal_dist = goal_dist
+            self.closest_goal_idx = motion_idx
+
+        return motion_idx, coverage_delta
+
+    def _select_cell(self) -> KPIECECell:
+        all_cells = [cell for cell in self.cells.values() if cell.motion_indices]
+        border_cells = [cell for cell in all_cells if cell.border]
+        interior_cells = [cell for cell in all_cells if not cell.border]
+        border_probability = max(
+            self.border_fraction,
+            len(border_cells) / max(1, len(all_cells)),
+        )
+
+        if border_cells and (not interior_cells or self.rng.random() < border_probability):
+            pool = border_cells
+        else:
+            pool = interior_cells if interior_cells else all_cells
+
+        chosen = max(
+            pool,
+            key=lambda cell: (
+                cell.importance,
+                cell.creation_iteration,
+                -cell.selections,
+                len(cell.motion_indices),
+            ),
+        )
+        if chosen.score < np.finfo(np.float64).eps:
+            for cell in self.cells.values():
+                cell.score += 1.0
+                self._compute_importance(cell)
+            chosen = max(
+                pool,
+                key=lambda cell: (
+                    cell.importance,
+                    cell.creation_iteration,
+                    -cell.selections,
+                    len(cell.motion_indices),
+                ),
+            )
+        chosen.selections += 1
+        self._compute_importance(chosen)
+        return chosen
+
+    def _select_motion_index(self, cell: KPIECECell) -> int:
+        if len(cell.motion_indices) == 1:
+            return cell.motion_indices[0]
+
+        sigma = max(1.0, len(cell.motion_indices) / 3.0)
+        offset = min(int(abs(self.rng.normal(0.0, sigma))), len(cell.motion_indices) - 1)
+        return cell.motion_indices[-1 - offset]
+
+    def _select_state_on_motion(self, motion_idx: int) -> Point:
+        motion = self.motions[motion_idx]
+        if motion.start == motion.end:
+            return motion.end
+        t = float(self.rng.random())
+        x = int(round(motion.start[0] + t * (motion.end[0] - motion.start[0])))
+        y = int(round(motion.start[1] + t * (motion.end[1] - motion.start[1])))
+        return clamp_point((x, y), self.w, self.h)
+
+    def _sample_target(self, from_pt: Point) -> Point:
+        if self.rng.random() < self.goal_bias:
+            target = self.goal
+        else:
+            angle = float(self.rng.uniform(0.0, 2.0 * np.pi))
+            radius = float(self.max_distance * np.sqrt(self.rng.random()))
+            target = (
+                int(round(from_pt[0] + radius * np.cos(angle))),
+                int(round(from_pt[1] + radius * np.sin(angle))),
+            )
+
+        target = clamp_point(target, self.w, self.h)
+        if dist(from_pt, target) > self.max_distance:
+            target = clamp_point(steer(from_pt, target, self.max_distance), self.w, self.h)
+        return target
+
+    def _split_segment_by_cells(
+        self, start: Point, end: Point
+    ) -> List[Tuple[Point, Point, Tuple[int, int]]]:
+        points = segment_points(start, end)
+        if len(points) < 2:
+            return []
+
+        segments: List[Tuple[Point, Point, Tuple[int, int]]] = []
+        current_start = points[0]
+        current_cell = self._project(points[0])
+        for point in points[1:]:
+            point_cell = self._project(point)
+            if point_cell != current_cell:
+                if current_start != point:
+                    segments.append((current_start, point, current_cell))
+                current_start = point
+                current_cell = point_cell
+        if current_start != points[-1]:
+            segments.append((current_start, points[-1], current_cell))
+        return segments
+
+    def _partial_extension(self, from_pt: Point, target: Point) -> Tuple[Optional[Point], float]:
+        if target == from_pt:
+            return None, 0.0
+
+        total_dist = dist(from_pt, target)
+        if total_dist <= 1e-6:
+            return None, 0.0
+
+        last_valid = from_pt
+        for point in segment_points(from_pt, target):
+            if point == from_pt:
+                continue
+            if not self.is_free(point):
+                break
+            last_valid = point
+
+        if last_valid == from_pt:
+            return None, 0.0
+
+        moved_dist = dist(from_pt, last_valid)
+        valid_fraction = moved_dist / total_dist
+        if last_valid != target and valid_fraction < self.min_valid_path_fraction:
+            return None, moved_dist
+        return last_valid, moved_dist
+
+    def _apply_progress_penalty(self, cell: KPIECECell, coverage_delta: float, simulated_distance: float) -> None:
+        if simulated_distance <= 1e-6:
+            progress = self.progress_alpha
+        else:
+            progress = self.progress_alpha + self.progress_beta * (coverage_delta / simulated_distance)
+        if progress < 1.0:
+            cell.score *= progress
+            self._compute_importance(cell)
+
+    def _add_motion_chain(
+        self, parent_idx: int, start: Point, end: Point
+    ) -> Tuple[Optional[int], List[Edge], float]:
+        segments = self._split_segment_by_cells(start, end)
+        if not segments:
+            return None, [], 0.0
+
+        total_coverage_delta = 0.0
+        edges: List[Edge] = []
+        current_parent = parent_idx
+        last_idx: Optional[int] = None
+        for seg_start, seg_end, seg_cell in segments:
+            if seg_start == seg_end:
+                continue
+            motion_idx, coverage_delta = self._add_motion(seg_start, seg_end, current_parent, coord=seg_cell)
+            total_coverage_delta += coverage_delta
+            edges.append((seg_start, seg_end))
+            current_parent = motion_idx
+            last_idx = motion_idx
+        return last_idx, edges, total_coverage_delta
+
+    def _connect_goal(self, from_idx: int) -> Optional[Tuple[int, List[Edge]]]:
+        from_pt = self.motions[from_idx].end
+        if dist(from_pt, self.goal) > self.goal_tolerance:
+            return None
+        if not line_collision_free(from_pt, self.goal, self.occ):
+            return None
+
+        if from_pt == self.goal:
+            self.goal_idx = from_idx
+            self.done = True
+            self.found_path = True
+            return (from_idx, [])
+
+        goal_idx, goal_edges, _ = self._add_motion_chain(from_idx, from_pt, self.goal)
+        if goal_idx is None:
+            return None
+
+        self.goal_idx = goal_idx
+        self.done = True
+        self.found_path = True
+        return (goal_idx, goal_edges)
+
+    def step_once(self) -> StepResult:
+        if self.done:
+            return StepResult(done=True, found_path=self.found_path)
+
+        if self.iteration >= self.max_iters:
+            self.done = True
+            return StepResult(done=True, found_path=False)
+
+        self.iteration += 1
+        cell = self._select_cell()
+        motion_idx = self._select_motion_index(cell)
+        source = self._select_state_on_motion(motion_idx)
+        target = self._sample_target(source)
+        attempted_distance = max(dist(source, target), 1e-6)
+        new_point, traveled = self._partial_extension(source, target)
+
+        if new_point is None or new_point in self.point_set:
+            self._apply_progress_penalty(cell, coverage_delta=0.0, simulated_distance=attempted_distance)
+            return StepResult(rejected_point=target)
+
+        new_idx, edges, coverage_delta = self._add_motion_chain(motion_idx, source, new_point)
+        self._apply_progress_penalty(cell, coverage_delta=coverage_delta, simulated_distance=max(traveled, attempted_distance))
+        if new_idx is None:
+            return StepResult(rejected_point=target)
+
+        goal_result = self._connect_goal(new_idx)
+        if goal_result is not None:
+            _, goal_edges = goal_result
+            if goal_edges:
+                return StepResult(edges=edges + goal_edges, done=True, found_path=True)
+            return StepResult(edges=edges, done=True, found_path=True)
+
+        if len(edges) == 1:
+            return StepResult(edge=edges[0])
+        return StepResult(edges=edges)
+
+    def extract_path(self) -> List[Point]:
+        if self.goal_idx is None:
+            return []
+
+        chain: List[Tuple[int, Point]] = []
+        current: Optional[int] = self.goal_idx
+        target = self.motions[self.goal_idx].end
+        while current is not None:
+            chain.append((current, target))
+            motion = self.motions[current]
+            target = motion.start
+            current = motion.parent
+
+        chain.reverse()
+        root_motion = self.motions[chain[0][0]]
+        path: List[Point] = [root_motion.start]
+        for _, target_state in chain:
+            if path[-1] != target_state:
+                path.append(target_state)
+        return path
+
+    def get_status(self) -> str:
+        status = "FOUND" if self.found_path else f"closest {self.closest_goal_dist:.1f}px"
+        return (
+            f"KPIECE: iter {self.iteration}/{self.max_iters}, motions {len(self.motions)}, "
+            f"cells {len(self.cells)} (border {self.border_cell_count}), {status}"
+        )
+
+    @staticmethod
+    def get_params_widget() -> QWidget:
+        return KPIECEParamsWidget()
+
+    @staticmethod
+    def create_from_params(
+        occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int], params_widget: QWidget
+    ) -> 'KPIECEPlanner':
+        params = params_widget.get_params()
+        return KPIECEPlanner(occ, start, goal, **params)
+
+# ============================================================================
 # RRT* Implementation
 # ============================================================================
 
@@ -997,10 +1982,10 @@ class RRTStarParamsWidget(QWidget):
         }
 
 class RRTStarPlanner(BasePlanner):
-    """RRT* - Optimal RRT with rewiring for shorter paths."""
+    """RRT* - Rewiring-based RRT variant with incremental path improvement."""
     
     name = "RRT*"
-    description = "Optimal RRT with cost-based rewiring"
+    description = "Rewiring-based sampling planner with incremental path improvement"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  step_size: int = 18, goal_sample_rate: float = 0.10, goal_tolerance: int = 20,
@@ -1795,7 +2780,7 @@ class STOMPPlanner(BasePlanner):
     """
     
     name = "STOMP"
-    description = "Stochastic trajectory optimization"
+    description = "Approximate / experimental stochastic trajectory optimization"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 50, max_iters: int = 300, num_rollouts: int = 20,
@@ -2154,36 +3139,89 @@ class PRMPlanner(BasePlanner):
     """PRM - Probabilistic Roadmap planner.
     
     Two phases:
-    1. Learning phase: Sample random points and connect to k-nearest neighbors
-    2. Query phase: Connect start/goal to roadmap and search with A*
+    1. Learning phase: Build a roadmap of collision-free random samples
+    2. Query phase: Connect start/goal to the roadmap and search the graph
     """
     
     name = "PRM"
-    description = "Probabilistic Roadmap"
+    description = "Two-phase probabilistic roadmap with query-time start/goal connection"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                 num_samples: int = 500, k_neighbors: int = 10, max_edge_dist: int = 100, seed: int = 42):
+                  num_samples: int = 500, k_neighbors: int = 10, max_edge_dist: int = 100, seed: int = 42):
         super().__init__(occ, start, goal)
         
-        self.num_samples = num_samples
-        self.k_neighbors = k_neighbors
-        self.max_edge_dist = max_edge_dist
+        self.num_samples = int(max(1, num_samples))
+        self.k_neighbors = int(max(1, k_neighbors))
+        self.max_edge_dist = float(max(1.0, max_edge_dist))
         self.rng = np.random.default_rng(seed)
-        
-        # Roadmap data structures
-        self.nodes: List[Tuple[int, int]] = [start, goal]  # 0=start, 1=goal
-        self.edges: Dict[int, List[Tuple[int, float]]] = {0: [], 1: []}  # adjacency list with costs
-        
+
+        # Roadmap is learned independently of the query.
+        self.nodes: List[Point] = []
+        self.edges: Dict[int, List[Tuple[int, float]]] = {}
+        self.roadmap_size = 0
+        self.sample_pool: List[Point] = self._build_sample_pool()
+
+        # Query nodes are added only after roadmap learning.
+        self.start_idx: Optional[int] = None
+        self.goal_idx: Optional[int] = None
+
         # Phase tracking
-        self.phase = "sampling"  # sampling -> connecting -> searching -> done
+        self.phase = "sampling"  # sampling -> connecting -> query_start -> query_goal -> searching -> done
         self.sample_idx = 0
         self.connect_idx = 0
         self.search_open: List[Tuple[float, float, int]] = []  # (f_cost, g_cost, node)
         self.search_closed: Set[int] = set()
         self.search_parent: Dict[int, int] = {}
-        self.search_g: Dict[int, float] = {0: 0.0}
+        self.search_g: Dict[int, float] = {}
         self.current_path: List[int] = []
-        
+
+    def _build_sample_pool(self) -> List[Point]:
+        """Pre-sample unique free roadmap nodes, excluding query configurations."""
+        free_y, free_x = np.where(~self.occ)
+        free_points = [
+            (int(x), int(y))
+            for x, y in zip(free_x.tolist(), free_y.tolist())
+            if (int(x), int(y)) not in {self.start, self.goal}
+        ]
+        if not free_points:
+            return []
+
+        sample_count = min(self.num_samples, len(free_points))
+        chosen = self.rng.choice(len(free_points), size=sample_count, replace=False)
+        return [free_points[int(i)] for i in chosen]
+
+    def _add_node(self, point: Point) -> int:
+        node_idx = len(self.nodes)
+        self.nodes.append(point)
+        self.edges[node_idx] = []
+        return node_idx
+
+    def _edge_exists(self, a: int, b: int) -> bool:
+        return any(neighbor == b for neighbor, _ in self.edges[a])
+
+    def _candidate_neighbors(self, point: Point, candidate_indices: List[int]) -> List[Tuple[float, int]]:
+        distances: List[Tuple[float, int]] = []
+        for idx in candidate_indices:
+            other = self.nodes[idx]
+            d = dist(point, other)
+            if d <= self.max_edge_dist:
+                distances.append((d, idx))
+        distances.sort(key=lambda item: item[0])
+        return distances[:self.k_neighbors]
+
+    def _connect_node(self, node_idx: int, candidate_indices: List[int]) -> List[Edge]:
+        node = self.nodes[node_idx]
+        added_edges: List[Edge] = []
+        for edge_dist, neighbor_idx in self._candidate_neighbors(node, candidate_indices):
+            if neighbor_idx == node_idx or self._edge_exists(node_idx, neighbor_idx):
+                continue
+            if not line_collision_free(node, self.nodes[neighbor_idx], self.occ):
+                continue
+            self.edges[node_idx].append((neighbor_idx, edge_dist))
+            self.edges[neighbor_idx].append((node_idx, edge_dist))
+            added_edges.append((node, self.nodes[neighbor_idx]))
+        return added_edges
+    
     def step_once(self) -> StepResult:
         if self.done:
             return StepResult(done=True, found_path=self.found_path)
@@ -2199,6 +3237,10 @@ class PRMPlanner(BasePlanner):
             return self._sampling_step()
         elif self.phase == "connecting":
             return self._connecting_step()
+        elif self.phase == "query_start":
+            return self._query_connect_step(self.start)
+        elif self.phase == "query_goal":
+            return self._query_connect_step(self.goal)
         elif self.phase == "searching":
             return self._searching_step()
         
@@ -2206,80 +3248,79 @@ class PRMPlanner(BasePlanner):
     
     def _sampling_step(self) -> StepResult:
         """Sample random points in free space."""
-        if self.sample_idx >= self.num_samples:
+        if self.sample_idx >= len(self.sample_pool):
+            self.roadmap_size = len(self.nodes)
             self.phase = "connecting"
             return StepResult()
-        
-        # Sample random point
-        for _ in range(10):  # Try up to 10 times to find free point
-            x = self.rng.integers(0, self.w)
-            y = self.rng.integers(0, self.h)
-            if self.occ[y, x] == 0:
-                node_idx = len(self.nodes)
-                self.nodes.append((x, y))
-                self.edges[node_idx] = []
-                self.sample_idx += 1
-                return StepResult(edge=((x-2, y-2), (x+2, y+2)))  # Small marker
-        
+
+        x, y = self.sample_pool[self.sample_idx]
+        self._add_node((x, y))
         self.sample_idx += 1
-        return StepResult()
+        return StepResult(edge=((x - 2, y - 2), (x + 2, y + 2)))  # Small marker
     
     def _connecting_step(self) -> StepResult:
-        """Connect nodes to their k-nearest neighbors."""
-        if self.connect_idx >= len(self.nodes):
-            # Initialize A* search
-            self.phase = "searching"
-            h = self._heuristic(0)
-            self.search_open = [(h, 0.0, 0)]
-            import heapq
-            heapq.heapify(self.search_open)
+        """Connect roadmap nodes to nearby roadmap neighbors."""
+        if self.connect_idx >= self.roadmap_size:
+            self.phase = "query_start"
             return StepResult()
-        
-        node = self.nodes[self.connect_idx]
-        
-        # Find k-nearest neighbors
-        distances = []
-        for i, other in enumerate(self.nodes):
-            if i != self.connect_idx:
-                d = np.sqrt((node[0] - other[0])**2 + (node[1] - other[1])**2)
-                if d <= self.max_edge_dist:
-                    distances.append((d, i))
-        
-        distances.sort()
-        neighbors = distances[:self.k_neighbors]
-        
-        edge = None
-        for dist, neighbor_idx in neighbors:
-            # Check if edge already exists
-            if any(n == neighbor_idx for n, _ in self.edges[self.connect_idx]):
-                continue
-            
-            # Check collision-free path
-            if line_collision_free(node, self.nodes[neighbor_idx], self.occ):
-                self.edges[self.connect_idx].append((neighbor_idx, dist))
-                self.edges[neighbor_idx].append((self.connect_idx, dist))
-                edge = (node, self.nodes[neighbor_idx])
-        
+
+        candidate_indices = [idx for idx in range(self.roadmap_size) if idx != self.connect_idx]
+        edges = self._connect_node(self.connect_idx, candidate_indices)
         self.connect_idx += 1
-        return StepResult(edge=edge)
+        return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if len(edges) > 1 else None)
+
+    def _query_connect_step(self, query_point: Point) -> StepResult:
+        """Attach a query configuration to the learned roadmap."""
+        if self.roadmap_size == 0:
+            self.phase = "done"
+            self.done = True
+            return StepResult(done=True, found_path=False)
+
+        node_idx = self._add_node(query_point)
+        # Query nodes connect to the previously built roadmap and, once available,
+        # to earlier query nodes as well (e.g. direct start-goal visibility).
+        edges = self._connect_node(node_idx, list(range(node_idx)))
+
+        if query_point == self.start:
+            self.start_idx = node_idx
+            self.phase = "query_goal"
+        else:
+            self.goal_idx = node_idx
+            if not edges or self.start_idx is None:
+                self.phase = "done"
+                self.done = True
+                return StepResult(done=True, found_path=False)
+            self.phase = "searching"
+            self.search_open = []
+            self.search_closed = set()
+            self.search_parent = {}
+            self.search_g = {self.start_idx: 0.0}
+            heapq.heappush(self.search_open, (self._heuristic(self.start_idx), 0.0, self.start_idx))
+
+        return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if len(edges) > 1 else None)
     
     def _searching_step(self) -> StepResult:
         """A* search on the roadmap."""
-        import heapq
-        
+        if self.start_idx is None or self.goal_idx is None:
+            self.phase = "done"
+            self.done = True
+            return StepResult(done=True, found_path=False)
+
         if not self.search_open:
+            self.phase = "done"
             self.done = True
             return StepResult(done=True, found_path=False)
         
         _, current_g, current = heapq.heappop(self.search_open)
 
-        if current == 1:  # Reached goal
+        if current == self.goal_idx:
             self.current_path = [current]
             while current in self.search_parent:
                 current = self.search_parent[current]
                 self.current_path.append(current)
             self.current_path.reverse()
             self.found_path = True
+            self.phase = "done"
             self.done = True
             return StepResult(done=True, found_path=True)
         
@@ -2314,7 +3355,11 @@ class PRMPlanner(BasePlanner):
         return [self.nodes[i] for i in self.current_path]
     
     def get_status(self) -> str:
-        return f"PRM: {self.phase}, nodes: {len(self.nodes)}, edges: {sum(len(e) for e in self.edges.values())//2}"
+        total_edges = sum(len(e) for e in self.edges.values()) // 2
+        return (
+            f"PRM: {self.phase}, roadmap nodes: {self.roadmap_size}, "
+            f"total nodes: {len(self.nodes)}, edges: {total_edges}"
+        )
     
     @staticmethod
     def get_params_widget() -> QWidget:
@@ -2325,6 +3370,581 @@ class PRMPlanner(BasePlanner):
                           params_widget: QWidget) -> 'PRMPlanner':
         params = params_widget.get_params()
         return PRMPlanner(occ, start, goal, **params)
+
+
+# ============================================================================
+# SBL - Single-query Bi-directional Lazy collision checking
+# ============================================================================
+
+class SBLParamsWidget(QWidget):
+    """Parameters widget for the SBL planner."""
+
+    def __init__(self):
+        super().__init__()
+        layout = QFormLayout()
+
+        self.spin_maxit = QSpinBox()
+        self.spin_maxit.setRange(100, 200000)
+        self.spin_maxit.setValue(12000)
+        self.spin_maxit.setToolTip("Maximum number of milestone expansion iterations")
+
+        self.spin_rho = QSpinBox()
+        self.spin_rho.setRange(2, 400)
+        self.spin_rho.setValue(45)
+        self.spin_rho.setToolTip("SBL distance threshold rho for local expansion and tree connection")
+
+        self.spin_resolution = QSpinBox()
+        self.spin_resolution.setRange(1, 50)
+        self.spin_resolution.setValue(4)
+        self.spin_resolution.setToolTip("Lazy segment resolution epsilon in pixels")
+
+        self.spin_candidates = QSpinBox()
+        self.spin_candidates.setRange(1, 20)
+        self.spin_candidates.setValue(6)
+        self.spin_candidates.setToolTip("Maximum number of shrinking-neighborhood candidates per expansion")
+
+        self.spin_grid_cells = QSpinBox()
+        self.spin_grid_cells.setRange(2, 50)
+        self.spin_grid_cells.setValue(10)
+        self.spin_grid_cells.setToolTip("Spatial indexing resolution per tree (cells per axis)")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
+
+        layout.addRow("Max iterations:", self.spin_maxit)
+        layout.addRow("Rho:", self.spin_rho)
+        layout.addRow("Lazy resolution:", self.spin_resolution)
+        layout.addRow("Candidates:", self.spin_candidates)
+        layout.addRow("Grid cells:", self.spin_grid_cells)
+        layout.addRow("Seed:", self.spin_seed)
+
+        self.setLayout(layout)
+
+    def get_params(self) -> dict:
+        return {
+            'max_iters': self.spin_maxit.value(),
+            'rho': self.spin_rho.value(),
+            'lazy_resolution': self.spin_resolution.value(),
+            'max_candidates': self.spin_candidates.value(),
+            'grid_cells': self.spin_grid_cells.value(),
+            'seed': self.spin_seed.value(),
+        }
+
+
+class SBLPlanner(BasePlanner):
+    """SBL - Single-query bi-directional planner with lazy collision checking."""
+
+    name = "SBL"
+    description = "Bi-directional lazy roadmap planner with deferred collision checking and a lightweight post-optimizer"
+
+    def __init__(
+        self,
+        occ: np.ndarray,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        max_iters: int = 12000,
+        rho: int = 45,
+        lazy_resolution: int = 4,
+        max_candidates: int = 6,
+        grid_cells: int = 10,
+        seed: int = 42,
+    ) -> None:
+        super().__init__(occ, start, goal)
+
+        self.max_iters = max_iters
+        self.rho = float(rho)
+        self.lazy_resolution = float(lazy_resolution)
+        self.max_candidates = max_candidates
+        self.grid_cells = grid_cells
+        self.rng = np.random.default_rng(seed)
+
+        self.nodes: List[SBLNode] = [
+            SBLNode(point=start, tree_id=0, parent=None),
+            SBLNode(point=goal, tree_id=1, parent=None),
+        ]
+        self.tree_nodes: Dict[int, Set[int]] = {0: {0}, 1: {1}}
+        self.cell_maps: Dict[int, Dict[Tuple[int, int], Set[int]]] = {0: {}, 1: {}}
+        self.edge_states: Dict[frozenset[int], SBLSegmentState] = {}
+        self._add_to_cell_map(0)
+        self._add_to_cell_map(1)
+
+        self.raw_solution_path: List[Point] = []
+        self.solution_path: List[Point] = []
+        self.lazy_checks = 0
+        self.transfer_count = 0
+        self.bridge_attempts = 0
+        self.last_collision_point: Optional[Point] = None
+
+    def _edge_key(self, a: int, b: int) -> frozenset[int]:
+        return frozenset((a, b))
+
+    def _cell_for_point(self, p: Point) -> Tuple[int, int]:
+        cx = min(int(p[0] * self.grid_cells / max(1, self.w)), self.grid_cells - 1)
+        cy = min(int(p[1] * self.grid_cells / max(1, self.h)), self.grid_cells - 1)
+        return (cx, cy)
+
+    def _add_to_cell_map(self, node_id: int) -> None:
+        node = self.nodes[node_id]
+        cell = self._cell_for_point(node.point)
+        self.cell_maps[node.tree_id].setdefault(cell, set()).add(node_id)
+
+    def _remove_from_cell_map(self, node_id: int, tree_id: Optional[int] = None) -> None:
+        actual_tree = self.nodes[node_id].tree_id if tree_id is None else tree_id
+        cell = self._cell_for_point(self.nodes[node_id].point)
+        ids = self.cell_maps[actual_tree].get(cell)
+        if ids is None:
+            return
+        ids.discard(node_id)
+        if not ids:
+            del self.cell_maps[actual_tree][cell]
+
+    def _move_node_between_trees(self, node_id: int, new_tree: int) -> None:
+        old_tree = self.nodes[node_id].tree_id
+        if old_tree == new_tree:
+            return
+        self._remove_from_cell_map(node_id, tree_id=old_tree)
+        self.tree_nodes[old_tree].discard(node_id)
+        self.nodes[node_id].tree_id = new_tree
+        self.tree_nodes[new_tree].add(node_id)
+        self._add_to_cell_map(node_id)
+
+    def _pick_node_by_density(self, tree_id: int) -> int:
+        non_empty_cells = [cell for cell, ids in self.cell_maps[tree_id].items() if ids]
+        if not non_empty_cells:
+            return 0 if tree_id == 0 else 1
+        cell = non_empty_cells[int(self.rng.integers(0, len(non_empty_cells)))]
+        ids = list(self.cell_maps[tree_id][cell])
+        return ids[int(self.rng.integers(0, len(ids)))]
+
+    def _random_tree_node(self, tree_id: int) -> Optional[int]:
+        ids = list(self.tree_nodes[tree_id])
+        if not ids:
+            return None
+        return ids[int(self.rng.integers(0, len(ids)))]
+
+    def _sample_near(self, center: Point, radius: float) -> Point:
+        radius = max(1.0, radius)
+        iradius = max(1, int(np.ceil(radius)))
+        for _ in range(40):
+            dx = int(self.rng.integers(-iradius, iradius + 1))
+            dy = int(self.rng.integers(-iradius, iradius + 1))
+            p = clamp_point((center[0] + dx, center[1] + dy), self.w, self.h)
+            if p != center and linf_dist(center, p) <= radius + 1e-6:
+                return p
+        return clamp_point((center[0] + iradius, center[1]), self.w, self.h)
+
+    def _add_node(self, parent_id: int, point: Point, tree_id: int) -> int:
+        node_id = len(self.nodes)
+        self.nodes.append(SBLNode(point=point, tree_id=tree_id, parent=parent_id))
+        self.nodes[parent_id].children.add(node_id)
+        self.tree_nodes[tree_id].add(node_id)
+        self._add_to_cell_map(node_id)
+        self.edge_states[self._edge_key(parent_id, node_id)] = SBLSegmentState()
+        return node_id
+
+    def _expand_tree(self) -> Tuple[Optional[int], Optional[Edge]]:
+        tree_id = int(self.rng.integers(0, 2))
+        for _ in range(60):
+            parent_id = self._pick_node_by_density(tree_id)
+            parent_point = self.nodes[parent_id].point
+            for i in range(1, self.max_candidates + 1):
+                q = self._sample_near(parent_point, self.rho / i)
+                if q == parent_point or not self.is_free(q):
+                    continue
+                node_id = self._add_node(parent_id, q, tree_id)
+                return node_id, (parent_point, q)
+        return None, None
+
+    def _chain_root_to_node(self, node_id: int) -> List[int]:
+        chain: List[int] = []
+        current: Optional[int] = node_id
+        while current is not None:
+            chain.append(current)
+            current = self.nodes[current].parent
+        chain.reverse()
+        return chain
+
+    def _segment_length(self, edge_key: frozenset[int]) -> float:
+        a, b = tuple(edge_key)
+        return linf_dist(self.nodes[a].point, self.nodes[b].point)
+
+    def _segment_new_points(self, a: Point, b: Point, level: int) -> List[Point]:
+        denom = 2 ** level
+        pts: List[Point] = []
+        for odd in range(1, denom, 2):
+            t = odd / denom
+            x = int(round(a[0] + t * (b[0] - a[0])))
+            y = int(round(a[1] + t * (b[1] - a[1])))
+            p = clamp_point((x, y), self.w, self.h)
+            if p != a and p != b and (not pts or pts[-1] != p):
+                pts.append(p)
+        return pts
+
+    def _test_segment_once(self, edge_key: frozenset[int]) -> Optional[Point]:
+        state = self.edge_states.setdefault(edge_key, SBLSegmentState())
+        a_id, b_id = tuple(edge_key)
+        a = self.nodes[a_id].point
+        b = self.nodes[b_id].point
+        next_level = state.kappa + 1
+        self.lazy_checks += 1
+
+        for p in self._segment_new_points(a, b, next_level):
+            if not self.is_free(p):
+                return p
+
+        state.kappa = next_level
+        if self._segment_length(edge_key) / (2 ** next_level) < self.lazy_resolution:
+            if not line_collision_free(a, b, self.occ):
+                for p in segment_points(a, b):
+                    if not self.is_free(p):
+                        return p
+                return a
+            state.safe = True
+        return None
+
+    def _segment_score(self, edge_key: frozenset[int]) -> float:
+        state = self.edge_states[edge_key]
+        if state.safe:
+            return -1.0
+        return self._segment_length(edge_key) / (2 ** state.kappa)
+
+    def _build_solution_path(self, start_chain: List[int], goal_chain: List[int]) -> List[Point]:
+        path = [self.nodes[node_id].point for node_id in start_chain]
+        path.extend(self.nodes[node_id].point for node_id in reversed(goal_chain))
+
+        deduped: List[Point] = []
+        for p in path:
+            if not deduped or deduped[-1] != p:
+                deduped.append(p)
+        return deduped
+
+    def _point_at_arclength(self, path: List[Point], arclength: float) -> Tuple[int, Point]:
+        """Return a point sampled along a polyline at the given arclength."""
+        if len(path) < 2:
+            return 0, path[0]
+
+        remaining = max(0.0, arclength)
+        for seg_idx in range(len(path) - 1):
+            a = path[seg_idx]
+            b = path[seg_idx + 1]
+            seg_len = dist(a, b)
+            if seg_len <= 1e-9:
+                continue
+            if remaining <= seg_len or seg_idx == len(path) - 2:
+                t = float(np.clip(remaining / seg_len, 0.0, 1.0))
+                x = int(round(a[0] + t * (b[0] - a[0])))
+                y = int(round(a[1] + t * (b[1] - a[1])))
+                return seg_idx, clamp_point((x, y), self.w, self.h)
+            remaining -= seg_len
+        return len(path) - 2, path[-1]
+
+    def _splice_shortcut(
+        self,
+        path: List[Point],
+        first_seg_idx: int,
+        first_point: Point,
+        second_seg_idx: int,
+        second_point: Point,
+    ) -> List[Point]:
+        """Replace a subpath by a direct shortcut segment."""
+        rebuilt: List[Point] = []
+        for p in path[: first_seg_idx + 1]:
+            if not rebuilt or rebuilt[-1] != p:
+                rebuilt.append(p)
+        if not rebuilt or rebuilt[-1] != first_point:
+            rebuilt.append(first_point)
+        if rebuilt[-1] != second_point:
+            rebuilt.append(second_point)
+        for p in path[second_seg_idx + 1:]:
+            if rebuilt[-1] != p:
+                rebuilt.append(p)
+        return rebuilt
+
+    def _optimize_solution_path(self, path: List[Point]) -> List[Point]:
+        """Apply the SBL-style lightweight random path optimizer."""
+        if len(path) < 3:
+            return list(path)
+
+        optimized = list(path)
+        for _ in range(16):
+            total_len = compute_path_length(optimized)
+            if total_len <= 1e-6:
+                break
+
+            s1 = float(self.rng.uniform(0.0, total_len))
+            s2 = float(self.rng.uniform(0.0, total_len))
+            if s1 > s2:
+                s1, s2 = s2, s1
+            if s2 - s1 < 4.0:
+                continue
+
+            first_seg_idx, q1 = self._point_at_arclength(optimized, s1)
+            second_seg_idx, q2 = self._point_at_arclength(optimized, s2)
+            if q1 == q2:
+                continue
+            if not line_collision_free(q1, q2, self.occ):
+                continue
+
+            optimized = self._splice_shortcut(optimized, first_seg_idx, q1, second_seg_idx, q2)
+
+        return optimized
+
+    def _candidate_path_segments(
+        self,
+        start_chain: List[int],
+        goal_chain: List[int],
+        bridge_key: frozenset[int],
+    ) -> List[frozenset[int]]:
+        segments: List[frozenset[int]] = []
+        for i in range(1, len(start_chain)):
+            segments.append(self._edge_key(start_chain[i - 1], start_chain[i]))
+        segments.append(bridge_key)
+        for i in range(len(goal_chain) - 1, 0, -1):
+            segments.append(self._edge_key(goal_chain[i], goal_chain[i - 1]))
+        return segments
+
+    def _test_candidate_path(
+        self,
+        start_chain: List[int],
+        goal_chain: List[int],
+        bridge_key: frozenset[int],
+    ) -> Tuple[Optional[frozenset[int]], Optional[Point]]:
+        path_segments = self._candidate_path_segments(start_chain, goal_chain, bridge_key)
+        for seg in path_segments:
+            self.edge_states.setdefault(seg, SBLSegmentState())
+
+        unresolved = [seg for seg in path_segments if not self.edge_states[seg].safe]
+        while unresolved:
+            seg = max(unresolved, key=self._segment_score)
+            collision_point = self._test_segment_once(seg)
+            if collision_point is not None:
+                return seg, collision_point
+            unresolved = [key for key in path_segments if not self.edge_states[key].safe]
+        return None, None
+
+    def _find_edge_index(self, chain: List[int], edge_key: frozenset[int]) -> Optional[int]:
+        for i in range(1, len(chain)):
+            if self._edge_key(chain[i - 1], chain[i]) == edge_key:
+                return i
+        return None
+
+    def _collect_subtree(self, root_id: int) -> Set[int]:
+        stack = [root_id]
+        subtree: Set[int] = set()
+        while stack:
+            node_id = stack.pop()
+            if node_id in subtree:
+                continue
+            subtree.add(node_id)
+            stack.extend(self.nodes[node_id].children)
+        return subtree
+
+    def _transfer_subtree_after_collision(
+        self,
+        chain: List[int],
+        edge_index: int,
+        opposite_bridge: int,
+        new_tree: int,
+        bridge_key: frozenset[int],
+    ) -> None:
+        parent = chain[edge_index - 1]
+        child = chain[edge_index]
+        collision_key = self._edge_key(parent, child)
+
+        self.nodes[parent].children.discard(child)
+        if self.nodes[child].parent == parent:
+            self.nodes[child].parent = None
+        self.edge_states.pop(collision_key, None)
+
+        chain_sub = chain[edge_index:]  # child -> ... -> bridge endpoint on this side
+        subtree_nodes = self._collect_subtree(child)
+
+        for node_id in subtree_nodes:
+            self._move_node_between_trees(node_id, new_tree)
+
+        for i in range(len(chain_sub) - 1):
+            old_parent = chain_sub[i]
+            old_child = chain_sub[i + 1]
+            self.nodes[old_parent].children.discard(old_child)
+
+        rev_chain = list(reversed(chain_sub))  # bridge endpoint -> ... -> child
+        bridge_side = rev_chain[0]
+        self.nodes[bridge_side].parent = opposite_bridge
+        self.nodes[opposite_bridge].children.add(bridge_side)
+        self.edge_states.setdefault(bridge_key, SBLSegmentState())
+
+        for i in range(1, len(rev_chain)):
+            node_id = rev_chain[i]
+            new_parent = rev_chain[i - 1]
+            self.nodes[node_id].parent = new_parent
+            self.nodes[new_parent].children.add(node_id)
+
+        self.transfer_count += 1
+
+    def _handle_path_collision(
+        self,
+        collision_key: frozenset[int],
+        start_chain: List[int],
+        goal_chain: List[int],
+        bridge_key: frozenset[int],
+    ) -> None:
+        self.raw_solution_path = []
+        self.solution_path = []
+        if collision_key == bridge_key:
+            self.edge_states.pop(bridge_key, None)
+            return
+
+        start_idx = self._find_edge_index(start_chain, collision_key)
+        if start_idx is not None:
+            self._transfer_subtree_after_collision(
+                start_chain,
+                start_idx,
+                opposite_bridge=goal_chain[-1],
+                new_tree=1,
+                bridge_key=bridge_key,
+            )
+            return
+
+        goal_idx = self._find_edge_index(goal_chain, collision_key)
+        if goal_idx is not None:
+            self._transfer_subtree_after_collision(
+                goal_chain,
+                goal_idx,
+                opposite_bridge=start_chain[-1],
+                new_tree=0,
+                bridge_key=bridge_key,
+            )
+            return
+
+        a_id, b_id = tuple(collision_key)
+        if self.nodes[a_id].parent == b_id:
+            self.nodes[b_id].children.discard(a_id)
+            self.nodes[a_id].parent = None
+        elif self.nodes[b_id].parent == a_id:
+            self.nodes[a_id].children.discard(b_id)
+            self.nodes[b_id].parent = None
+        self.edge_states.pop(collision_key, None)
+
+    def _attempt_connection(self, new_node_id: int) -> Optional[StepResult]:
+        this_tree = self.nodes[new_node_id].tree_id
+        other_tree = 1 - this_tree
+        new_point = self.nodes[new_node_id].point
+        same_cell = self._cell_for_point(new_point)
+
+        candidate_ids: List[int] = []
+        same_cell_ids = list(self.cell_maps[other_tree].get(same_cell, set()))
+        if same_cell_ids:
+            best_same_cell = min(same_cell_ids, key=lambda node_id: linf_dist(new_point, self.nodes[node_id].point))
+            candidate_ids.append(best_same_cell)
+
+        random_other = self._random_tree_node(other_tree)
+        if random_other is not None and random_other not in candidate_ids:
+            candidate_ids.append(random_other)
+
+        attempted_edges: List[Edge] = []
+        last_rejected_point: Optional[Point] = None
+        for other_id in candidate_ids:
+            other_point = self.nodes[other_id].point
+            if linf_dist(new_point, other_point) >= self.rho:
+                continue
+
+            self.bridge_attempts += 1
+            if this_tree == 0:
+                start_bridge, goal_bridge = new_node_id, other_id
+            else:
+                start_bridge, goal_bridge = other_id, new_node_id
+
+            start_chain = self._chain_root_to_node(start_bridge)
+            goal_chain = self._chain_root_to_node(goal_bridge)
+            bridge_key = self._edge_key(start_bridge, goal_bridge)
+            self.edge_states.setdefault(bridge_key, SBLSegmentState())
+
+            collision_key, collision_point = self._test_candidate_path(start_chain, goal_chain, bridge_key)
+            bridge_edge = (self.nodes[start_bridge].point, self.nodes[goal_bridge].point)
+
+            if collision_key is None:
+                self.raw_solution_path = self._build_solution_path(start_chain, goal_chain)
+                self.solution_path = self._optimize_solution_path(self.raw_solution_path)
+                self.found_path = True
+                self.done = True
+                return StepResult(edge=bridge_edge, done=True, found_path=True)
+
+            attempted_edges.append(bridge_edge)
+            last_rejected_point = collision_point
+            self.last_collision_point = collision_point
+            self._handle_path_collision(collision_key, start_chain, goal_chain, bridge_key)
+            if collision_key == bridge_key:
+                continue
+            return StepResult(edge=bridge_edge, rejected_point=collision_point)
+
+        if attempted_edges:
+            if len(attempted_edges) == 1:
+                return StepResult(edge=attempted_edges[0], rejected_point=last_rejected_point)
+            return StepResult(edges=attempted_edges, rejected_point=last_rejected_point)
+        return None
+
+    def step_once(self) -> StepResult:
+        if self.done:
+            return StepResult(done=True, found_path=self.found_path)
+
+        if self.iteration >= self.max_iters:
+            self.done = True
+            return StepResult(done=True, found_path=False)
+
+        self.iteration += 1
+
+        new_node_id, expansion_edge = self._expand_tree()
+        if new_node_id is None:
+            return StepResult()
+
+        connect_result = self._attempt_connection(new_node_id)
+        edges: List[Edge] = [expansion_edge] if expansion_edge is not None else []
+
+        if connect_result is not None:
+            if connect_result.edge is not None:
+                edges.append(connect_result.edge)
+            if connect_result.edges:
+                edges.extend(connect_result.edges)
+            if len(edges) > 1:
+                connect_result.edges = edges
+                connect_result.edge = None
+            elif len(edges) == 1 and connect_result.edge is None:
+                connect_result.edge = edges[0]
+            return connect_result
+
+        if len(edges) == 1:
+            return StepResult(edge=edges[0])
+        if edges:
+            return StepResult(edges=edges)
+        return StepResult()
+
+    def extract_path(self) -> List[Tuple[int, int]]:
+        return list(self.solution_path)
+
+    def get_status(self) -> str:
+        if self.found_path:
+            return (
+                f"SBL: iter {self.iteration}/{self.max_iters}, "
+                f"T0={len(self.tree_nodes[0])}, T1={len(self.tree_nodes[1])}, "
+                f"checks {self.lazy_checks}, FOUND"
+            )
+        return (
+            f"SBL: iter {self.iteration}/{self.max_iters}, "
+            f"T0={len(self.tree_nodes[0])}, T1={len(self.tree_nodes[1])}, "
+            f"checks {self.lazy_checks}, transfers {self.transfer_count}"
+        )
+
+    @staticmethod
+    def get_params_widget() -> QWidget:
+        return SBLParamsWidget()
+
+    @staticmethod
+    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
+                          params_widget: QWidget) -> 'SBLPlanner':
+        params = params_widget.get_params()
+        return SBLPlanner(occ, start, goal, **params)
 
 
 # ============================================================================
@@ -2363,7 +3983,7 @@ class AStarPlanner(BasePlanner):
     """A* - Classic heuristic search algorithm."""
     
     name = "A*"
-    description = "Classic heuristic search"
+    description = "Grid-based heuristic search"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  grid_size: int = 5, allow_diagonal: bool = True):
@@ -2542,10 +4162,10 @@ class DijkstraParamsWidget(QWidget):
 
 
 class DijkstraPlanner(BasePlanner):
-    """Dijkstra's Algorithm - Optimal pathfinding without heuristic."""
+    """Dijkstra's Algorithm - Grid-based uniform-cost pathfinding."""
     
     name = "Dijkstra"
-    description = "Optimal uniform-cost search"
+    description = "Grid-based uniform-cost search"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  grid_size: int = 5, allow_diagonal: bool = True):
@@ -2911,19 +4531,14 @@ class FMTStarParamsWidget(QWidget):
         
         self.spin_num_samples = QSpinBox()
         self.spin_num_samples.setRange(50, 5000)
-        self.spin_num_samples.setValue(300)
-        self.spin_num_samples.setToolTip("Number of random samples (fewer = faster)")
+        self.spin_num_samples.setValue(400)
+        self.spin_num_samples.setToolTip("Number of random samples (higher = more robust, slower)")
         
         self.spin_radius = QDoubleSpinBox()
         self.spin_radius.setRange(0.0, 300.0)  # 0 = auto
         self.spin_radius.setSingleStep(10.0)
         self.spin_radius.setValue(0.0)  # Auto by default
-        self.spin_radius.setToolTip("Connection radius (0 = auto-compute optimal)")
-        
-        self.spin_goal_tolerance = QSpinBox()
-        self.spin_goal_tolerance.setRange(5, 100)
-        self.spin_goal_tolerance.setValue(30)
-        self.spin_goal_tolerance.setToolTip("Distance to goal for direct connection attempt")
+        self.spin_radius.setToolTip("Connection radius (0 = auto-compute FMT* radius for the 2D free space)")
 
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(0, 10_000_000)
@@ -2932,7 +4547,6 @@ class FMTStarParamsWidget(QWidget):
         
         layout.addRow("Num samples:", self.spin_num_samples)
         layout.addRow("Radius (0=auto):", self.spin_radius)
-        layout.addRow("Goal tolerance:", self.spin_goal_tolerance)
         layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
@@ -2941,7 +4555,6 @@ class FMTStarParamsWidget(QWidget):
         return {
             'num_samples': self.spin_num_samples.value(),
             'radius': self.spin_radius.value() if self.spin_radius.value() > 0 else None,
-            'goal_tolerance': self.spin_goal_tolerance.value(),
             'seed': self.spin_seed.value(),
         }
 
@@ -2949,108 +4562,100 @@ class FMTStarParamsWidget(QWidget):
 class FMTStarPlanner(BasePlanner):
     """FMT* - Fast Marching Tree algorithm.
     
-    Samples points first, then grows tree using wavefront expansion.
-    Uses lazy collision checking for efficiency.
-    Includes goal tolerance check for early termination.
+    Samples points first, then grows a tree using dynamic-programming-style
+    wavefront expansion with lazy collision checking.
     """
     
     name = "FMT*"
-    description = "Fast Marching Tree"
+    description = "Fast Marching Tree with uniform free-space sampling and lazy wavefront expansion"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                 num_samples: int = 300, radius: Optional[float] = None, 
-                 goal_tolerance: int = 30, seed: int = 42):
+                 num_samples: int = 400, radius: Optional[float] = None, seed: int = 42):
         super().__init__(occ, start, goal)
         
-        self.num_samples = num_samples
-        self.goal_tolerance = goal_tolerance
+        self.num_samples = int(max(50, num_samples))
         self.rng = np.random.default_rng(seed)
-        
-        # Auto-compute optimal radius if not specified
-        if radius is None or radius <= 0:
-            # FMT* optimal radius: r_n = gamma * (log(n)/n)^(1/d) * vol^(1/d)
-            d = 2  # 2D
-            gamma = 2.0 * np.power(1.0 + 1.0/d, 1.0/d) * np.power(np.pi, -1.0/d)
-            volume = self.w * self.h
-            self.radius = gamma * np.power(np.log(num_samples) / num_samples, 1.0/d) * np.power(volume, 1.0/d)
-            # Add some margin for robustness
-            self.radius *= 1.5
-        else:
-            self.radius = radius
-        
-        # Sample points
-        self.samples = [np.array(start, dtype=float)]  # 0 = start
-        self._sample_points()
-        self.samples.append(np.array(goal, dtype=float))  # last = goal
+        self.samples: List[np.ndarray] = [np.array(start, dtype=float)]
+        self._sample_points_uniform()
+        self.samples.append(np.array(goal, dtype=float))
         self.goal_idx = len(self.samples) - 1
-        
-        # FMT* sets
-        self.V_open: Set[int] = {0}  # Open set (wavefront)
-        self.V_closed: Set[int] = set()  # Closed set (in tree)
-        self.V_unvisited: Set[int] = set(range(1, len(self.samples)))  # Unvisited
-        
-        # Tree structure
+
+        self.num_nodes = len(self.samples)
+        self.free_space_volume = float(np.count_nonzero(~self.occ))
+        self.radius = self._compute_connection_radius(radius)
+
+        self.V_open: Set[int] = {0}
+        self.V_closed: Set[int] = set()
+        self.V_unvisited: Set[int] = set(range(1, self.num_nodes))
+
         self.parent: Dict[int, int] = {0: -1}
         self.cost: Dict[int, float] = {0: 0.0}
-        
-        # Current processing
-        self.current_node: Optional[int] = None
-        self.phase = "expanding"
-        
-    def _sample_points(self):
-        """Sample random points in free space with goal bias.
-        
-        Uses informed sampling: 50% uniform, 30% along start-goal corridor, 20% near goal.
-        This makes FMT* find paths faster by focusing samples toward the goal.
-        """
-        start_pos = np.array(self.start, dtype=float)
-        goal_pos = np.array(self.goal, dtype=float)
-        direction = goal_pos - start_pos
-        dist_to_goal = np.linalg.norm(direction)
-        if dist_to_goal > 0:
-            direction = direction / dist_to_goal
-        
-        # Perpendicular direction for corridor sampling
-        perp = np.array([-direction[1], direction[0]])
-        corridor_width = min(self.w, self.h) * 0.3  # 30% of smaller dimension
-        
+        self.open_heap: List[Tuple[float, int]] = [(0.0, 0)]
+
+        self.neighbors: Dict[int, List[Tuple[int, float]]] = self._precompute_neighbors()
+        self.collision_cache: Dict[Tuple[int, int], bool] = {}
+        self.collision_checks = 0
+
+    def _sample_points_uniform(self) -> None:
+        """Sample free states uniformly from the occupancy grid."""
         attempts = 0
-        while len(self.samples) < self.num_samples + 1 and attempts < self.num_samples * 10:
+        seen: Set[Point] = {self.start, self.goal}
+        while len(self.samples) < self.num_samples + 1 and attempts < self.num_samples * 50:
             attempts += 1
-            
-            r = self.rng.random()
-            if r < 0.5:
-                # 50% uniform random sampling
-                x = self.rng.integers(0, self.w)
-                y = self.rng.integers(0, self.h)
-            elif r < 0.8:
-                # 30% corridor sampling (along start-goal line)
-                t = self.rng.random()  # Position along line
-                base_point = start_pos + t * (goal_pos - start_pos)
-                offset = (self.rng.random() - 0.5) * corridor_width
-                point = base_point + offset * perp
-                x, y = int(np.clip(point[0], 0, self.w - 1)), int(np.clip(point[1], 0, self.h - 1))
-            else:
-                # 20% near goal sampling
-                offset_x = self.rng.normal(0, dist_to_goal * 0.15)
-                offset_y = self.rng.normal(0, dist_to_goal * 0.15)
-                x = int(np.clip(goal_pos[0] + offset_x, 0, self.w - 1))
-                y = int(np.clip(goal_pos[1] + offset_y, 0, self.h - 1))
-            
-            if 0 <= x < self.w and 0 <= y < self.h and self.occ[y, x] == 0:
-                self.samples.append(np.array([x, y], dtype=float))
-    
-    def _get_neighbors_in_radius(self, idx: int, candidate_set: Set[int]) -> List[Tuple[int, float]]:
-        """Get neighbors within radius from candidate set."""
-        neighbors = []
-        pos = self.samples[idx]
-        for other_idx in candidate_set:
-            if other_idx != idx:
-                other_pos = self.samples[other_idx]
-                dist = np.linalg.norm(pos - other_pos)
-                if dist <= self.radius:
-                    neighbors.append((other_idx, dist))
-        return neighbors
+            x = int(self.rng.integers(0, self.w))
+            y = int(self.rng.integers(0, self.h))
+            point = (x, y)
+            if point in seen or self.occ[y, x]:
+                continue
+            seen.add(point)
+            self.samples.append(np.array(point, dtype=float))
+
+    @staticmethod
+    def _unit_ball_volume(dimension: int) -> float:
+        if dimension == 0:
+            return 1.0
+        if dimension == 1:
+            return 2.0
+        return 2.0 * np.pi / dimension * FMTStarPlanner._unit_ball_volume(dimension - 2)
+
+    def _compute_connection_radius(self, radius: Optional[float]) -> float:
+        if radius is not None and radius > 0:
+            return float(radius)
+
+        dimension = 2
+        n = max(2, self.num_samples)
+        unit_ball_volume = self._unit_ball_volume(dimension)
+        free_volume = max(1.0, self.free_space_volume)
+        gamma = 2.0 * np.power(1.0 / dimension, 1.0 / dimension) * np.power(free_volume / unit_ball_volume, 1.0 / dimension)
+        return float(1.1 * gamma * np.power(np.log(n) / n, 1.0 / dimension))
+
+    def _precompute_neighbors(self) -> Dict[int, List[Tuple[int, float]]]:
+        coords = np.array(self.samples, dtype=np.float64)
+        neighborhoods: Dict[int, List[Tuple[int, float]]] = {}
+        for idx in range(self.num_nodes):
+            deltas = coords - coords[idx]
+            dists = np.linalg.norm(deltas, axis=1)
+            mask = (dists > 0.0) & (dists <= self.radius)
+            nbrs = [(int(j), float(dists[j])) for j in np.where(mask)[0]]
+            nbrs.sort(key=lambda item: item[1])
+            neighborhoods[idx] = nbrs
+        return neighborhoods
+
+    def _neighbors_in_set(self, idx: int, candidate_set: Set[int]) -> List[Tuple[int, float]]:
+        return [(other_idx, dist) for other_idx, dist in self.neighbors[idx] if other_idx in candidate_set]
+
+    def _collision_free_indices(self, a_idx: int, b_idx: int) -> bool:
+        key = (a_idx, b_idx) if a_idx <= b_idx else (b_idx, a_idx)
+        cached = self.collision_cache.get(key)
+        if cached is not None:
+            return cached
+
+        a = self.samples[a_idx]
+        b = self.samples[b_idx]
+        free = line_collision_free((int(a[0]), int(a[1])), (int(b[0]), int(b[1])), self.occ)
+        self.collision_cache[key] = free
+        self.collision_checks += 1
+        return free
     
     def step_once(self) -> StepResult:
         if self.done:
@@ -3058,112 +4663,69 @@ class FMTStarPlanner(BasePlanner):
         
         self.iteration += 1
         
-        if not self.V_open:
+        while self.open_heap and self.open_heap[0][1] not in self.V_open:
+            heapq.heappop(self.open_heap)
+
+        if not self.open_heap:
             self.done = True
             return StepResult(done=True, found_path=False)
         
-        # Find lowest cost node in open set
-        min_cost = float('inf')
-        z = None
-        for node in self.V_open:
-            if self.cost.get(node, float('inf')) < min_cost:
-                min_cost = self.cost[node]
-                z = node
+        _, z = heapq.heappop(self.open_heap)
         
-        if z is None:
-            self.done = True
-            return StepResult(done=True, found_path=False)
-        
-        # Move z from open to closed
-        self.V_open.remove(z)
-        self.V_closed.add(z)
-        
-        # Check if we just moved goal to closed (found path!)
-        if z == self.goal_idx:
-            self.found_path = True
-            self.done = True
-            return StepResult(done=True, found_path=True)
-        
-        # Goal tolerance check: if z is close to goal, try direct connection
-        z_pos = self.samples[z]
-        goal_pos = self.samples[self.goal_idx]
-        dist_to_goal = np.linalg.norm(z_pos - goal_pos)
-        
-        if dist_to_goal <= self.goal_tolerance:
-            # Try to connect directly to goal
-            p1 = (int(z_pos[0]), int(z_pos[1]))
-            p2 = (int(goal_pos[0]), int(goal_pos[1]))
-            if line_collision_free(p1, p2, self.occ):
-                # Direct connection to goal!
-                self.parent[self.goal_idx] = z
-                self.cost[self.goal_idx] = self.cost[z] + dist_to_goal
-                self.V_unvisited.discard(self.goal_idx)
-                self.V_closed.add(self.goal_idx)
-                self.found_path = True
-                self.done = True
-                return StepResult(edge=(p1, p2), done=True, found_path=True)
-        
-        # Visualize current node being processed
-        current_point = (int(z_pos[0]), int(z_pos[1]))
-        
-        # Find unvisited neighbors of z
-        z_neighbors = self._get_neighbors_in_radius(z, self.V_unvisited)
-        
-        edges = []  # Collect all edges for visualization
-        added_this_step = []
-        
+        z_neighbors = self._neighbors_in_set(z, self.V_unvisited)
+
+        edges: List[Edge] = []
+        H_new: List[int] = []
+
         for x, _ in z_neighbors:
-            # Find neighbors of x in open/closed set (potential parents)
-            x_open_neighbors = self._get_neighbors_in_radius(x, self.V_open | self.V_closed)
-            
+            x_open_neighbors = self._neighbors_in_set(x, self.V_open)
             if not x_open_neighbors:
                 continue
-            
-            # Find best parent for x
-            best_parent = None
-            best_cost = float('inf')
-            
-            for y, dist in x_open_neighbors:
-                if y in self.V_closed or y in self.V_open:
-                    potential_cost = self.cost.get(y, float('inf')) + dist
-                    if potential_cost < best_cost:
-                        # Check collision
-                        p1 = (int(self.samples[y][0]), int(self.samples[y][1]))
-                        p2 = (int(self.samples[x][0]), int(self.samples[x][1]))
-                        if line_collision_free(p1, p2, self.occ):
-                            best_cost = potential_cost
-                            best_parent = y
-            
-            if best_parent is not None:
-                self.parent[x] = best_parent
-                self.cost[x] = best_cost
-                added_this_step.append(x)
-                
-                # Add edge for visualization
-                p1 = (int(self.samples[best_parent][0]), int(self.samples[best_parent][1]))
-                p2 = (int(self.samples[x][0]), int(self.samples[x][1]))
-                edges.append((p1, p2))
-        
-        # Move all added nodes from unvisited to open (do this after loop to avoid modifying set during iteration)
-        for x in added_this_step:
+
+            y_min = None
+            c_min = float('inf')
+            for y, dist_yx in x_open_neighbors:
+                potential_cost = self.cost[y] + dist_yx
+                if potential_cost < c_min:
+                    c_min = potential_cost
+                    y_min = y
+
+            if y_min is None:
+                continue
+
+            if not self._collision_free_indices(y_min, x):
+                continue
+
+            self.parent[x] = y_min
+            self.cost[x] = c_min
+            H_new.append(x)
+
+            p1 = self.samples[y_min]
+            p2 = self.samples[x]
+            edges.append(((int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1]))))
+
+        for x in H_new:
             self.V_unvisited.discard(x)
             self.V_open.add(x)
-        
-        # If no nodes added but z was processed, show edge from parent to z
-        if not edges and z in self.parent and self.parent[z] != -1:
-            parent = self.parent[z]
-            p1 = (int(self.samples[parent][0]), int(self.samples[parent][1]))
-            p2 = current_point
-            edges.append((p1, p2))
-        
-        # Return first edge for backward compatibility, and all edges in edges list
-        return StepResult(edge=edges[0] if edges else None, edges=edges if edges else None)
+            heapq.heappush(self.open_heap, (self.cost[x], x))
+
+        # In FMT*, z stays in the open wavefront while its neighbors are
+        # processed, then moves to closed after the batch update.
+        self.V_open.remove(z)
+        self.V_closed.add(z)
+
+        if self.goal_idx in H_new:
+            self.found_path = True
+            self.done = True
+            return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if edges else None, done=True, found_path=True)
+
+        return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if edges else None)
     
     def extract_path(self) -> List[Tuple[int, int]]:
-        if not self.found_path:
+        if self.goal_idx not in self.parent:
             return []
         
-        path = []
+        path: List[Tuple[int, int]] = []
         current = self.goal_idx
         while current != -1:
             pos = self.samples[current]
@@ -3173,7 +4735,11 @@ class FMTStarPlanner(BasePlanner):
         return path
     
     def get_status(self) -> str:
-        return f"FMT*: open {len(self.V_open)}, closed {len(self.V_closed)}, unvisited {len(self.V_unvisited)}"
+        status = "FOUND" if self.found_path else "searching"
+        return (
+            f"FMT*: open {len(self.V_open)}, closed {len(self.V_closed)}, "
+            f"unvisited {len(self.V_unvisited)}, cc {self.collision_checks}, {status}"
+        )
     
     @staticmethod
     def get_params_widget() -> QWidget:
@@ -3208,10 +4774,16 @@ class BITStarParamsWidget(QWidget):
         self.spin_max_iters.setToolTip("Maximum iterations")
         
         self.spin_rewire_radius = QDoubleSpinBox()
-        self.spin_rewire_radius.setRange(10.0, 300.0)
+        self.spin_rewire_radius.setRange(0.0, 300.0)
         self.spin_rewire_radius.setSingleStep(5.0)
-        self.spin_rewire_radius.setValue(120.0)
-        self.spin_rewire_radius.setToolTip("Rewiring radius")
+        self.spin_rewire_radius.setValue(0.0)
+        self.spin_rewire_radius.setToolTip("Connection / rewiring radius (0 = auto)")
+
+        self.spin_step_size = QDoubleSpinBox()
+        self.spin_step_size.setRange(4.0, 100.0)
+        self.spin_step_size.setSingleStep(2.0)
+        self.spin_step_size.setValue(26.0)
+        self.spin_step_size.setToolTip("Maximum local BIT* connection length")
 
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(0, 10_000_000)
@@ -3221,6 +4793,7 @@ class BITStarParamsWidget(QWidget):
         layout.addRow("Batch size:", self.spin_batch_size)
         layout.addRow("Max iterations:", self.spin_max_iters)
         layout.addRow("Rewire radius:", self.spin_rewire_radius)
+        layout.addRow("Step size:", self.spin_step_size)
         layout.addRow("Seed:", self.spin_seed)
         
         self.setLayout(layout)
@@ -3229,7 +4802,8 @@ class BITStarParamsWidget(QWidget):
         return {
             'batch_size': self.spin_batch_size.value(),
             'max_iters': self.spin_max_iters.value(),
-            'rewire_radius': self.spin_rewire_radius.value(),
+            'rewire_radius': self.spin_rewire_radius.value() if self.spin_rewire_radius.value() > 0 else None,
+            'step_size': self.spin_step_size.value(),
             'seed': self.spin_seed.value(),
         }
 
@@ -3243,40 +4817,52 @@ class BITStarPlanner(BasePlanner):
     """
     
     name = "BIT*"
-    description = "Batch Informed Trees"
+    description = "Batch-informed tree search with ordered vertex/edge queues and rewiring in a 2D occupancy-grid adaptation"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                 batch_size: int = 200, max_iters: int = 10000, rewire_radius: float = 120.0, seed: int = 42):
+                 batch_size: int = 200, max_iters: int = 10000, rewire_radius: Optional[float] = None,
+                 step_size: float = 26.0, seed: int = 42):
         super().__init__(occ, start, goal)
         
-        self.batch_size = batch_size
-        self.max_iters = max_iters
-        self.r = rewire_radius  # Connection radius
+        self.batch_size = int(max(1, batch_size))
+        self.max_iters = int(max(1, max_iters))
+        self.step_size = float(max(4.0, step_size))
         self.rng = np.random.default_rng(seed)
-        
-        # Vertices in tree (V)
-        self.V: List[np.ndarray] = [np.array(start, dtype=float)]
-        self.parent: Dict[int, int] = {}  # parent[child] = parent_idx
-        self.g_cost: Dict[int, float] = {0: 0.0}  # Cost from start
-        
-        # Samples not yet in tree (X_samples) - includes goal
-        self.X_samples: List[np.ndarray] = [np.array(goal, dtype=float)]
-        
-        # Edge queues
-        self.Q_V: List[int] = [0]  # Vertices to expand (indices into V)
-        self.Q_E: List[Tuple[float, int, int]] = []  # Edges: (cost, v_idx, x_idx) where x_idx is in X_samples
-        
+
+        self.goal_state = np.array(goal, dtype=float)
+        self.start_state = np.array(start, dtype=float)
+        self.free_space_volume = float(np.count_nonzero(~self.occ))
+
+        # Tree vertices
+        self.V: List[np.ndarray] = [self.start_state.copy()]
+        self.parent: Dict[int, Optional[int]] = {0: None}
+        self.children: Dict[int, Set[int]] = {0: set()}
+        self.g_cost: Dict[int, float] = {0: 0.0}
+
+        # Unconnected samples, including a single goal sample.
+        self.X_samples: List[Optional[np.ndarray]] = [self.goal_state.copy()]
+        self.sample_point_keys: Set[Point] = {self.goal}
+
+        # Ordered search queues
+        self.Q_V: List[Tuple[float, int, int]] = []
+        self.Q_E: List[Tuple[float, int, int, int, int]] = []
+        self._queue_counter = 0
+        self.vertex_expanded_batch: Dict[int, int] = {}
+
         # Solution tracking
         self.best_cost = float('inf')
         self.goal_idx_in_V: Optional[int] = None
         
-        # Ellipse parameters for informed sampling
+        # Informed set parameters
         self.c_min = np.linalg.norm(np.array(goal) - np.array(start))
         self.x_center = (np.array(start) + np.array(goal)) / 2
         self.C = self._rotation_to_world()
-        
-        # Batch tracking
+
+        # Batch / RGG tracking
         self.batch_count = 0
+        self.user_radius = rewire_radius
+        self.r = self._compute_radius(rewire_radius)
+        self.edge_collision_checks = 0
         self._new_batch()
     
     def _rotation_to_world(self) -> np.ndarray:
@@ -3288,8 +4874,8 @@ class BITStarPlanner(BasePlanner):
     
     def _sample_uniform(self) -> np.ndarray:
         """Sample uniformly in configuration space."""
-        x = self.rng.uniform(0, self.w)
-        y = self.rng.uniform(0, self.h)
+        x = int(self.rng.integers(0, self.w))
+        y = int(self.rng.integers(0, self.h))
         return np.array([x, y], dtype=float)
     
     def _sample_ellipse(self) -> np.ndarray:
@@ -3316,15 +4902,10 @@ class BITStarPlanner(BasePlanner):
         # Rotate and translate
         x_world = self.C @ x_ell + self.x_center
         
-        # Clamp to bounds
-        x_world[0] = np.clip(x_world[0], 0, self.w - 1)
-        x_world[1] = np.clip(x_world[1], 0, self.h - 1)
-        
-        return x_world
-    
-    def _heuristic_cost(self, x: np.ndarray) -> float:
-        """Estimate cost-to-go from x to goal."""
-        return np.linalg.norm(x - np.array(self.goal))
+        # Clamp to bounds and discretize to the grid used by the environment.
+        x_world[0] = np.clip(np.round(x_world[0]), 0, self.w - 1)
+        x_world[1] = np.clip(np.round(x_world[1]), 0, self.h - 1)
+        return x_world.astype(float)
     
     def _g_hat(self, v_idx: int) -> float:
         """Estimated cost from start to vertex v."""
@@ -3332,7 +4913,7 @@ class BITStarPlanner(BasePlanner):
     
     def _h_hat(self, x: np.ndarray) -> float:
         """Estimated cost from x to goal."""
-        return np.linalg.norm(x - np.array(self.goal))
+        return np.linalg.norm(x - self.goal_state)
     
     def _f_hat(self, v_idx: int, x: np.ndarray) -> float:
         """Estimated total cost through edge (v, x)."""
@@ -3341,53 +4922,201 @@ class BITStarPlanner(BasePlanner):
         c_vx = np.linalg.norm(v - x)  # Edge cost
         h_x = self._h_hat(x)
         return g_v + c_vx + h_x
+
+    def _point_key(self, x: np.ndarray) -> Point:
+        return (int(round(float(x[0]))), int(round(float(x[1]))))
+
+    @staticmethod
+    def _unit_ball_volume(dimension: int) -> float:
+        if dimension == 0:
+            return 1.0
+        if dimension == 1:
+            return 2.0
+        return 2.0 * np.pi / dimension * BITStarPlanner._unit_ball_volume(dimension - 2)
+
+    def _compute_radius(self, radius: Optional[float]) -> float:
+        if radius is not None and radius > 0:
+            return float(radius)
+
+        dimension = 2
+        q = max(2, len(self.V) + self.num_unconnected_samples())
+        unit_ball_volume = self._unit_ball_volume(dimension)
+        free_volume = max(1.0, self.free_space_volume)
+        gamma = 2.0 * np.power(1.0 + 1.0 / dimension, 1.0 / dimension) * np.power(free_volume / unit_ball_volume, 1.0 / dimension)
+        return float(1.1 * gamma * np.power(np.log(q) / q, 1.0 / dimension))
+
+    def num_unconnected_samples(self) -> int:
+        return sum(1 for x in self.X_samples if x is not None)
+
+    def _sample_free(self) -> Optional[np.ndarray]:
+        for _ in range(500):
+            x_new = self._sample_ellipse()
+            ix, iy = self._point_key(x_new)
+            if self.occ[iy, ix]:
+                continue
+            if (ix, iy) == self.start or (ix, iy) in self.sample_point_keys:
+                continue
+            self.sample_point_keys.add((ix, iy))
+            return np.array([ix, iy], dtype=float)
+        return None
+
+    def _vertex_key(self, v_idx: int) -> float:
+        return self._g_hat(v_idx) + self._h_hat(self.V[v_idx])
+
+    def _edge_key(self, parent_idx: int, target: np.ndarray) -> float:
+        return self._f_hat(parent_idx, target)
+
+    def _push_vertex(self, v_idx: int) -> None:
+        key = self._vertex_key(v_idx)
+        self._queue_counter += 1
+        heapq.heappush(self.Q_V, (key, self._queue_counter, v_idx))
+
+    def _push_edge(self, key: float, parent_idx: int, target_kind: int, target_idx: int) -> None:
+        self._queue_counter += 1
+        heapq.heappush(self.Q_E, (key, self._queue_counter, parent_idx, target_kind, target_idx))
+
+    def _iter_active_samples(self):
+        for idx, sample in enumerate(self.X_samples):
+            if sample is not None:
+                yield idx, sample
+
+    def _near_samples(self, v_idx: int) -> List[Tuple[int, np.ndarray, float]]:
+        v = self.V[v_idx]
+        near: List[Tuple[int, np.ndarray, float]] = []
+        edge_radius = min(self.r, self.step_size)
+        for idx, sample in self._iter_active_samples():
+            d = float(np.linalg.norm(v - sample))
+            if d <= edge_radius:
+                near.append((idx, sample, d))
+        return near
+
+    def _near_vertices(self, v_idx: int) -> List[Tuple[int, float]]:
+        v = self.V[v_idx]
+        near: List[Tuple[int, float]] = []
+        edge_radius = min(self.r, self.step_size)
+        for idx, other in enumerate(self.V):
+            if idx == v_idx:
+                continue
+            d = float(np.linalg.norm(v - other))
+            if d <= edge_radius:
+                near.append((idx, d))
+        return near
+
+    def _is_ancestor(self, ancestor_idx: int, v_idx: int) -> bool:
+        current = self.parent.get(v_idx)
+        while current is not None:
+            if current == ancestor_idx:
+                return True
+            current = self.parent.get(current)
+        return False
+
+    def _set_parent(self, child_idx: int, parent_idx: Optional[int]) -> None:
+        old_parent = self.parent.get(child_idx)
+        if old_parent is not None:
+            self.children.setdefault(old_parent, set()).discard(child_idx)
+        self.parent[child_idx] = parent_idx
+        if parent_idx is not None:
+            self.children.setdefault(parent_idx, set()).add(child_idx)
+        self.children.setdefault(child_idx, set())
+
+    def _propagate_cost_delta(self, root_idx: int, delta: float) -> None:
+        stack = [root_idx]
+        while stack:
+            current = stack.pop()
+            self.g_cost[current] = self.g_cost.get(current, float('inf')) + delta
+            self._push_vertex(current)
+            stack.extend(self.children.get(current, ()))
+
+    def _is_collision_free(self, a: np.ndarray, b: np.ndarray) -> bool:
+        self.edge_collision_checks += 1
+        return line_collision_free(self._point_key(a), self._point_key(b), self.occ)
+
+    def _sample_lower_bound(self, x: np.ndarray) -> float:
+        return np.linalg.norm(x - self.start_state) + self._h_hat(x)
+
+    def _prune(self) -> None:
+        if not np.isfinite(self.best_cost):
+            return
+
+        # Drop samples that can provably not improve the incumbent.
+        for idx, sample in enumerate(self.X_samples):
+            if sample is None:
+                continue
+            if self._sample_lower_bound(sample) >= self.best_cost:
+                self.X_samples[idx] = None
+
+        # Rebuild ordered queues against the incumbent.
+        new_qv: List[Tuple[float, int, int]] = []
+        for _, _, v_idx in self.Q_V:
+            if self._vertex_key(v_idx) < self.best_cost:
+                self._queue_counter += 1
+                heapq.heappush(new_qv, (self._vertex_key(v_idx), self._queue_counter, v_idx))
+        self.Q_V = new_qv
+
+        new_qe: List[Tuple[float, int, int, int, int]] = []
+        for _, _, parent_idx, target_kind, target_idx in self.Q_E:
+            if target_kind == 0:
+                if target_idx >= len(self.X_samples) or self.X_samples[target_idx] is None:
+                    continue
+                key = self._edge_key(parent_idx, self.X_samples[target_idx])
+            else:
+                if target_idx >= len(self.V):
+                    continue
+                key = self._edge_key(parent_idx, self.V[target_idx])
+            if key < self.best_cost:
+                self._queue_counter += 1
+                heapq.heappush(new_qe, (key, self._queue_counter, parent_idx, target_kind, target_idx))
+        self.Q_E = new_qe
     
     def _new_batch(self):
         """Add a new batch of samples."""
         self.batch_count += 1
-        
-        # Always include goal in samples (for anytime improvement)
-        goal_arr = np.array(self.goal, dtype=float)
-        self.X_samples.append(goal_arr.copy())
-        
-        # Sample new points
+
         for _ in range(self.batch_size):
-            x_new = self._sample_ellipse()
-            ix, iy = int(x_new[0]), int(x_new[1])
-            if 0 <= ix < self.w and 0 <= iy < self.h and self.occ[iy, ix] == 0:
+            x_new = self._sample_free()
+            if x_new is not None:
                 self.X_samples.append(x_new)
-        
-        # Reset vertex expansion queue to all vertices
-        self.Q_V = list(range(len(self.V)))
+
+        self.r = self._compute_radius(self.user_radius)
+        self.Q_V = []
         self.Q_E = []
+        self.vertex_expanded_batch = {}
+        for v_idx in range(len(self.V)):
+            if self._vertex_key(v_idx) < self.best_cost:
+                self._push_vertex(v_idx)
     
     def _expand_vertex(self, v_idx: int):
         """Expand vertex by adding edges to nearby samples."""
-        import heapq
-        
+        if self.vertex_expanded_batch.get(v_idx) == self.batch_count:
+            return
+        self.vertex_expanded_batch[v_idx] = self.batch_count
+
         v = self.V[v_idx]
         g_v = self._g_hat(v_idx)
-        
-        for x_idx, x in enumerate(self.X_samples):
-            if x is None:  # Skip removed samples
+
+        if self._vertex_key(v_idx) >= self.best_cost:
+            return
+
+        for x_idx, x, dist_vx in self._near_samples(v_idx):
+            f_est = g_v + dist_vx + self._h_hat(x)
+            if f_est < self.best_cost:
+                self._push_edge(f_est, v_idx, 0, x_idx)
+
+        for w_idx, dist_vw in self._near_vertices(v_idx):
+            if self._is_ancestor(w_idx, v_idx):
                 continue
-            
-            dist = np.linalg.norm(v - x)
-            if dist <= self.r:
-                # Estimated cost
-                f_est = g_v + dist + self._h_hat(x)
-                
-                # Only add if could improve solution
-                if f_est < self.best_cost:
-                    heapq.heappush(self.Q_E, (f_est, v_idx, x_idx))
+            g_new = g_v + dist_vw
+            if g_new + self._h_hat(self.V[w_idx]) >= self.best_cost:
+                continue
+            if g_new + 1e-9 >= self.g_cost.get(w_idx, float('inf')):
+                continue
+            self._push_edge(g_new + self._h_hat(self.V[w_idx]), v_idx, 1, w_idx)
     
     def _is_goal(self, x: np.ndarray) -> bool:
         """Check if x is the goal."""
         return np.linalg.norm(x - np.array(self.goal)) < 1.0
     
     def step_once(self) -> StepResult:
-        import heapq
-        
         if self.done:
             return StepResult(done=True, found_path=self.found_path)
         
@@ -3397,93 +5126,150 @@ class BITStarPlanner(BasePlanner):
             self.done = True
             return StepResult(done=True, found_path=self.found_path)
         
-        # If we need to expand vertices, do that first
-        while self.Q_V and (not self.Q_E or self._best_vertex_cost() <= self._best_edge_cost()):
-            v_idx = self.Q_V.pop(0)
-            self._expand_vertex(v_idx)
-        
-        # If no edges to process, start new batch
-        if not self.Q_E:
-            if self.batch_count >= 50:
-                self.done = True
-                return StepResult(done=True, found_path=self.found_path)
-            self._new_batch()
-            return StepResult()
-        
-        # Process best edge
-        f_est, v_idx, x_idx = heapq.heappop(self.Q_E)
-        
-        # Check if sample still exists
-        if x_idx >= len(self.X_samples) or self.X_samples[x_idx] is None:
-            return StepResult()
-        
-        x = self.X_samples[x_idx]
-        v = self.V[v_idx]
-        
-        # Check if this edge can still improve solution
-        g_v = self._g_hat(v_idx)
-        edge_cost = np.linalg.norm(v - x)
-        g_x_new = g_v + edge_cost
-        f_x_new = g_x_new + self._h_hat(x)
-        
-        if f_x_new >= self.best_cost:
-            return StepResult()  # Can't improve
-        
-        # Check collision
-        p1 = (int(v[0]), int(v[1]))
-        p2 = (int(x[0]), int(x[1]))
-        
-        if not line_collision_free(p1, p2, self.occ):
-            return StepResult(rejected_point=p2)
-        
-        # Add x to tree
-        new_v_idx = len(self.V)
-        self.V.append(x.copy())
-        self.parent[new_v_idx] = v_idx
-        self.g_cost[new_v_idx] = g_x_new
-        
-        # Remove from samples
-        self.X_samples[x_idx] = None
-        
-        # Add to vertex expansion queue
-        self.Q_V.append(new_v_idx)
-        
-        # Check if we reached goal
-        if self._is_goal(x):
-            if g_x_new < self.best_cost:
-                self.best_cost = g_x_new
-                self.goal_idx_in_V = new_v_idx
+        while True:
+            while True:
+                best_vertex = self._best_vertex_cost()
+                best_edge = self._best_edge_cost()
+                if not self.Q_V or best_vertex > best_edge:
+                    break
+                _, _, v_idx = heapq.heappop(self.Q_V)
+                if v_idx >= len(self.V):
+                    continue
+                if self._vertex_key(v_idx) >= self.best_cost:
+                    continue
+                if self.vertex_expanded_batch.get(v_idx) == self.batch_count:
+                    continue
+                self._expand_vertex(v_idx)
+
+            if not self.Q_E:
+                if self.num_unconnected_samples() == 0:
+                    self.done = True
+                    return StepResult(done=True, found_path=self.found_path)
+                self._new_batch()
+                return StepResult()
+
+            _, _, parent_idx, target_kind, target_idx = heapq.heappop(self.Q_E)
+            if parent_idx >= len(self.V):
+                continue
+
+            parent_state = self.V[parent_idx]
+            if target_kind == 0:
+                if target_idx >= len(self.X_samples):
+                    continue
+                x = self.X_samples[target_idx]
+                if x is None:
+                    continue
+
+                edge_cost = float(np.linalg.norm(parent_state - x))
+                g_new = self._g_hat(parent_idx) + edge_cost
+                f_new = g_new + self._h_hat(x)
+                if f_new >= self.best_cost:
+                    continue
+
+                p1 = self._point_key(parent_state)
+                p2 = self._point_key(x)
+                if not self._is_collision_free(parent_state, x):
+                    return StepResult(rejected_point=p2)
+
+                new_v_idx = len(self.V)
+                self.V.append(x.copy())
+                self.g_cost[new_v_idx] = g_new
+                self._set_parent(new_v_idx, parent_idx)
+                self.X_samples[target_idx] = None
+                self._push_vertex(new_v_idx)
+
+                path_improved = False
+                if self._is_goal(x) and g_new < self.best_cost:
+                    self.best_cost = g_new
+                    self.goal_idx_in_V = new_v_idx
+                    self.found_path = True
+                    path_improved = True
+                    self._prune()
+
+                return StepResult(edge=(p1, p2), path_improved=path_improved)
+
+            if target_idx >= len(self.V):
+                continue
+            if self._is_ancestor(target_idx, parent_idx) or target_idx == parent_idx:
+                continue
+
+            child_state = self.V[target_idx]
+            edge_cost = float(np.linalg.norm(parent_state - child_state))
+            new_cost = self._g_hat(parent_idx) + edge_cost
+            current_cost = self.g_cost.get(target_idx, float('inf'))
+            if new_cost + 1e-9 >= current_cost:
+                continue
+            if new_cost + self._h_hat(child_state) >= self.best_cost:
+                continue
+
+            p1 = self._point_key(parent_state)
+            p2 = self._point_key(child_state)
+            if not self._is_collision_free(parent_state, child_state):
+                return StepResult(rejected_point=p2)
+
+            delta = new_cost - current_cost
+            self._set_parent(target_idx, parent_idx)
+            self._propagate_cost_delta(target_idx, delta)
+
+            path_improved = False
+            goal_updated = (
+                self.goal_idx_in_V is not None
+                and (self.goal_idx_in_V == target_idx or self._is_ancestor(target_idx, self.goal_idx_in_V))
+            )
+            if goal_updated and self.goal_idx_in_V is not None:
+                goal_cost = self.g_cost.get(self.goal_idx_in_V, float('inf'))
+                if goal_cost < self.best_cost:
+                    self.best_cost = goal_cost
+                    self.found_path = True
+                    path_improved = True
+                    self._prune()
+
+            if self.goal_idx_in_V == target_idx and new_cost < self.best_cost:
+                self.best_cost = new_cost
                 self.found_path = True
-                # Prune edges that can't improve
-                self._prune_edge_queue()
-        
-        return StepResult(edge=(p1, p2), path_improved=self.found_path)
+                path_improved = True
+                self._prune()
+
+            return StepResult(edge=(p1, p2), path_improved=path_improved)
     
     def _best_vertex_cost(self) -> float:
         """Get the best potential cost through any vertex in Q_V."""
-        if not self.Q_V:
-            return float('inf')
-        best = float('inf')
-        for v_idx in self.Q_V:
-            v = self.V[v_idx]
-            cost = self._g_hat(v_idx) + self._h_hat(v)
-            best = min(best, cost)
-        return best
+        while self.Q_V:
+            key, _, v_idx = self.Q_V[0]
+            if v_idx >= len(self.V):
+                heapq.heappop(self.Q_V)
+                continue
+            current_key = self._vertex_key(v_idx)
+            if abs(current_key - key) > 1e-9 or self.vertex_expanded_batch.get(v_idx) == self.batch_count:
+                heapq.heappop(self.Q_V)
+                continue
+            return current_key
+        return float('inf')
     
     def _best_edge_cost(self) -> float:
         """Get the best potential cost in edge queue."""
-        if not self.Q_E:
-            return float('inf')
-        return self.Q_E[0][0]  # Heap is sorted by cost
-    
-    def _prune_edge_queue(self):
-        """Remove edges that can't improve the solution."""
-        import heapq
-        new_queue = []
-        for f_est, v_idx, x_idx in self.Q_E:
-            if f_est < self.best_cost:
-                heapq.heappush(new_queue, (f_est, v_idx, x_idx))
-        self.Q_E = new_queue
+        while self.Q_E:
+            key, _, parent_idx, target_kind, target_idx = self.Q_E[0]
+            if parent_idx >= len(self.V):
+                heapq.heappop(self.Q_E)
+                continue
+
+            if target_kind == 0:
+                if target_idx >= len(self.X_samples) or self.X_samples[target_idx] is None:
+                    heapq.heappop(self.Q_E)
+                    continue
+                current_key = self._edge_key(parent_idx, self.X_samples[target_idx])
+            else:
+                if target_idx >= len(self.V):
+                    heapq.heappop(self.Q_E)
+                    continue
+                current_key = self._edge_key(parent_idx, self.V[target_idx])
+
+            if abs(current_key - key) > 1e-9:
+                heapq.heappop(self.Q_E)
+                continue
+            return current_key
+        return float('inf')
     
     def extract_path(self) -> List[Tuple[int, int]]:
         if self.goal_idx_in_V is None:
@@ -3497,10 +5283,32 @@ class BITStarPlanner(BasePlanner):
             current = self.parent.get(current)
         path.reverse()
         return path
+
+    def extract_display_path(self) -> List[Tuple[float, float]]:
+        path = self.extract_path()
+        if len(path) < 3:
+            return [(float(p[0]), float(p[1])) for p in path]
+        spacing = max(2.0, min(4.0, self.step_size / 4.0))
+        return smooth_display_path(path, self.occ, spacing=spacing, iterations=1)
+
+    def extract_tree_edges(self) -> List[Edge]:
+        edges: List[Edge] = []
+        for child_idx, parent_idx in self.parent.items():
+            if parent_idx is None:
+                continue
+            if child_idx >= len(self.V) or parent_idx >= len(self.V):
+                continue
+            parent_pt = self._point_key(self.V[parent_idx])
+            child_pt = self._point_key(self.V[child_idx])
+            edges.append((parent_pt, child_pt))
+        return edges
     
     def get_status(self) -> str:
         cost_str = f"{self.best_cost:.1f}" if self.best_cost < float('inf') else "inf"
-        return f"BIT*: batch {self.batch_count}, V={len(self.V)}, cost: {cost_str}"
+        return (
+            f"BIT*: batch {self.batch_count}, V={len(self.V)}, X={self.num_unconnected_samples()}, "
+            f"Qv={len(self.Q_V)}, Qe={len(self.Q_E)}, cc={self.edge_collision_checks}, cost: {cost_str}"
+        )
     
     @staticmethod
     def get_params_widget() -> QWidget:
@@ -3570,7 +5378,7 @@ class TrajOptPlanner(BasePlanner):
     """
     
     name = "TrajOpt"
-    description = "Sequential Convex Optimization"
+    description = "Approximate / experimental sequential convex-style optimization"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 50, max_iters: int = 500, trust_region: float = 20.0,
@@ -4810,7 +6618,7 @@ class ITOMPPlanner(BasePlanner):
     """
     
     name = "ITOMP"
-    description = "Incremental Trajectory Optimization"
+    description = "Approximate / experimental incremental trajectory optimization"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 30, max_iters: int = 1000, replan_interval: int = 20,
@@ -5001,7 +6809,7 @@ class GPMPPlanner(BasePlanner):
     """
     
     name = "GPMP"
-    description = "Gaussian Process Motion Planning"
+    description = "Approximate / experimental GP-based local trajectory optimization"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 25, max_iters: int = 800, sigma: float = 10.0,
@@ -5230,19 +7038,22 @@ class GPMPPlanner(BasePlanner):
 
 # Algorithms grouped by category for UI organization
 ALGORITHM_GROUPS: List[Tuple[str, List[str]]] = [
-    ('Sampling-Based', ['RRT', 'RRT-Connect', 'RRT*', 'PRM']),
+    ('Sampling-Based', ['RRT', 'RRT-Connect', 'BiTRRT', 'KPIECE', 'RRT*', 'PRM', 'SBL', 'FMT*', 'BIT*']),
     ('Graph Search', ['A*', 'Dijkstra']),
     ('Potential Field', ['APF']),
     ('Trajectory Optimization', ['CHOMP']),
-    ('Approximate / Experimental', ['FMT*', 'BIT*', 'STOMP', 'TrajOpt', 'ITOMP', 'GPMP', 'PSO', 'Genetic']),
+    ('Approximate / Experimental', ['STOMP', 'TrajOpt', 'ITOMP', 'GPMP', 'PSO', 'Genetic']),
 ]
 
 # Register all available planners here
 AVAILABLE_PLANNERS: Dict[str, Type[BasePlanner]] = {
     'RRT': RRTPlanner,
     'RRT-Connect': RRTConnectPlanner,
+    'BiTRRT': BiTRRTPlanner,
+    'KPIECE': KPIECEPlanner,
     'RRT*': RRTStarPlanner,
     'PRM': PRMPlanner,
+    'SBL': SBLPlanner,
     'FMT*': FMTStarPlanner,
     'BIT*': BITStarPlanner,
     'A*': AStarPlanner,
@@ -5259,7 +7070,7 @@ AVAILABLE_PLANNERS: Dict[str, Type[BasePlanner]] = {
 
 # Sampling-based algorithms that can be optimized with CHOMP
 SAMPLING_BASED_ALGOS: Set[str] = {
-    'RRT', 'RRT-Connect', 'RRT*', 'PRM', 'FMT*', 'BIT*'
+    'RRT', 'RRT-Connect', 'BiTRRT', 'KPIECE', 'RRT*', 'PRM', 'SBL', 'FMT*', 'BIT*'
 }
 
 # Anytime algorithms that continue improving after finding first path
@@ -5275,28 +7086,40 @@ ALGORITHM_INFO: Dict[str, Tuple[str, str]] = {
         "Bidirectional RRT growing two trees from start and goal, connecting when they meet.",
         "Kuffner & LaValle, 2000"
     ),
+    'BiTRRT': (
+        "OMPL-style bidirectional Transition-based RRT with transition tests, frontier control, and a clearance-derived cost map adaptation for 2D occupancy grids.",
+        "Devaurs et al., 2013 / OMPL"
+    ),
+    'KPIECE': (
+        "Single-level geometric KPIECE adaptation using a 2D projection grid, border-cell preference, half-normal motion selection within cells, state sampling along motions, and progress-based score penalties.",
+        "Sucan & Kavraki, 2008"
+    ),
     'RRT*': (
-        "Asymptotically optimal RRT with rewiring. Continuously improves path quality.",
+        "RRT variant with rewiring and incremental path improvement. This UI shows a practical fixed-radius implementation rather than a proof-oriented asymptotic-optimality setup.",
         "Karaman & Frazzoli, 2011"
     ),
     'PRM': (
-        "Probabilistic Roadmap. Builds a graph of collision-free samples, then searches for path.",
+        "Probabilistic Roadmap with a query-independent learning phase and a query phase that connects start and goal to the learned roadmap before graph search.",
         "Kavraki et al., 1996"
     ),
+    'SBL': (
+        "Single-query bi-directional lazy roadmap planner using an L-infinity neighborhood metric, deferred segment validation, and the paper's lightweight random path optimizer.",
+        "Sanchez & Latombe, 2001"
+    ),
     'FMT*': (
-        "FMT*-inspired visual approximation with informed sampling and lazy collision checking.",
+        "Fast Marching Tree using uniform free-space sampling, open-set parent selection, and one-shot lazy collision checking per candidate connection in a 2D occupancy-grid adaptation.",
         "Janson et al., 2015"
     ),
     'BIT*': (
-        "BIT*-inspired visual approximation with batch sampling and heuristic edge ordering.",
+        "Batch Informed Trees with ordered vertex and edge queues, rewiring, informed batch sampling, and incumbent-based pruning in a 2D occupancy-grid adaptation.",
         "Gammell et al., 2015"
     ),
     'A*': (
-        "Classic graph search with heuristic. Guarantees shortest path on grid.",
+        "Classic heuristic graph search on the induced occupancy grid. Optimal only with respect to that grid discretization.",
         "Hart et al., 1968"
     ),
     'Dijkstra': (
-        "Uniform-cost graph search. Explores all directions equally, guarantees shortest path.",
+        "Uniform-cost graph search on the induced occupancy grid. Optimal only with respect to that grid discretization.",
         "Dijkstra, 1959"
     ),
     'APF': (
@@ -5308,19 +7131,19 @@ ALGORITHM_INFO: Dict[str, Tuple[str, str]] = {
         "Zucker et al., 2013"
     ),
     'STOMP': (
-        "STOMP-inspired stochastic optimizer using noisy rollout averaging for visualization.",
+        "Approximate / experimental STOMP-style stochastic optimizer using noisy rollout averaging for visualization.",
         "Kalakrishnan et al., 2011"
     ),
     'TrajOpt': (
-        "TrajOpt-style trust-region optimizer rather than a full sequential convex solver.",
+        "Approximate / experimental TrajOpt-style trust-region optimizer rather than a full sequential convex solver.",
         "Schulman et al., 2014"
     ),
     'ITOMP': (
-        "ITOMP-inspired incremental smoother for visual replanning demonstrations.",
+        "Approximate / experimental ITOMP-style incremental smoother for visual replanning demonstrations.",
         "Park et al., 2012"
     ),
     'GPMP': (
-        "Gaussian Process Motion Planning as a deterministic local optimizer with GP prior and interpolated obstacle factors.",
+        "Approximate / experimental GPMP-style deterministic local optimizer with GP prior and interpolated obstacle factors.",
         "Mukadam et al., 2016"
     ),
     'PSO': (
@@ -5385,7 +7208,8 @@ class ImageCanvas(QLabel):
         self.highlights: List[Tuple[int, int, int]] = []  # (x, y, alpha)
         self.rejected_highlights: List[Tuple[int, int, int]] = []  # (x, y, alpha)
         self.edge_highlights: List[Tuple[int, int, int, int, int]] = []  # (x1, y1, x2, y2, alpha)
-        self.current_path: List[Point] = []
+        self.current_tree_edges: List[Edge] = []
+        self.current_path: List[Tuple[float, float]] = []
 
     def _make_pen(self, color: Union[Qt.GlobalColor, QColor], width: int) -> QPen:
         """Create a pen with rounded joins for cleaner path rendering."""
@@ -5421,6 +7245,7 @@ class ImageCanvas(QLabel):
         self.highlights = []
         self.rejected_highlights = []
         self.edge_highlights = []
+        self.current_tree_edges = []
         self.current_path = []
         self._cached_disp_size = None  # Recompute on new image
         self._update_display()
@@ -5433,6 +7258,7 @@ class ImageCanvas(QLabel):
         self.highlights = []
         self.rejected_highlights = []
         self.edge_highlights = []
+        self.current_tree_edges = []
         self.current_path = []
         self._update_display()
     
@@ -5462,16 +7288,25 @@ class ImageCanvas(QLabel):
         composed.fill(Qt.GlobalColor.transparent)
         painter = QPainter(composed)
         painter.drawPixmap(0, 0, self.base_pixmap)
+
+        # Draw live tree edges for planners with rewiring/history-sensitive trees.
+        if self.current_tree_edges:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(self._make_pen(QColor(0, 0, 255, 100), 1))
+            for a, b in self.current_tree_edges:
+                painter.drawLine(QPointF(float(a[0]), float(a[1])), QPointF(float(b[0]), float(b[1])))
+
         painter.drawPixmap(0, 0, self.overlay)
-        
-        # Draw current path (for RRT* live updates)
+
+        # Draw current path on top of the tree for a cleaner readable solution view.
         if len(self.current_path) >= 2:
             self._draw_polyline(painter, self.current_path, Qt.GlobalColor.yellow, 4)
         
         # Draw edge highlights
         for (x1, y1, x2, y2, alpha) in self.edge_highlights:
-            painter.setPen(QPen(QColor(0, 255, 255, alpha), 3))
-            painter.drawLine(x1, y1, x2, y2)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(self._make_pen(QColor(0, 255, 255, alpha), 2))
+            painter.drawLine(QPointF(float(x1), float(y1)), QPointF(float(x2), float(y2)))
         
         # Draw rejected highlights
         for (x, y, alpha) in self.rejected_highlights:
@@ -5540,11 +7375,25 @@ class ImageCanvas(QLabel):
         if self.overlay is None:
             return
         painter = QPainter(self.overlay)
-        painter.setPen(QPen(color, 1))
-        painter.drawLine(a[0], a[1], b[0], b[1])
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(self._make_pen(color, 1))
+        painter.drawLine(QPointF(float(a[0]), float(a[1])), QPointF(float(b[0]), float(b[1])))
         painter.end()
         self.highlights.append((b[0], b[1], 255))
         self.edge_highlights.append((a[0], a[1], b[0], b[1], 255))
+        self._update_display()
+
+    def highlight_edge(self, a: Point, b: Point, color: Optional[QColor] = None):
+        self.highlights.append((b[0], b[1], 255))
+        self.edge_highlights.append((a[0], a[1], b[0], b[1], 255))
+        self._update_display()
+
+    def set_current_tree_edges(self, edges: List[Edge]):
+        self.current_tree_edges = list(edges)
+        self._update_display()
+
+    def clear_current_tree(self):
+        self.current_tree_edges = []
         self._update_display()
     
     def add_rejected_highlight(self, point):
@@ -5603,7 +7452,7 @@ class MainWindow(QMainWindow):
     
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Path Planning Visualizer Beta (0.1.0b2)")
+        self.setWindowTitle("Path Planning Visualizer Beta (0.1.0b3)")
         
         self._setup_canvas()
         self._setup_algorithm_controls()
@@ -6350,12 +8199,16 @@ class MainWindow(QMainWindow):
     def _handle_step_result(self, result: StepResult):
         edge_color = QColor(160, 32, 240) if self.optimizing_from_sampling else Qt.GlobalColor.blue
         is_gpmp = isinstance(self.planner, GPMPPlanner)
+        is_bitstar = isinstance(self.planner, BITStarPlanner)
         # Handle multiple edges (for batch algorithms like FMT*)
-        if result.edges and not is_gpmp:
+        if result.edges and not is_gpmp and not is_bitstar:
             for edge in result.edges:
                 self.canvas.draw_edge(edge[0], edge[1], color=edge_color)
-        elif result.edge and not is_gpmp:
+        elif result.edge and not is_gpmp and not is_bitstar:
             self.canvas.draw_edge(result.edge[0], result.edge[1], color=edge_color)
+        elif is_bitstar:
+            if self.planner is not None and hasattr(self.planner, "extract_tree_edges"):
+                self.canvas.set_current_tree_edges(self.planner.extract_tree_edges())
         if result.rejected_point:
             self.canvas.add_rejected_highlight(result.rejected_point)
             self.canvas._update_display()
@@ -6386,6 +8239,7 @@ class MainWindow(QMainWindow):
             self.fade_timer.start(50)
         
         if not self.planner.found_path:
+            self.canvas.clear_current_tree()
             self.canvas.clear_path()
             self._update_stopwatch_label()
             self._update_status_display(state="No Path", info=self.planner.get_status())
@@ -6394,6 +8248,8 @@ class MainWindow(QMainWindow):
             return
         
         path = self.planner.extract_path()
+        if isinstance(self.planner, BITStarPlanner):
+            self.canvas.clear_current_tree()
         self.canvas.clear_path()  # Clear live path
         display_path = self.planner.extract_display_path() if hasattr(self.planner, "extract_display_path") else path
         if self.optimizing_from_sampling:

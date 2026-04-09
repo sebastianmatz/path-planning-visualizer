@@ -2,7 +2,13 @@
 
 Path Planning Visualizer is a desktop application for exploring, comparing, and tuning path-planning algorithms for a 2D point robot on occupancy-grid maps.
 
-Current release status: `0.1.0b2` (`Beta`)
+Current release status: `0.1.0b3` (`Beta`)
+
+## What's New in `0.1.0b3`
+
+- Added `SBL`, `BiTRRT`, and `KPIECE` as additional sampling-based planners for the 2D occupancy-grid setting
+- Reworked `PRM`, `FMT*`, and `BIT*` to be cleaner and closer to their reference formulations within this application's 2D scope
+- Improved BIT* live rendering with smaller local connections and smoother display paths for clearer visual feedback
 
 ## Preview
 
@@ -22,14 +28,22 @@ The demo below shows the typical workflow: loading a map, placing start and goal
 
 ## Included Algorithms
 
-- Core Baselines: `A*`, `Dijkstra`, `RRT`, `RRT-Connect`, `RRT*`, `PRM`, `APF`, `CHOMP`
-- Approximate / Experimental: `FMT*`, `BIT*`, `STOMP`, `TrajOpt`, `ITOMP`, `GPMP`, `PSO`, `Genetic`
+- Core Baselines: `A*`, `Dijkstra`, `RRT`, `RRT-Connect`, `BiTRRT`, `KPIECE`, `RRT*`, `PRM`, `SBL`, `FMT*`, `BIT*`, `APF`, `CHOMP`
+- Approximate / Experimental Visualizations: `STOMP`, `TrajOpt`, `ITOMP`, `GPMP`, `PSO`, `Genetic`
 
 ## Scientific Scope
 
 - The tool is best understood as a teaching and visualization environment, not as a benchmark suite.
 - Core baseline planners are implemented in a comparatively direct way for 2D occupancy-grid pathfinding.
-- Several advanced planners are visualization-oriented approximations inspired by the cited methods rather than paper-faithful reference implementations.
+- `A*` and `Dijkstra` should be interpreted as optimal on the induced search grid, not on the continuous image plane.
+- `BiTRRT` follows the OMPL planner structure closely, but in this application its optimization objective is adapted to a 2D occupancy grid through a clearance-derived cost field rather than an arbitrary user-supplied cost objective.
+- `PRM` now follows a clearer two-phase structure with query-independent roadmap construction followed by query-time start/goal attachment.
+- `SBL` is implemented as a 2D adaptation with lazy segment validation and lightweight path optimization, not as a full general-configuration-space reproduction of the original system.
+- `KPIECE` is implemented here as a single-level geometric adaptation with projection-grid cell selection, state sampling along motions, and progress-based cell penalties, rather than the full multilevel kinodynamic formulation from the original paper.
+- `RRT*` is presented here as a practical rewiring-based planner, not as a proof-focused asymptotic-optimality reference implementation.
+- `FMT*` is implemented as a cleaner 2D geometric adaptation with uniform free-space samples, open-wavefront parent selection, and one-shot lazy collision checking, rather than the earlier corridor-biased visualization variant.
+- `BIT*` is implemented here as a cleaner 2D geometric adaptation with ordered vertex/edge queues, rewiring, informed batches, incumbent-based pruning, and a visualization-oriented local connection cap, rather than a full OMPL-scale implementation of the original planner.
+- Several advanced planners, especially `STOMP`, `TrajOpt`, `ITOMP`, and `GPMP`, are visualization-oriented approximations inspired by the cited methods rather than paper-faithful reference implementations.
 - The environment model is a binary occupancy map with a point robot, so results do not directly transfer to higher-dimensional robot dynamics or configuration spaces.
 
 ## Requirements
