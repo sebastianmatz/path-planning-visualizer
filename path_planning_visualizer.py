@@ -171,6 +171,48 @@ def clamp_point(p: Point, w: int, h: int) -> Point:
     return (x, y)
 
 
+def bilinear_sample_scalar(field: np.ndarray, x: float, y: float) -> float:
+    """Sample a 2D scalar field continuously with bilinear interpolation."""
+    h, w = field.shape
+    x = float(np.clip(x, 0.0, w - 1))
+    y = float(np.clip(y, 0.0, h - 1))
+
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, w - 1)
+    y1 = min(y0 + 1, h - 1)
+    tx = x - x0
+    ty = y - y0
+
+    v00 = float(field[y0, x0])
+    v10 = float(field[y0, x1])
+    v01 = float(field[y1, x0])
+    v11 = float(field[y1, x1])
+
+    return (
+        (1.0 - tx) * (1.0 - ty) * v00
+        + tx * (1.0 - ty) * v10
+        + (1.0 - tx) * ty * v01
+        + tx * ty * v11
+    )
+
+
+def bilinear_sample_vector(
+    field_x: np.ndarray,
+    field_y: np.ndarray,
+    x: float,
+    y: float,
+) -> np.ndarray:
+    """Sample a 2D vector field continuously with bilinear interpolation."""
+    return np.array(
+        [
+            bilinear_sample_scalar(field_x, x, y),
+            bilinear_sample_scalar(field_y, x, y),
+        ],
+        dtype=np.float64,
+    )
+
+
 def segment_points(a: Point, b: Point, samples: Optional[int] = None) -> List[Point]:
     """Return rasterized sample points along a segment.
 
@@ -296,6 +338,129 @@ def resample_path_points(path: List[Point], spacing: float = 4.0) -> List[Tuple[
         resampled[i] = pts[seg_idx] + local_t * deltas[seg_idx]
 
     return [(float(p[0]), float(p[1])) for p in resampled]
+
+
+def resample_float_path_points(
+    path: List[Tuple[float, float]],
+    spacing: float = 4.0,
+) -> List[Tuple[float, float]]:
+    """Resample a floating-point polyline with approximately uniform spacing."""
+    if not path:
+        return []
+    if len(path) == 1:
+        return [(float(path[0][0]), float(path[0][1]))]
+
+    pts = np.array(path, dtype=np.float64)
+    deltas = np.diff(pts, axis=0)
+    seg_lens = np.linalg.norm(deltas, axis=1)
+    total_len = float(np.sum(seg_lens))
+    if total_len <= 1e-6:
+        return [(float(path[0][0]), float(path[0][1]))]
+
+    sample_count = max(2, int(np.ceil(total_len / max(1e-6, spacing))) + 1)
+    targets = np.linspace(0.0, total_len, sample_count)
+    cum = np.concatenate(([0.0], np.cumsum(seg_lens)))
+    resampled = np.zeros((sample_count, 2), dtype=np.float64)
+
+    seg_idx = 0
+    for i, t in enumerate(targets):
+        while seg_idx < len(seg_lens) - 1 and t > cum[seg_idx + 1]:
+            seg_idx += 1
+        seg_len = seg_lens[seg_idx]
+        if seg_len <= 1e-6:
+            resampled[i] = pts[seg_idx]
+            continue
+        local_t = (t - cum[seg_idx]) / seg_len
+        resampled[i] = pts[seg_idx] + local_t * deltas[seg_idx]
+
+    return [(float(p[0]), float(p[1])) for p in resampled]
+
+
+def smooth_float_polyline(
+    path: List[Tuple[float, float]],
+    spacing: float = 3.0,
+    iterations: int = 2,
+) -> List[Tuple[float, float]]:
+    """Return a smoother display-only version of a floating-point polyline."""
+    if not path:
+        return []
+    if len(path) == 1:
+        return [(float(path[0][0]), float(path[0][1]))]
+
+    smoothed = resample_float_path_points(path, spacing=max(1.0, spacing))
+    if len(smoothed) < 3:
+        return smoothed
+
+    for _ in range(max(0, iterations)):
+        candidate: List[Tuple[float, float]] = [smoothed[0]]
+        for i in range(len(smoothed) - 1):
+            p0 = np.array(smoothed[i], dtype=np.float64)
+            p1 = np.array(smoothed[i + 1], dtype=np.float64)
+            q = 0.75 * p0 + 0.25 * p1
+            r = 0.25 * p0 + 0.75 * p1
+            candidate.append((float(q[0]), float(q[1])))
+            candidate.append((float(r[0]), float(r[1])))
+        candidate.append(smoothed[-1])
+        smoothed = candidate
+
+    return smoothed
+
+
+def resample_float_path_fixed_count(
+    path: List[Tuple[float, float]],
+    sample_count: int,
+) -> List[Tuple[float, float]]:
+    """Resample a floating-point polyline to an exact number of samples."""
+    if not path:
+        return []
+    sample_count = max(1, int(sample_count))
+    if len(path) == 1 or sample_count == 1:
+        p = (float(path[0][0]), float(path[0][1]))
+        return [p for _ in range(sample_count)]
+
+    pts = np.array(path, dtype=np.float64)
+    deltas = np.diff(pts, axis=0)
+    seg_lens = np.linalg.norm(deltas, axis=1)
+    total_len = float(np.sum(seg_lens))
+    if total_len <= 1e-6:
+        p = (float(path[0][0]), float(path[0][1]))
+        return [p for _ in range(sample_count)]
+
+    targets = np.linspace(0.0, total_len, sample_count)
+    cum = np.concatenate(([0.0], np.cumsum(seg_lens)))
+    resampled = np.zeros((sample_count, 2), dtype=np.float64)
+
+    seg_idx = 0
+    for i, t in enumerate(targets):
+        while seg_idx < len(seg_lens) - 1 and t > cum[seg_idx + 1]:
+            seg_idx += 1
+        seg_len = seg_lens[seg_idx]
+        if seg_len <= 1e-6:
+            resampled[i] = pts[seg_idx]
+            continue
+        local_t = (t - cum[seg_idx]) / seg_len
+        resampled[i] = pts[seg_idx] + local_t * deltas[seg_idx]
+
+    return [(float(p[0]), float(p[1])) for p in resampled]
+
+
+def blend_float_paths(
+    path_a: List[Tuple[float, float]],
+    path_b: List[Tuple[float, float]],
+    alpha: float,
+) -> List[Tuple[float, float]]:
+    """Blend two float polylines by resampling them to a shared waypoint count."""
+    if not path_a:
+        return list(path_b)
+    if not path_b:
+        return list(path_a)
+
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    sample_count = max(24, len(path_a), len(path_b))
+    a_pts = np.array(resample_float_path_fixed_count(path_a, sample_count), dtype=np.float64)
+    b_pts = np.array(resample_float_path_fixed_count(path_b, sample_count), dtype=np.float64)
+    blended = (1.0 - alpha) * a_pts + alpha * b_pts
+    return [(float(p[0]), float(p[1])) for p in blended]
 
 
 def compute_path_smoothness(path: List[Point], spacing: float = 4.0) -> float:
@@ -2252,19 +2417,19 @@ class CHOMPParamsWidget(QWidget):
         self.spin_learning_rate.setRange(0.001, 10.0)
         self.spin_learning_rate.setSingleStep(0.1)
         self.spin_learning_rate.setValue(1.0)
-        self.spin_learning_rate.setToolTip("Gradient descent step size")
+        self.spin_learning_rate.setToolTip("Base step size for the covariant CHOMP update")
         
         self.spin_smoothness_weight = QDoubleSpinBox()
         self.spin_smoothness_weight.setRange(0.0, 100.0)
         self.spin_smoothness_weight.setSingleStep(0.1)
         self.spin_smoothness_weight.setValue(1.0)
-        self.spin_smoothness_weight.setToolTip("Weight for curvature reduction and smoothness")
+        self.spin_smoothness_weight.setToolTip("Weight for the CHOMP smoothness prior")
         
         self.spin_obstacle_weight = QDoubleSpinBox()
         self.spin_obstacle_weight.setRange(0.0, 1000.0)
         self.spin_obstacle_weight.setSingleStep(1.0)
         self.spin_obstacle_weight.setValue(100.0)
-        self.spin_obstacle_weight.setToolTip("Weight for obstacle avoidance")
+        self.spin_obstacle_weight.setToolTip("Weight for the obstacle functional")
         
         self.spin_obstacle_epsilon = QSpinBox()
         self.spin_obstacle_epsilon.setRange(1, 100)
@@ -2275,7 +2440,7 @@ class CHOMPParamsWidget(QWidget):
         self.spin_path_length_weight.setRange(0.0, 10.0)
         self.spin_path_length_weight.setSingleStep(0.05)
         self.spin_path_length_weight.setValue(0.0)
-        self.spin_path_length_weight.setToolTip("Optional penalty for overly long detours")
+        self.spin_path_length_weight.setToolTip("Optional extra arc-length penalty beyond standard CHOMP")
         
         layout.addRow("Waypoints:", self.spin_num_points)
         layout.addRow("Max iterations:", self.spin_max_iters)
@@ -2302,18 +2467,21 @@ class CHOMPParamsWidget(QWidget):
 class CHOMPPlanner(BasePlanner):
     """CHOMP - Covariant Hamiltonian Optimization for Motion Planning.
     
-    Optimizes a trajectory by minimizing:
-    - Smoothness cost (minimize acceleration/curvature)
-    - Obstacle cost (stay away from obstacles)
+    This implementation specializes CHOMP to a 2D point robot on an
+    occupancy-grid map using:
+    - A signed distance field in workspace
+    - A covariant preconditioned update with a velocity-based smoothness metric
+    - The point-robot form of CHOMP's obstacle functional with tangent projection
+      and curvature terms
     """
     
     name = "CHOMP"
-    description = "Optimization-based trajectory smoother"
+    description = "Covariant trajectory optimization for a 2D point robot"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 50, max_iters: int = 500, learning_rate: float = 1.0,
                  smoothness_weight: float = 1.0, obstacle_weight: float = 100.0,
-                 obstacle_epsilon: int = 20, path_length_weight: float = 0.2,
+                 obstacle_epsilon: int = 20, path_length_weight: float = 0.0,
                  init_trajectory: Optional[List[Tuple[int, int]]] = None):
         super().__init__(occ, start, goal)
         
@@ -2331,6 +2499,7 @@ class CHOMPPlanner(BasePlanner):
         # Compute distance field from obstacles first
         self.dist_field = self._compute_distance_field()
         self.grad_x, self.grad_y = self._compute_gradient_field()
+        self._build_smoothness_system()
         
         # Initialize trajectory - use provided trajectory if available
         if init_trajectory is not None and len(init_trajectory) >= 2:
@@ -2372,6 +2541,44 @@ class CHOMPPlanner(BasePlanner):
         grad_x = cv2.Sobel(self.dist_field, cv2.CV_64F, 1, 0, ksize=3) / 8.0
         grad_y = cv2.Sobel(self.dist_field, cv2.CV_64F, 0, 1, ksize=3) / 8.0
         return grad_x, grad_y
+
+    def _build_smoothness_system(self) -> None:
+        """Build the discrete CHOMP metric for the free waypoints.
+
+        We use the squared-velocity prior from the original formulation, which
+        yields a tridiagonal quadratic form over the free waypoints. Its inverse
+        acts as the CHOMP preconditioner.
+        """
+        self.num_free = max(0, self.num_points - 2)
+        if self.num_free == 0:
+            self.velocity_diff_matrix = np.zeros((0, 0), dtype=np.float64)
+            self.smoothness_matrix = np.zeros((0, 0), dtype=np.float64)
+            self.metric_matrix = np.zeros((0, 0), dtype=np.float64)
+            self.boundary_term = np.zeros((0, 2), dtype=np.float64)
+            return
+
+        m = self.num_free
+        diff = np.zeros((m + 1, m), dtype=np.float64)
+        diff[0, 0] = 1.0
+        for i in range(1, m):
+            diff[i, i - 1] = -1.0
+            diff[i, i] = 1.0
+        diff[m, m - 1] = -1.0
+
+        boundary = np.zeros((m + 1, 2), dtype=np.float64)
+        boundary[0] = -np.array(self.start, dtype=np.float64)
+        boundary[m] = np.array(self.goal, dtype=np.float64)
+
+        self.velocity_diff_matrix = diff
+        self.smoothness_matrix = diff.T @ diff
+        self.metric_matrix = self.smoothness_matrix + 1e-6 * np.eye(m, dtype=np.float64)
+        self.boundary_term = diff.T @ boundary
+
+    def _solve_metric(self, rhs: np.ndarray) -> np.ndarray:
+        """Apply the CHOMP metric inverse to a waypoint-space vector."""
+        if self.num_free == 0:
+            return np.zeros_like(rhs)
+        return np.linalg.solve(self.metric_matrix, rhs)
     
     def _initialize_trajectory(self) -> np.ndarray:
         """Initialize trajectory - with random perturbation to help escape obstacles."""
@@ -2383,14 +2590,8 @@ class CHOMPPlanner(BasePlanner):
             trajectory[i, 0] = self.start[0] + t * (self.goal[0] - self.start[0])
             trajectory[i, 1] = self.start[1] + t * (self.goal[1] - self.start[1])
         
-        # Check if straight line goes through obstacles
-        has_collision = False
-        for i in range(self.num_points):
-            ix = int(np.clip(trajectory[i, 0], 0, self.w - 1))
-            iy = int(np.clip(trajectory[i, 1], 0, self.h - 1))
-            if self.dist_field[iy, ix] < 0:
-                has_collision = True
-                break
+        # Check if the straight-line initialization is already collision free.
+        has_collision = not self._trajectory_collision_free(trajectory)
         
         # If collision, add sinusoidal perturbation perpendicular to path
         if has_collision:
@@ -2418,14 +2619,8 @@ class CHOMPPlanner(BasePlanner):
                 test_traj[:, 0] = np.clip(test_traj[:, 0], 0, self.w - 1)
                 test_traj[:, 1] = np.clip(test_traj[:, 1], 0, self.h - 1)
                 
-                # Evaluate obstacle cost
-                obs_cost = 0
-                for i in range(self.num_points):
-                    ix = int(test_traj[i, 0])
-                    iy = int(test_traj[i, 1])
-                    d = self.dist_field[iy, ix]
-                    if d < self.obstacle_epsilon:
-                        obs_cost += self.obstacle_epsilon - d
+                # Evaluate the CHOMP obstacle functional and keep the lower-cost seed.
+                _, obs_cost, _, _ = self._evaluate_trajectory(test_traj)
                 
                 if obs_cost < best_obs_cost:
                     best_obs_cost = obs_cost
@@ -2480,6 +2675,17 @@ class CHOMPPlanner(BasePlanner):
             return 0.0
         return float(np.sum(np.linalg.norm(np.diff(traj, axis=0), axis=1)))
 
+    def _trajectory_collision_free(self, trajectory: np.ndarray) -> bool:
+        """Check a floating-point trajectory against the occupancy grid."""
+        if len(trajectory) < 2:
+            return True
+        for i in range(len(trajectory) - 1):
+            p1 = self._trajectory_point_to_pixel(trajectory[i])
+            p2 = self._trajectory_point_to_pixel(trajectory[i + 1])
+            if not line_collision_free(p1, p2, self.occ):
+                return False
+        return True
+
     def _trajectory_point_to_pixel(self, point: np.ndarray) -> Point:
         """Convert a floating-point waypoint to the nearest valid pixel."""
         x = int(np.clip(np.rint(point[0]), 0, self.w - 1))
@@ -2523,30 +2729,91 @@ class CHOMPPlanner(BasePlanner):
 
         return polished
 
-    def _evaluate_trajectory(self, trajectory: np.ndarray) -> Tuple[float, float, float, float]:
-        """Return total, obstacle, smoothness, and path-length costs for a trajectory."""
+    def _sample_workspace_distance_and_gradient(self, x: float, y: float) -> Tuple[float, np.ndarray]:
+        """Sample the signed distance field and its gradient at a continuous point."""
+        distance = bilinear_sample_scalar(self.dist_field, x, y)
+        gradient = bilinear_sample_vector(self.grad_x, self.grad_y, x, y)
+        return distance, gradient
+
+    def _workspace_cost_and_gradient(self, x: float, y: float) -> Tuple[float, np.ndarray]:
+        """Return CHOMP's workspace potential c(x) and its gradient."""
+        distance, distance_grad = self._sample_workspace_distance_and_gradient(x, y)
+        epsilon = float(self.obstacle_epsilon)
+
+        if distance < 0.0:
+            cost = -distance + 0.5 * epsilon
+            cost_grad = -distance_grad
+        elif distance <= epsilon:
+            cost = 0.5 * (distance - epsilon) ** 2 / epsilon
+            cost_grad = ((distance - epsilon) / epsilon) * distance_grad
+        else:
+            cost = 0.0
+            cost_grad = np.zeros(2, dtype=np.float64)
+
+        return float(cost), cost_grad
+
+    def _compute_smoothness_cost_and_grad(self, trajectory: np.ndarray) -> Tuple[float, np.ndarray]:
+        """Return the discrete squared-velocity prior and its gradient."""
+        if self.num_free == 0:
+            return 0.0, np.zeros((0, 2), dtype=np.float64)
+
+        segments = np.diff(trajectory, axis=0)
+        free_points = trajectory[1:-1]
+        smooth_cost = 0.5 * float(np.sum(segments ** 2))
+        smooth_grad = self.smoothness_matrix @ free_points + self.boundary_term
+        return smooth_cost, smooth_grad
+
+    def _compute_obstacle_terms(
+        self,
+        trajectory: np.ndarray,
+        compute_gradients: bool,
+    ) -> Tuple[float, np.ndarray, float, np.ndarray]:
+        """Return CHOMP obstacle/length functionals and their gradients."""
         n = len(trajectory)
-        total_smooth_cost = 0.0
-        total_obs_cost = 0.0
+        obs_grad = np.zeros((max(0, n - 2), 2), dtype=np.float64)
+        length_grad = np.zeros_like(obs_grad)
+        obs_cost = 0.0
+        length_cost = 0.0
+        identity = np.eye(2, dtype=np.float64)
 
         for i in range(1, n - 1):
-            x, y = trajectory[i]
-            accel_x = trajectory[i + 1, 0] - 2 * x + trajectory[i - 1, 0]
-            accel_y = trajectory[i + 1, 1] - 2 * y + trajectory[i - 1, 1]
-            total_smooth_cost += accel_x ** 2 + accel_y ** 2
+            q_prev = trajectory[i - 1]
+            q_curr = trajectory[i]
+            q_next = trajectory[i + 1]
 
-            obs_cost, _, _ = self._get_obstacle_cost_and_grad(x, y)
-            total_obs_cost += obs_cost
+            velocity = 0.5 * (q_next - q_prev)
+            speed = float(np.linalg.norm(velocity))
+            speed_safe = max(speed, 1e-6)
+            tangent = velocity / speed_safe
+            projector = identity - np.outer(tangent, tangent)
+            acceleration = q_next - 2.0 * q_curr + q_prev
+            curvature = (projector @ acceleration) / (speed_safe ** 2)
 
-        avg_smooth_cost = total_smooth_cost / max(1, n - 2)
-        avg_obs_cost = total_obs_cost / max(1, n - 2)
-        avg_path_segment_length = self._trajectory_length(trajectory) / max(1, n - 1)
-        total_cost = (
-            self.smoothness_weight * avg_smooth_cost
-            + self.obstacle_weight * avg_obs_cost
-            + self.path_length_weight * avg_path_segment_length
+            workspace_cost, workspace_grad = self._workspace_cost_and_gradient(q_curr[0], q_curr[1])
+            obs_cost += workspace_cost * speed_safe
+            length_cost += speed_safe
+
+            if not compute_gradients:
+                continue
+
+            obs_grad[i - 1] = speed_safe * (projector @ workspace_grad - workspace_cost * curvature)
+            length_grad[i - 1] = -speed_safe * curvature
+
+        return float(obs_cost), obs_grad, float(length_cost), length_grad
+
+    def _evaluate_trajectory(self, trajectory: np.ndarray) -> Tuple[float, float, float, float]:
+        """Return total, obstacle, smoothness, and path-length costs for a trajectory."""
+        smooth_cost, _ = self._compute_smoothness_cost_and_grad(trajectory)
+        obs_cost, _, path_length_cost, _ = self._compute_obstacle_terms(
+            trajectory,
+            compute_gradients=False,
         )
-        return total_cost, avg_obs_cost, avg_smooth_cost, avg_path_segment_length
+        total_cost = (
+            self.smoothness_weight * smooth_cost
+            + self.obstacle_weight * obs_cost
+            + self.path_length_weight * path_length_cost
+        )
+        return total_cost, obs_cost, smooth_cost, path_length_cost
 
     def _store_best_valid_trajectory(self, total_cost: float) -> bool:
         """Keep the best collision-free trajectory seen so far."""
@@ -2583,33 +2850,6 @@ class CHOMPPlanner(BasePlanner):
         self.trajectory = self.best_trajectory.copy()
         self._check_path_validity()
     
-    def _get_obstacle_cost_and_grad(self, x: float, y: float) -> Tuple[float, float, float]:
-        """Get obstacle cost and gradient at a point."""
-        ix, iy = int(np.clip(x, 0, self.w - 1)), int(np.clip(y, 0, self.h - 1))
-        
-        d = self.dist_field[iy, ix]
-        
-        if d < 0:  # Inside obstacle - strong repulsion
-            cost = self.obstacle_epsilon - d
-            # Gradient points away from obstacle (towards free space)
-            grad_x = -self.grad_x[iy, ix] 
-            grad_y = -self.grad_y[iy, ix]
-            # Normalize and amplify
-            norm = np.sqrt(grad_x**2 + grad_y**2) + 1e-6
-            grad_x = grad_x / norm * 2.0
-            grad_y = grad_y / norm * 2.0
-        elif d < self.obstacle_epsilon:  # Near obstacle
-            cost = 0.5 * (d - self.obstacle_epsilon) ** 2 / self.obstacle_epsilon
-            factor = (d - self.obstacle_epsilon) / self.obstacle_epsilon
-            grad_x = factor * self.grad_x[iy, ix]
-            grad_y = factor * self.grad_y[iy, ix]
-        else:  # Far from obstacle
-            cost = 0.0
-            grad_x = 0.0
-            grad_y = 0.0
-        
-        return cost, grad_x, grad_y
-    
     def step_once(self) -> StepResult:
         if self.done:
             return StepResult(done=True, found_path=self.found_path)
@@ -2620,81 +2860,90 @@ class CHOMPPlanner(BasePlanner):
             return StepResult(done=True, found_path=self.found_path)
         
         self.iteration += 1
-        
         n = self.num_points
-        
-        # Compute gradients for all internal points (not start/goal)
-        grad = np.zeros((n, 2), dtype=np.float64)
+        previous_total_cost = self.total_cost
 
-        for i in range(1, n - 1):  # Skip start and goal
-            x, y = self.trajectory[i]
-            
-            # Smoothness gradient (using finite differences of acceleration)
-            smooth_grad_x = 2 * (2 * x - self.trajectory[i-1, 0] - self.trajectory[i+1, 0])
-            smooth_grad_y = 2 * (2 * y - self.trajectory[i-1, 1] - self.trajectory[i+1, 1])
+        smooth_cost, smooth_grad = self._compute_smoothness_cost_and_grad(self.trajectory)
+        obs_cost, obs_grad, path_length_cost, length_grad = self._compute_obstacle_terms(
+            self.trajectory,
+            compute_gradients=True,
+        )
+        total_cost = (
+            self.smoothness_weight * smooth_cost
+            + self.obstacle_weight * obs_cost
+            + self.path_length_weight * path_length_cost
+        )
 
-            # Obstacle gradient and cost
-            _, obs_grad_x, obs_grad_y = self._get_obstacle_cost_and_grad(x, y)
+        rhs = (
+            self.smoothness_weight * smooth_grad
+            + self.obstacle_weight * obs_grad
+            + self.path_length_weight * length_grad
+        )
+        preconditioned_grad = self._solve_metric(rhs)
 
-            prev_vec = self.trajectory[i] - self.trajectory[i - 1]
-            next_vec = self.trajectory[i] - self.trajectory[i + 1]
-            prev_len = np.linalg.norm(prev_vec) + 1e-6
-            next_len = np.linalg.norm(next_vec) + 1e-6
-            length_grad_x = prev_vec[0] / prev_len + next_vec[0] / next_len
-            length_grad_y = prev_vec[1] / prev_len + next_vec[1] / next_len
+        accepted_update = np.zeros_like(preconditioned_grad)
+        accepted_total_cost = total_cost
+        accepted_obs_cost = obs_cost
+        accepted_smooth_cost = smooth_cost
+        accepted_length_cost = path_length_cost
 
-            # Combine gradients
-            grad[i, 0] = (
-                self.smoothness_weight * smooth_grad_x
-                + self.obstacle_weight * obs_grad_x
-                + self.path_length_weight * length_grad_x
-            )
-            grad[i, 1] = (
-                self.smoothness_weight * smooth_grad_y
-                + self.obstacle_weight * obs_grad_y
-                + self.path_length_weight * length_grad_y
-            )
-        
-        # Adaptive learning rate - reduce if oscillating
-        lr = self.learning_rate
-        if self.iteration > 50:
-            lr *= 0.5  # Reduce learning rate later for fine-tuning
-        
-        # Gradient descent update with gradient clipping
-        grad_norm = np.sqrt(np.sum(grad ** 2))
-        if grad_norm > 1e-6:
-            max_grad_norm = 50.0  # Clip gradients to prevent instability
-            if grad_norm > max_grad_norm:
-                grad = grad * (max_grad_norm / grad_norm)
-        
-        # Update trajectory
-        self.trajectory[1:-1] -= lr * grad[1:-1]
-        
-        # Clamp to image bounds
-        self.trajectory[:, 0] = np.clip(self.trajectory[:, 0], 0, self.w - 1)
-        self.trajectory[:, 1] = np.clip(self.trajectory[:, 1], 0, self.h - 1)
+        if self.num_free > 0:
+            best_candidate = self.trajectory.copy()
+            best_candidate_cost = total_cost
+            best_candidate_obs_cost = obs_cost
+            best_candidate_smooth_cost = smooth_cost
+            best_candidate_length_cost = path_length_cost
 
-        total_cost, avg_obs_cost, avg_smooth_cost, avg_path_segment_length = self._evaluate_trajectory(self.trajectory)
-        self.path_length = avg_path_segment_length * max(1, n - 1)
+            for backtrack in range(8):
+                step_size = self.learning_rate * (0.5 ** backtrack)
+                delta = -step_size * preconditioned_grad
+                delta_norm = float(np.linalg.norm(delta))
+                if delta_norm > 25.0:
+                    delta *= 25.0 / delta_norm
 
-        if total_cost < self.best_cost:
-            self.best_cost = total_cost
+                candidate = self.trajectory.copy()
+                candidate[1:-1] += delta
+                candidate[1:-1, 0] = np.clip(candidate[1:-1, 0], 0, self.w - 1)
+                candidate[1:-1, 1] = np.clip(candidate[1:-1, 1], 0, self.h - 1)
+
+                candidate_total, candidate_obs, candidate_smooth, candidate_length = self._evaluate_trajectory(candidate)
+                if candidate_total < best_candidate_cost - 1e-9:
+                    best_candidate = candidate
+                    best_candidate_cost = candidate_total
+                    best_candidate_obs_cost = candidate_obs
+                    best_candidate_smooth_cost = candidate_smooth
+                    best_candidate_length_cost = candidate_length
+                    accepted_update = delta
+                    break
+
+            self.trajectory = best_candidate
+            accepted_total_cost = best_candidate_cost
+            accepted_obs_cost = best_candidate_obs_cost
+            accepted_smooth_cost = best_candidate_smooth_cost
+            accepted_length_cost = best_candidate_length_cost
+
+        self.path_length = self._trajectory_length(self.trajectory)
+
+        if accepted_total_cost < self.best_cost:
+            self.best_cost = accepted_total_cost
             self.best_trajectory = self.trajectory.copy()
 
-        # Check if current path is valid (for live visualization)
         path_improved = False
-        if self.iteration % 10 == 0 or avg_obs_cost < 0.5:
+        if self.iteration % 5 == 0:
             self._check_path_validity()
-            path_improved = self._store_best_valid_trajectory(total_cost)
-        
-        # Check convergence
-        cost_change = abs(self.total_cost - total_cost) if self.total_cost != float('inf') else float('inf')
-        self.total_cost = total_cost
-        self.obs_cost = avg_obs_cost
-        self.smooth_cost = avg_smooth_cost
-        
-        # Convergence: small cost change and low obstacle cost
-        if cost_change < 0.01 and avg_obs_cost < 0.5 and self.iteration > 20:
+            path_improved = self._store_best_valid_trajectory(accepted_total_cost)
+
+        cost_change = abs(previous_total_cost - accepted_total_cost) if previous_total_cost != float('inf') else float('inf')
+        update_norm = float(np.linalg.norm(accepted_update))
+        self.total_cost = accepted_total_cost
+        self.obs_cost = accepted_obs_cost
+        self.smooth_cost = accepted_smooth_cost
+
+        if (
+            self.iteration > 40
+            and self.best_valid_trajectory is not None
+            and (cost_change < 8e-4 or update_norm < 8e-3)
+        ):
             self.converged = True
             self.done = True
             self._finalize_best_trajectory()
@@ -2712,13 +2961,7 @@ class CHOMPPlanner(BasePlanner):
     
     def _check_path_validity(self):
         """Check if the final trajectory is collision-free."""
-        for i in range(len(self.trajectory) - 1):
-            p1 = self._rounded_trajectory_point(i)
-            p2 = self._rounded_trajectory_point(i + 1)
-            if not line_collision_free(p1, p2, self.occ):
-                self.found_path = False
-                return
-        self.found_path = True
+        self.found_path = self._trajectory_collision_free(self.trajectory)
     
     def extract_path(self) -> List[Tuple[int, int]]:
         """Extract the current trajectory as a path."""
@@ -2726,7 +2969,11 @@ class CHOMPPlanner(BasePlanner):
 
     def extract_display_path(self) -> List[Tuple[float, float]]:
         """Extract the floating-point trajectory for rendering."""
-        return [(float(p[0]), float(p[1])) for p in self.trajectory]
+        path = [(float(p[0]), float(p[1])) for p in self.trajectory]
+        if len(path) < 3:
+            return path
+        spacing = max(1.0, self._trajectory_length() / max(24.0, len(path) * 1.5))
+        return smooth_float_polyline(path, spacing=spacing, iterations=2)
     
     def get_status(self) -> str:
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
@@ -7182,7 +7429,7 @@ ALGORITHM_INFO: Dict[str, Tuple[str, str]] = {
         "Khatib, 1986"
     ),
     'CHOMP': (
-        "Covariant Hamiltonian Optimization. Gradient-based trajectory optimization.",
+        "Covariant trajectory optimization for a 2D point robot using a signed distance field, functional obstacle gradients, and a CHOMP-style preconditioned update.",
         "Zucker et al., 2013"
     ),
     'STOMP': (
@@ -7265,6 +7512,20 @@ class ImageCanvas(QLabel):
         self.edge_highlights: List[Tuple[int, int, int, int, int]] = []  # (x1, y1, x2, y2, alpha)
         self.current_tree_edges: List[Edge] = []
         self.current_path: List[Tuple[float, float]] = []
+        self.previous_path: List[Tuple[float, float]] = []
+        self.reference_path: List[Tuple[float, float]] = []
+        self.reference_path_color = QColor(130, 170, 255, 120)
+        self.current_path_style: str = "default"
+        self.current_path_focus: Optional[Tuple[float, float]] = None
+        self.animated_path: List[Tuple[float, float]] = []
+        self.path_animation_from: List[Tuple[float, float]] = []
+        self.path_animation_to: List[Tuple[float, float]] = []
+        self.path_animation_start_time: float = 0.0
+        self.path_animation_duration_s: float = 0.14
+        self.path_animation_timer = QTimer(self)
+        self.path_animation_timer.setInterval(16)
+        self.path_animation_timer.timeout.connect(self._advance_path_animation)
+        self.path_history: List[Tuple[List[Tuple[float, float]], str, int]] = []
 
     def _make_pen(self, color: Union[Qt.GlobalColor, QColor], width: int) -> QPen:
         """Create a pen with rounded joins for cleaner path rendering."""
@@ -7279,21 +7540,94 @@ class ImageCanvas(QLabel):
         path: List[Tuple[Union[int, float], Union[int, float]]],
         color: Union[Qt.GlobalColor, QColor],
         width: int,
+        pen_style: Qt.PenStyle = Qt.PenStyle.SolidLine,
     ) -> None:
         """Draw a path with anti-aliasing and rounded joins."""
         if len(path) < 2:
             return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(self._make_pen(color, width))
+        pen = self._make_pen(color, width)
+        pen.setStyle(pen_style)
+        painter.setPen(pen)
         for i in range(len(path) - 1):
             p1 = QPointF(float(path[i][0]), float(path[i][1]))
             p2 = QPointF(float(path[i + 1][0]), float(path[i + 1][1]))
             painter.drawLine(p1, p2)
+
+    def _draw_live_path(self, painter: QPainter) -> None:
+        """Draw the current live path with an algorithm-specific visual style."""
+        if len(self.reference_path) >= 2:
+            self._draw_polyline(
+                painter,
+                self.reference_path,
+                self.reference_path_color,
+                2,
+                pen_style=Qt.PenStyle.DashLine,
+            )
+
+        render_path = self.current_path
+        if len(render_path) < 2:
+            return
+
+        if self.current_path_style == "optimizer":
+            history_color = QColor(85, 200, 255, 70)
+            prev_color = QColor(210, 245, 255, 135)
+            connector_color = QColor(65, 210, 255, 110)
+            main_glow = QColor(35, 185, 255, 70)
+            main_core = QColor(235, 248, 255, 245)
+        elif self.current_path_style == "optimizer_post":
+            history_color = QColor(255, 155, 215, 78)
+            prev_color = QColor(255, 232, 244, 145)
+            connector_color = QColor(255, 120, 205, 110)
+            main_glow = QColor(255, 95, 185, 78)
+            main_core = QColor(255, 246, 250, 245)
+        else:
+            self._draw_polyline(painter, render_path, Qt.GlobalColor.yellow, 4)
+            return
+
+        # Recent full trajectories remain visible briefly as contour lines.
+        for history_path, history_style, alpha in self.path_history:
+            if len(history_path) < 2 or alpha <= 0:
+                continue
+            if history_style != self.current_path_style:
+                continue
+            self._draw_polyline(
+                painter,
+                history_path,
+                QColor(history_color.red(), history_color.green(), history_color.blue(), min(alpha, 120)),
+                2,
+            )
+
+        # Show the immediately previous full trajectory as a dashed comparison path.
+        if len(self.previous_path) >= 2:
+            self._draw_polyline(
+                painter,
+                self.previous_path,
+                prev_color,
+                2,
+                pen_style=Qt.PenStyle.DashLine,
+            )
+
+            # Visualize the whole-trajectory deformation between the last and current iteration.
+            sample_count = max(14, min(40, max(len(self.previous_path), len(render_path))))
+            prev_samples = resample_float_path_fixed_count(self.previous_path, sample_count)
+            curr_samples = resample_float_path_fixed_count(render_path, sample_count)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(self._make_pen(connector_color, 1))
+            painter.setBrush(QBrush(QColor(connector_color.red(), connector_color.green(), connector_color.blue(), 95)))
+            for (ax, ay), (bx, by) in zip(prev_samples[1:-1], curr_samples[1:-1]):
+                painter.drawLine(QPointF(float(ax), float(ay)), QPointF(float(bx), float(by)))
+                painter.drawEllipse(QPointF(float(bx), float(by)), 1.6, 1.6)
+
+        # Current full trajectory
+        self._draw_polyline(painter, render_path, main_glow, 8)
+        self._draw_polyline(painter, render_path, main_core, 3)
     
     def set_image(self, qpix: QPixmap):
         self.base_pixmap = qpix
         self.overlay = QPixmap(qpix.size())
         self.overlay.fill(Qt.GlobalColor.transparent)
+        self.path_animation_timer.stop()
         self.start = None
         self.goal = None
         self.pick_mode = "start"
@@ -7302,6 +7636,14 @@ class ImageCanvas(QLabel):
         self.edge_highlights = []
         self.current_tree_edges = []
         self.current_path = []
+        self.previous_path = []
+        self.reference_path = []
+        self.current_path_style = "default"
+        self.current_path_focus = None
+        self.animated_path = []
+        self.path_animation_from = []
+        self.path_animation_to = []
+        self.path_history = []
         self._cached_disp_size = None  # Recompute on new image
         self._update_display()
     
@@ -7310,11 +7652,20 @@ class ImageCanvas(QLabel):
             return
         self.overlay = QPixmap(self.base_pixmap.size())
         self.overlay.fill(Qt.GlobalColor.transparent)
+        self.path_animation_timer.stop()
         self.highlights = []
         self.rejected_highlights = []
         self.edge_highlights = []
         self.current_tree_edges = []
         self.current_path = []
+        self.previous_path = []
+        self.reference_path = []
+        self.current_path_style = "default"
+        self.current_path_focus = None
+        self.animated_path = []
+        self.path_animation_from = []
+        self.path_animation_to = []
+        self.path_history = []
         self._update_display()
     
     def _update_display(self):
@@ -7353,9 +7704,8 @@ class ImageCanvas(QLabel):
 
         painter.drawPixmap(0, 0, self.overlay)
 
-        # Draw current path on top of the tree for a cleaner readable solution view.
-        if len(self.current_path) >= 2:
-            self._draw_polyline(painter, self.current_path, Qt.GlobalColor.yellow, 4)
+        # Draw current optimizer/path estimate on top of the tree.
+        self._draw_live_path(painter)
         
         # Draw edge highlights
         for (x1, y1, x2, y2, alpha) in self.edge_highlights:
@@ -7450,6 +7800,38 @@ class ImageCanvas(QLabel):
     def clear_current_tree(self):
         self.current_tree_edges = []
         self._update_display()
+
+    def set_reference_path(
+        self,
+        path: List[Tuple[float, float]],
+        color: Optional[QColor] = None,
+    ) -> None:
+        self.reference_path = list(path)
+        if color is not None:
+            self.reference_path_color = QColor(color)
+        self._update_display()
+
+    def clear_reference_path(self) -> None:
+        self.reference_path = []
+        self._update_display()
+
+    def _advance_path_animation(self) -> None:
+        """Advance the live path tween used for optimizer-style planners."""
+        if len(self.path_animation_from) < 2 or len(self.path_animation_to) < 2:
+            self.path_animation_timer.stop()
+            self.animated_path = list(self.current_path)
+            self._update_display()
+            return
+
+        elapsed = time.perf_counter() - self.path_animation_start_time
+        alpha = min(1.0, elapsed / max(1e-6, self.path_animation_duration_s))
+        eased = alpha * alpha * (3.0 - 2.0 * alpha)
+        self.animated_path = blend_float_paths(self.path_animation_from, self.path_animation_to, eased)
+        self._update_display()
+
+        if alpha >= 1.0:
+            self.path_animation_timer.stop()
+            self.animated_path = list(self.current_path)
     
     def add_rejected_highlight(self, point):
         self.rejected_highlights.append((point[0], point[1], 255))
@@ -7459,10 +7841,62 @@ class ImageCanvas(QLabel):
         self.rejected_highlights = [(x, y, a - fade_amount) for x, y, a in self.rejected_highlights if a - fade_amount > 0]
         edge_fade = fade_amount * 3
         self.edge_highlights = [(x1, y1, x2, y2, a - edge_fade) for x1, y1, x2, y2, a in self.edge_highlights if a - edge_fade > 0]
+        self.path_history = [
+            (path, style, alpha - fade_amount)
+            for path, style, alpha in self.path_history
+            if alpha - fade_amount > 0
+        ]
     
     def clear_path(self):
         """Clear the current path (for RRT* live updates)."""
+        self.path_animation_timer.stop()
         self.current_path = []
+        self.previous_path = []
+        self.current_path_style = "default"
+        self.current_path_focus = None
+        self.animated_path = []
+        self.path_animation_from = []
+        self.path_animation_to = []
+        self.path_history = []
+
+    def set_current_path(
+        self,
+        path: List[Tuple[float, float]],
+        style: str = "default",
+        focus_point: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        next_path = list(path)
+        current_draw_path = self.animated_path if len(self.animated_path) >= 2 else self.current_path
+        if current_draw_path and len(current_draw_path) >= 2:
+            self.previous_path = list(current_draw_path)
+        else:
+            self.previous_path = []
+
+        if style in {"optimizer", "optimizer_post"} and current_draw_path and len(current_draw_path) >= 2:
+            self.path_history.append((list(current_draw_path), style, 190))
+            self.path_history = self.path_history[-18:]
+
+        self.current_path = next_path
+        self.current_path_style = style
+        if focus_point is None:
+            self.current_path_focus = None
+        else:
+            self.current_path_focus = (float(focus_point[0]), float(focus_point[1]))
+
+        # Optimizer paths are shown as discrete full-trajectory iterations rather
+        # than morphing continuously between them.
+        self.path_animation_timer.stop()
+        self.path_animation_from = []
+        self.path_animation_to = []
+        self.animated_path = list(next_path)
+        self._update_display()
+
+    def set_optimizer_animation_profile(self, live: bool) -> None:
+        """Switch between interactive and process-heavy optimizer animation profiles."""
+        if live:
+            self.path_animation_duration_s = 0.10
+        else:
+            self.path_animation_duration_s = 0.16
     
     def draw_path(self, path, permanent=False, color=Qt.GlobalColor.yellow):
         """Draw path. If permanent=True, draw to overlay. Otherwise set as current_path for live display."""
@@ -7476,8 +7910,8 @@ class ImageCanvas(QLabel):
             self._draw_polyline(painter, list(path), color, 4)
             painter.end()
         else:
-            # Set as current path for live display
-            self.current_path = list(path)
+            self.set_current_path(list(path), style="default")
+            return
         self._update_display()
 
 # =============================================================================
@@ -8091,13 +8525,13 @@ class MainWindow(QMainWindow):
         
         if not self._ensure_planner():
             return
+        self.canvas.set_optimizer_animation_profile(live=not isinstance(self.planner, CHOMPPlanner))
         self.is_playing = True
         self._set_running_state()
         self._update_status_display(state="Running", info="Algorithm is running...")
         self._update_stopwatch_label()
-        # MAX mode (1000) uses minimal interval, normal mode uses 1000/speed
         speed = self.speed_slider.value()
-        interval_ms = 1 if speed >= 1000 else max(1, 1000 // speed)
+        interval_ms = self._compute_timer_interval_ms(speed)
         self.timer.start(interval_ms)
     
     def _set_running_state(self):
@@ -8149,21 +8583,20 @@ class MainWindow(QMainWindow):
         if base_path is None or len(base_path) < 2:
             QMessageBox.information(self, "Info", "No valid path to optimize.")
             return
-        base_path = shortcut_path(list(base_path), self.occ)
+        base_path = list(base_path)
 
         # Stop any running timers
         self.timer.stop()
         self.is_playing = False
 
         chomp_params = self.params_widgets['CHOMP'].get_params()
-        # Bias CHOMP toward smoother trajectories when optimizing an existing path
-        chomp_params['num_points'] = max(
-            chomp_params.get('num_points', 50),
-            min(90, max(50, len(base_path) * 2))
-        )
-        # Keep CHOMP Optimize quick for interactive use.
-        chomp_params['max_iters'] = 400
-        chomp_params['smoothness_weight'] = chomp_params.get('smoothness_weight', 1.0) * 1.5
+
+        # Keep the originally found path visible while CHOMP optimizes over it.
+        self.canvas.clear_current_tree()
+        self.canvas.clear_path()
+        self.canvas.clear_reference_path()
+        self.canvas.set_optimizer_animation_profile(live=True)
+
         self.planner = CHOMPPlanner(
             self.occ,
             self.canvas.start,
@@ -8180,7 +8613,7 @@ class MainWindow(QMainWindow):
         self._set_running_state()
         self._update_status_display(state="Running", info="CHOMP optimizing...")
         speed = self.speed_slider.value()
-        interval_ms = 1 if speed >= 1000 else max(1, 1000 // speed)
+        interval_ms = self._compute_timer_interval_ms(speed)
         self.timer.start(interval_ms)
     
     def _update_speed_label(self, value: int):
@@ -8189,14 +8622,26 @@ class MainWindow(QMainWindow):
         else:
             self.speed_label.setText(f"{value} steps/sec")
         if self.is_playing and self.timer.isActive():
-            # MAX mode uses minimal interval
-            interval_ms = 1 if value >= 1000 else max(1, 1000 // value)
+            interval_ms = self._compute_timer_interval_ms(value)
             self.timer.setInterval(interval_ms)
+
+    def _compute_timer_interval_ms(self, speed_value: int) -> int:
+        """Return a playback interval suited to the current planner."""
+        if isinstance(self.planner, CHOMPPlanner):
+            if speed_value >= 1000:
+                return 8
+            return max(8, 1000 // max(1, speed_value))
+        return 1 if speed_value >= 1000 else max(1, 1000 // speed_value)
     
     def _fade_tick(self):
         self.canvas.fade_highlights(fade_amount=30)
         self.canvas._update_display()
-        if not (self.canvas.highlights or self.canvas.rejected_highlights or self.canvas.edge_highlights):
+        if not (
+            self.canvas.highlights
+            or self.canvas.rejected_highlights
+            or self.canvas.edge_highlights
+            or self.canvas.path_history
+        ):
             self.fade_timer.stop()
     
     def _run_tick(self):
@@ -8205,13 +8650,20 @@ class MainWindow(QMainWindow):
         
         # MAX mode: faster fading to keep display clean
         speed = self.speed_slider.value()
-        if speed >= 1000:
+        is_chomp = isinstance(self.planner, CHOMPPlanner)
+        if is_chomp:
+            self.canvas.fade_highlights(fade_amount=18 if self.is_playing else 30)
+        elif speed >= 1000 and not is_chomp:
             self.canvas.fade_highlights(fade_amount=120)  # Much faster fade in MAX mode
         else:
             self.canvas.fade_highlights(fade_amount=30 if self.is_playing else 60)
         
         # MAX mode: run many steps per tick for maximum speed, but update display periodically
-        if speed >= 1000:
+        if is_chomp:
+            num_steps = 1
+            display_interval = 1
+            tick_time_budget = None
+        elif speed >= 1000:
             if isinstance(self.planner, PSOPlanner):
                 num_steps = 500  # PSO benefits from larger batches
                 display_interval = 100
@@ -8234,7 +8686,7 @@ class MainWindow(QMainWindow):
             self._handle_step_result(result)
             
             # In MAX mode, update display periodically for visual feedback
-            if speed >= 1000 and (i + 1) % display_interval == 0:
+            if speed >= 1000 and not is_chomp and (i + 1) % display_interval == 0:
                 self.canvas.fade_highlights(fade_amount=120)  # Extra fade during updates
                 self.canvas._update_display()
                 self._update_stopwatch_label()
@@ -8254,12 +8706,13 @@ class MainWindow(QMainWindow):
     def _handle_step_result(self, result: StepResult):
         edge_color = QColor(160, 32, 240) if self.optimizing_from_sampling else Qt.GlobalColor.blue
         is_gpmp = isinstance(self.planner, GPMPPlanner)
+        is_chomp = isinstance(self.planner, CHOMPPlanner)
         is_bitstar = isinstance(self.planner, BITStarPlanner)
         # Handle multiple edges (for batch algorithms like FMT*)
-        if result.edges and not is_gpmp and not is_bitstar:
+        if result.edges and not is_gpmp and not is_chomp and not is_bitstar:
             for edge in result.edges:
                 self.canvas.draw_edge(edge[0], edge[1], color=edge_color)
-        elif result.edge and not is_gpmp and not is_bitstar:
+        elif result.edge and not is_gpmp and not is_chomp and not is_bitstar:
             self.canvas.draw_edge(result.edge[0], result.edge[1], color=edge_color)
         elif is_bitstar:
             if self.planner is not None and hasattr(self.planner, "extract_tree_edges"):
@@ -8267,17 +8720,18 @@ class MainWindow(QMainWindow):
         if result.rejected_point:
             self.canvas.add_rejected_highlight(result.rejected_point)
             self.canvas._update_display()
-        if is_gpmp and self.planner is not None:
+        if (is_gpmp or is_chomp) and self.planner is not None:
             display_path = self.planner.extract_display_path()
             if display_path:
-                self.canvas.current_path = list(display_path)
+                style = "optimizer_post" if self.optimizing_from_sampling else "optimizer"
+                self.canvas.set_current_path(display_path, style=style, focus_point=None)
         # For RRT*: always keep the current best path visible
         if self.planner is not None and self.planner.found_path:
             path = self.planner.extract_path()
             if path:
-                if not self.optimizing_from_sampling and not is_gpmp:
+                if not self.optimizing_from_sampling and not is_gpmp and not is_chomp:
                     display_path = self.planner.extract_display_path() if hasattr(self.planner, "extract_display_path") else path
-                    self.canvas.current_path = list(display_path)
+                    self.canvas.set_current_path(list(display_path), style="default")
     
     def _check_done(self):
         if self.planner is None:
@@ -8306,6 +8760,7 @@ class MainWindow(QMainWindow):
         if isinstance(self.planner, BITStarPlanner):
             self.canvas.clear_current_tree()
         self.canvas.clear_path()  # Clear live path
+        self.canvas.clear_reference_path()
         display_path = self.planner.extract_display_path() if hasattr(self.planner, "extract_display_path") else path
         if self.optimizing_from_sampling:
             self.canvas.draw_path(display_path, permanent=True, color=QColor(255, 105, 180))

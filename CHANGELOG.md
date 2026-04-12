@@ -10,6 +10,9 @@ This file tracks release notes for published versions of the project.
 - Updated `RRT` to use the paper's `GENERATE_RRT(x_init, K, Delta t)` structure in a clearer 2D holonomic occupancy-grid adaptation
 - Improved `RRT` path presentation with a smoother display-only rendering of the current/final solution
 - Clarified the `RRT` algorithm description in the UI and README, including the role of configurable goal bias
+- Reworked `CHOMP` into a more faithful 2D point-robot specialization with signed-distance interpolation, CHOMP-style covariant preconditioning, and functional obstacle gradients
+- Reworked `CHOMP` visualization to show full-trajectory deformation per iteration, including recent trajectory history and previous-to-current correspondence cues
+- Retuned interactive `CHOMP` optimization defaults and stopping behavior for faster GUI feedback without changing the underlying objective
 
 ### Fixed
 
@@ -17,6 +20,8 @@ This file tracks release notes for published versions of the project.
 - Fixed `RRT` goal-region handling, including immediate success when `start` already lies inside the goal region
 - Fixed `RRT` vertex-budget termination so the planner now stops cleanly at the configured `K` limit
 - Corrected `RRT` rejection highlighting so failed expansion attempts mark the rejected extension point more accurately
+- Fixed `CHOMP` cost/gradient inconsistencies by aligning the optimized objective with the reported smoothness and obstacle terms
+- Fixed `CHOMP Optimize` so the original sampled path remains visible while the optimizer runs on top of it
 
 ## [0.1.0b3] - 2026-04-09
 

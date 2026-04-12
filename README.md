@@ -37,6 +37,7 @@ The demo below shows the typical workflow: loading a map, placing start and goal
 - Core baseline planners are implemented in a comparatively direct way for 2D occupancy-grid pathfinding.
 - `A*` and `Dijkstra` should be interpreted as optimal on the induced search grid, not on the continuous image plane.
 - `RRT` follows the paper's `GENERATE_RRT(x_init, K, Delta t)` structure in a 2D holonomic specialization: uniform bounded workspace sampling, Euclidean nearest-neighbor search, explicit `SELECT_INPUT/NEW_STATE` semantics via `x_dot = u`, a fixed vertex budget `K`, and an optional OMPL-style `goal_bias` parameter for goal-directed sampling.
+- `CHOMP` is implemented as a 2D point-robot specialization with a signed distance field, covariant preconditioned updates, and the functional obstacle-gradient structure from the original method, rather than a full articulated-robot configuration-space system.
 - `BiTRRT` follows the OMPL planner structure closely, but in this application its optimization objective is adapted to a 2D occupancy grid through a clearance-derived cost field rather than an arbitrary user-supplied cost objective.
 - `PRM` now follows a clearer two-phase structure with query-independent roadmap construction followed by query-time start/goal attachment.
 - `SBL` is implemented as a 2D adaptation with lazy segment validation and lightweight path optimization, not as a full general-configuration-space reproduction of the original system.
