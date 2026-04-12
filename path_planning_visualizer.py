@@ -76,6 +76,7 @@ from PyQt6.QtWidgets import (
 # =============================================================================
 
 Point = Tuple[int, int]
+FloatPoint = Tuple[float, float]
 Edge = Tuple[Point, Point]
 OccupancyGrid = NDArray[np.bool_]
 
@@ -104,6 +105,35 @@ def l1_dist(a: Point, b: Point) -> float:
 def linf_dist(a: Point, b: Point) -> float:
     """Calculate Chebyshev / L-infinity distance between two points."""
     return float(max(abs(a[0] - b[0]), abs(a[1] - b[1])))
+
+
+def round_point(p: FloatPoint) -> Point:
+    """Round a continuous state to the occupancy-grid pixel used by the UI."""
+    return (int(round(p[0])), int(round(p[1])))
+
+
+def select_holonomic_input(from_state: FloatPoint, to_state: FloatPoint, delta_t: float) -> FloatPoint:
+    """Return the paper-style holonomic control that best moves toward ``to_state``.
+
+    This specializes LaValle's ``SELECT_INPUT`` step to the simple holonomic model
+    ``x_dot = u`` with ``||u|| <= 1`` over a fixed integration interval ``delta_t``.
+    """
+    dx = float(to_state[0] - from_state[0])
+    dy = float(to_state[1] - from_state[1])
+    distance = float(np.hypot(dx, dy))
+    if distance <= 1e-12 or delta_t <= 1e-12:
+        return (0.0, 0.0)
+    if distance <= delta_t:
+        return (dx / delta_t, dy / delta_t)
+    return (dx / distance, dy / distance)
+
+
+def integrate_holonomic_state(state: FloatPoint, control: FloatPoint, delta_t: float) -> FloatPoint:
+    """Integrate the holonomic state equation ``x_dot = u`` for one fixed step."""
+    return (
+        float(state[0] + delta_t * control[0]),
+        float(state[1] + delta_t * control[1]),
+    )
 
 
 def steer(from_pt: Point, to_pt: Point, step: float) -> Point:
@@ -566,214 +596,239 @@ class BasePlanner(ABC):
 # =============================================================================
 
 class RRTParamsWidget(QWidget):
-    """Widget for RRT parameter configuration.
-    
-    Provides UI controls for all RRT algorithm parameters.
-    """
-    
+    """Widget for RRT parameterization."""
+
     def __init__(self) -> None:
         super().__init__()
         layout = QFormLayout()
-        
-        self.spin_step = QSpinBox()
-        self.spin_step.setRange(1, 200)
-        self.spin_step.setValue(18)
-        self.spin_step.setToolTip("Distance for each tree expansion step")
-        
-        self.spin_goal_rate = QDoubleSpinBox()
-        self.spin_goal_rate.setRange(0.0, 1.0)
-        self.spin_goal_rate.setSingleStep(0.01)
-        self.spin_goal_rate.setValue(0.10)
-        self.spin_goal_rate.setToolTip("Probability of sampling the goal directly")
-        
-        self.spin_goal_tol = QSpinBox()
-        self.spin_goal_tol.setRange(1, 200)
-        self.spin_goal_tol.setValue(20)
-        self.spin_goal_tol.setToolTip("Distance threshold to consider goal reached")
-        
+
+        self.spin_delta_t = QDoubleSpinBox()
+        self.spin_delta_t.setRange(0.5, 200.0)
+        self.spin_delta_t.setSingleStep(0.5)
+        self.spin_delta_t.setValue(18.0)
+        self.spin_delta_t.setToolTip(
+            "Fixed integration interval Delta t for the holonomic NEW_STATE step"
+        )
+
+        self.spin_goal_radius = QDoubleSpinBox()
+        self.spin_goal_radius.setRange(1.0, 200.0)
+        self.spin_goal_radius.setSingleStep(1.0)
+        self.spin_goal_radius.setValue(20.0)
+        self.spin_goal_radius.setToolTip(
+            "Goal-region radius for the single-query adaptation of the paper's tree generator"
+        )
+
+        self.spin_goal_bias = QDoubleSpinBox()
+        self.spin_goal_bias.setRange(0.0, 1.0)
+        self.spin_goal_bias.setSingleStep(0.01)
+        self.spin_goal_bias.setDecimals(3)
+        self.spin_goal_bias.setValue(0.05)
+        self.spin_goal_bias.setToolTip(
+            "OMPL-style probability of sampling the exact goal state; 0.05 is the typical default"
+        )
+
         self.spin_col = QSpinBox()
         self.spin_col.setRange(10, 500)
         self.spin_col.setValue(80)
-        self.spin_col.setToolTip("Number of samples for collision checking along edges")
-        
-        self.spin_maxit = QSpinBox()
-        self.spin_maxit.setRange(100, 200000)
-        self.spin_maxit.setValue(25000)
-        self.spin_maxit.setToolTip("Maximum number of iterations")
-        
+        self.spin_col.setToolTip("Raster samples used to validate each accepted edge on the occupancy grid")
+
+        self.spin_max_vertices = QSpinBox()
+        self.spin_max_vertices.setRange(2, 200000)
+        self.spin_max_vertices.setValue(25000)
+        self.spin_max_vertices.setToolTip(
+            "Vertex budget K from GENERATE_RRT(x_init, K, Delta t), including the root"
+        )
+
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(0, 10_000_000)
         self.spin_seed.setValue(1)
         self.spin_seed.setToolTip("Random seed for reproducibility")
-        
-        layout.addRow("Step size:", self.spin_step)
-        layout.addRow("Goal sample rate:", self.spin_goal_rate)
-        layout.addRow("Goal tolerance:", self.spin_goal_tol)
+
+        layout.addRow("Delta t:", self.spin_delta_t)
+        layout.addRow("Goal region radius:", self.spin_goal_radius)
+        layout.addRow("Goal bias:", self.spin_goal_bias)
         layout.addRow("Collision samples:", self.spin_col)
-        layout.addRow("Max iterations:", self.spin_maxit)
+        layout.addRow("Vertex budget K:", self.spin_max_vertices)
         layout.addRow("Seed:", self.spin_seed)
-        
+
         self.setLayout(layout)
-    
+
     def get_params(self) -> Dict[str, Union[int, float]]:
         """Get all parameter values as a dictionary."""
         return {
-            'step_size': self.spin_step.value(),
-            'goal_sample_rate': self.spin_goal_rate.value(),
-            'goal_tolerance': self.spin_goal_tol.value(),
+            'delta_t': self.spin_delta_t.value(),
+            'goal_region_radius': self.spin_goal_radius.value(),
+            'goal_bias': self.spin_goal_bias.value(),
             'collision_samples': self.spin_col.value(),
-            'max_iters': self.spin_maxit.value(),
+            'max_vertices': self.spin_max_vertices.value(),
             'seed': self.spin_seed.value(),
         }
 
 class RRTPlanner(BasePlanner):
-    """Rapidly-exploring Random Tree (RRT) path planner.
-    
-    RRT builds a tree by randomly sampling points in the configuration space
-    and connecting them to the nearest existing node in the tree.
-    
-    Reference: LaValle, S.M., 1998. Rapidly-exploring random trees: A new tool
-    for path planning.
-    
-    Attributes:
-        step_size: Maximum distance for tree expansion
-        goal_sample_rate: Probability of sampling the goal directly
-        goal_tolerance: Distance to consider goal reached
-        collision_samples: Points to check along edges for collision
-        max_iters: Maximum planning iterations
-        nodes: Tree nodes (list of points)
-        parent: Parent index for each node
-        goal_idx: Index of goal node if found
+    """RRT adapted to a 2D holonomic occupancy-grid world.
+
+    The implementation follows the structure of LaValle's
+    ``GENERATE_RRT(x_init, K, Delta t)``:
+    - ``RANDOM_STATE`` samples uniformly from the bounded workspace
+    - ``NEAREST_NEIGHBOR`` uses Euclidean distance in the continuous state
+    - ``SELECT_INPUT`` and ``NEW_STATE`` are specialized to ``x_dot = u`` with
+      ``||u|| <= 1`` over a fixed ``Delta t``
+    - an optional OMPL-style ``goal_bias`` can replace a random sample with the
+      exact goal state
+    - the UI's single-query path-planning interpretation terminates when a
+      vertex enters a goal region around the clicked goal point
     """
-    
+
     name = "RRT"
-    description = "Rapidly-exploring Random Tree - classic sampling-based planner"
-    
+    description = "Rapidly-exploring Random Tree implementation after LaValle (1998) with optional OMPL-style goal bias"
+
     def __init__(
-        self, 
-        occ: OccupancyGrid, 
-        start: Point, 
+        self,
+        occ: OccupancyGrid,
+        start: Point,
         goal: Point,
-        step_size: int = 18, 
-        goal_sample_rate: float = 0.10, 
-        goal_tolerance: int = 20,
-        collision_samples: int = 80, 
-        max_iters: int = 25000, 
+        delta_t: float = 18.0,
+        goal_region_radius: float = 20.0,
+        goal_bias: float = 0.05,
+        collision_samples: int = 80,
+        max_vertices: int = 25000,
         seed: int = 1
     ) -> None:
-        """Initialize RRT planner.
-        
-        Args:
-            occ: Occupancy grid
-            start: Start position
-            goal: Goal position
-            step_size: Maximum distance for each tree expansion step
-            goal_sample_rate: Probability of sampling the goal directly [0, 1]
-            goal_tolerance: Distance threshold to consider goal reached
-            collision_samples: Number of points to check for collision along edges
-            max_iters: Maximum number of iterations
-            seed: Random seed for reproducibility
-        """
         super().__init__(occ, start, goal)
-        
-        self.step_size = step_size
-        self.goal_sample_rate = goal_sample_rate
-        self.goal_tolerance = goal_tolerance
-        self.collision_samples = collision_samples
-        self.max_iters = max_iters
-        
+
+        self.delta_t = float(max(1e-6, delta_t))
+        self.goal_region_radius = float(max(1.0, goal_region_radius))
+        self.goal_bias = float(np.clip(goal_bias, 0.0, 1.0))
+        self.collision_samples = int(collision_samples)
+        self.max_vertices = int(max(2, max_vertices))
+
         self.rng = np.random.default_rng(seed)
+        self.states: List[FloatPoint] = [(float(start[0]), float(start[1]))]
         self.nodes: List[Point] = [start]
+        self.node_set: Set[Point] = {start}
         self.parent: List[int] = [-1]
+        self.controls: List[Optional[FloatPoint]] = [None]
         self.goal_idx: Optional[int] = None
-    
-    def _nearest(self, p: Point) -> int:
-        """Find index of nearest node to point p.
-        
-        Args:
-            p: Query point
-            
-        Returns:
-            Index of nearest node in the tree
-        """
-        pts = np.array(self.nodes, dtype=np.float32)
-        dx = pts[:, 0] - p[0]
-        dy = pts[:, 1] - p[1]
+        if self._goal_reached(self.states[0]):
+            self.goal_idx = 0
+            self.found_path = True
+            self.done = True
+
+    def _sample_state(self) -> FloatPoint:
+        """Sample uniformly from the bounded workspace, as in RANDOM_STATE."""
+        if self.rng.random() < self.goal_bias:
+            return (float(self.goal[0]), float(self.goal[1]))
+        return (
+            float(self.rng.uniform(0.0, max(0.0, self.w - 1))),
+            float(self.rng.uniform(0.0, max(0.0, self.h - 1))),
+        )
+
+    def _nearest(self, state: FloatPoint) -> int:
+        """Find the nearest existing continuous state to ``state``."""
+        pts = np.array(self.states, dtype=np.float64)
+        dx = pts[:, 0] - state[0]
+        dy = pts[:, 1] - state[1]
         return int(np.argmin(dx * dx + dy * dy))
-    
-    def _sample(self) -> Point:
-        """Sample a random point, biased towards goal.
-        
-        Returns:
-            Sampled point (goal with probability goal_sample_rate,
-            otherwise random point in free space)
-        """
-        if self.rng.random() < self.goal_sample_rate:
-            return self.goal
-        # Rejection sampling: only sample in free space
-        for _ in range(100):
-            p = (int(self.rng.integers(0, self.w)), int(self.rng.integers(0, self.h)))
-            if self.is_free(p):
-                return p
-        return (int(self.rng.integers(0, self.w)), int(self.rng.integers(0, self.h)))
-    
+
+    def _goal_reached(self, state: FloatPoint) -> bool:
+        goal_state = (float(self.goal[0]), float(self.goal[1]))
+        return float(np.hypot(state[0] - goal_state[0], state[1] - goal_state[1])) <= self.goal_region_radius
+
+    def _attempt_extension(
+        self,
+        sample_state: FloatPoint,
+    ) -> Tuple[Optional[Point], Optional[Point], Optional[int], Optional[FloatPoint], Optional[FloatPoint]]:
+        """Attempt one paper-style EXTEND step toward ``sample_state``."""
+        i_near = self._nearest(sample_state)
+        x_near = self.states[i_near]
+        u = select_holonomic_input(x_near, sample_state, self.delta_t)
+        if abs(u[0]) <= 1e-12 and abs(u[1]) <= 1e-12:
+            return None, round_point(sample_state), None, None, None
+
+        x_new = integrate_holonomic_state(x_near, u, self.delta_t)
+        q_near = self.nodes[i_near]
+        q_new = round_point(x_new)
+
+        # Do not insert null motions caused by discretizing the continuous state.
+        if q_new == q_near:
+            return None, q_new, None, None, None
+        if q_new in self.node_set:
+            return None, q_new, None, None, None
+        if not self.is_free(q_new):
+            return None, q_new, None, None, None
+        if not line_collision_free(q_near, q_new, self.occ, samples=self.collision_samples):
+            return None, q_new, None, None, None
+        return q_near, q_new, i_near, u, x_new
+
     def step_once(self) -> StepResult:
         if self.done:
             return StepResult(done=True, found_path=self.found_path)
-        
-        if self.iteration >= self.max_iters:
+
+        if len(self.nodes) >= self.max_vertices:
             self.done = True
             return StepResult(done=True, found_path=False)
-        
+
         self.iteration += 1
-        q_rand = self._sample()
-        i_near = self._nearest(q_rand)
-        q_near = self.nodes[i_near]
-        q_new = clamp_point(steer(q_near, q_rand, self.step_size), self.w, self.h)
-        
-        # Check if new point is valid
-        if not self.is_free(q_new):
-            return StepResult(rejected_point=q_new)
-        if not line_collision_free(q_near, q_new, self.occ, samples=self.collision_samples):
-            return StepResult(rejected_point=q_new)
-        
-        # Add new node
+        sample_state = self._sample_state()
+        q_near, q_new, i_near, u, x_new = self._attempt_extension(sample_state)
+        if q_near is None or q_new is None or i_near is None or u is None or x_new is None:
+            return StepResult(rejected_point=q_new if q_new is not None else round_point(sample_state))
+
         self.nodes.append(q_new)
+        self.node_set.add(q_new)
         self.parent.append(i_near)
-        
-        # Check if goal reached
-        if dist(q_new, self.goal) <= self.goal_tolerance:
-            if line_collision_free(q_new, self.goal, self.occ, samples=self.collision_samples):
-                self.nodes.append(self.goal)
-                self.parent.append(len(self.nodes) - 2)
-                self.goal_idx = len(self.nodes) - 1
-                self.done = True
-                self.found_path = True
-                return StepResult(edge=(q_new, self.goal), done=True, found_path=True)
-        
+        self.states.append(x_new)
+        self.controls.append(u)
+
+        if self._goal_reached(x_new):
+            self.goal_idx = len(self.nodes) - 1
+            self.done = True
+            self.found_path = True
+            return StepResult(edge=(q_near, q_new), done=True, found_path=True)
+
+        if len(self.nodes) >= self.max_vertices:
+            self.done = True
+            return StepResult(edge=(q_near, q_new), done=True, found_path=False)
+
         return StepResult(edge=(q_near, q_new))
-    
-    def extract_path(self) -> List[Tuple[int, int]]:
+
+    def extract_path(self) -> List[Point]:
         if self.goal_idx is None:
             return []
-        path = []
+        path: List[Point] = []
         i = self.goal_idx
         while i != -1:
             path.append(self.nodes[i])
             i = self.parent[i]
         path.reverse()
         return path
-    
+
+    def extract_display_path(self) -> List[Tuple[float, float]]:
+        """Return a smoothed display-only version of the current path."""
+        path = self.extract_path()
+        if len(path) < 3:
+            return [(float(p[0]), float(p[1])) for p in path]
+        spacing = max(2.0, min(4.0, self.delta_t / 4.0))
+        return smooth_display_path(path, self.occ, spacing=spacing, iterations=1)
+
     def get_status(self) -> str:
-        return f"RRT: iter {self.iteration}/{self.max_iters}, nodes {len(self.nodes)}"
-    
+        return (
+            f"RRT: iter {self.iteration}, vertices {len(self.nodes)}/{self.max_vertices}, "
+            f"Delta t {self.delta_t:.1f}, goal radius {self.goal_region_radius:.1f}, "
+            f"goal bias {self.goal_bias:.2f}"
+        )
+
     @staticmethod
     def get_params_widget() -> QWidget:
         return RRTParamsWidget()
-    
+
     @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'RRTPlanner':
+    def create_from_params(
+        occ: np.ndarray,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        params_widget: QWidget
+    ) -> 'RRTPlanner':
         params = params_widget.get_params()
         return RRTPlanner(occ, start, goal, **params)
 
@@ -7079,7 +7134,7 @@ ANYTIME_ALGOS: Set[str] = {'RRT*', 'BIT*'}
 # Algorithm descriptions and paper citations
 ALGORITHM_INFO: Dict[str, Tuple[str, str]] = {
     'RRT': (
-        "Rapidly-exploring Random Tree. Grows a tree by random sampling towards unexplored regions.",
+        "Rapidly-exploring Random Tree implementation after LaValle (1998) for a 2D occupancy-grid setting with configurable goal bias.",
         "LaValle, 1998"
     ),
     'RRT-Connect': (

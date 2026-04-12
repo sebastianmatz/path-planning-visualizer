@@ -4,7 +4,19 @@ This file tracks release notes for published versions of the project.
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Changed
+
+- Reworked `RRT` into a single configurable planner with an OMPL-style `goal_bias` parameter instead of maintaining a separate goal-biased UI variant
+- Updated `RRT` to use the paper's `GENERATE_RRT(x_init, K, Delta t)` structure in a clearer 2D holonomic occupancy-grid adaptation
+- Improved `RRT` path presentation with a smoother display-only rendering of the current/final solution
+- Clarified the `RRT` algorithm description in the UI and README, including the role of configurable goal bias
+
+### Fixed
+
+- Prevented duplicate or null `RRT` vertex insertions caused by continuous-to-grid discretization
+- Fixed `RRT` goal-region handling, including immediate success when `start` already lies inside the goal region
+- Fixed `RRT` vertex-budget termination so the planner now stops cleanly at the configured `K` limit
+- Corrected `RRT` rejection highlighting so failed expansion attempts mark the rejected extension point more accurately
 
 ## [0.1.0b3] - 2026-04-09
 
