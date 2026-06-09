@@ -149,10 +149,10 @@ def steer(from_pt: Point, to_pt: Point, step: float) -> Point:
     """
     d = dist(from_pt, to_pt)
     if d <= step:
-        return (int(to_pt[0]), int(to_pt[1]))
+        return (int(round(to_pt[0])), int(round(to_pt[1])))
     ux = (to_pt[0] - from_pt[0]) / d
     uy = (to_pt[1] - from_pt[1]) / d
-    return (int(from_pt[0] + ux * step), int(from_pt[1] + uy * step))
+    return (int(round(from_pt[0] + ux * step)), int(round(from_pt[1] + uy * step)))
 
 
 def clamp_point(p: Point, w: int, h: int) -> Point:
@@ -169,6 +169,16 @@ def clamp_point(p: Point, w: int, h: int) -> Point:
     x = int(np.clip(p[0], 0, w - 1))
     y = int(np.clip(p[1], 0, h - 1))
     return (x, y)
+
+
+def make_distance_field(occ: OccupancyGrid) -> np.ndarray:
+    """Euclidean distance (in pixels) from every free cell to the nearest obstacle.
+
+    Shared helper for the many planners that need an obstacle-clearance /
+    distance field over the occupancy grid.
+    """
+    free_space = (~occ).astype(np.uint8)
+    return cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
 
 
 def bilinear_sample_scalar(field: np.ndarray, x: float, y: float) -> float:
@@ -1121,23 +1131,32 @@ class RRTConnectPlanner(BasePlanner):
         """
         edges = []
         last_rejected = None
-        
+
         while True:
             i_near = self._nearest(nodes, target)
             q_near = nodes[i_near]
+
+            # Final step: land exactly on the target so the two trees share a
+            # vertex. The residual segment is collision-checked, so the joined
+            # path has no unchecked gap (see RRT-Connect "CONNECT" semantics).
+            if dist(q_near, target) <= self.step_size:
+                if not line_collision_free(q_near, target, self.occ, samples=self.collision_samples):
+                    return ('trapped', edges, target)
+                nodes.append(target)
+                parent.append(i_near)
+                edges.append((q_near, target))
+                return ('reached', edges, None)
+
             q_new = clamp_point(steer(q_near, target, self.step_size), self.w, self.h)
-            
+
             if not self.is_free(q_new):
                 return ('trapped', edges, q_new)
             if not line_collision_free(q_near, q_new, self.occ, samples=self.collision_samples):
                 return ('trapped', edges, q_new)
-            
+
             nodes.append(q_new)
             parent.append(i_near)
             edges.append((q_near, q_new))
-            
-            if dist(q_new, target) < self.step_size:
-                return ('reached', edges, None)
     
     def step_once(self) -> StepResult:
         if self.done:
@@ -1379,8 +1398,7 @@ class BiTRRTPlanner(BasePlanner):
         self.cost_threshold = float(cost_threshold)
         self.rng = np.random.default_rng(seed)
 
-        free_space = (~occ).astype(np.uint8)
-        self.clearance_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        self.clearance_field = make_distance_field(occ)
         # Clearance-derived adaptation of OMPL's generic state cost / mechanical-work setup.
         self.cost_field = 100.0 / (1.0 + self.clearance_field.astype(np.float64))
 
@@ -2527,9 +2545,8 @@ class CHOMPPlanner(BasePlanner):
         
     def _compute_distance_field(self) -> np.ndarray:
         """Compute signed distance field from obstacles."""
-        free_space = (self.occ == 0).astype(np.uint8)
-        dist_from_obstacle = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
-        
+        dist_from_obstacle = make_distance_field(self.occ)
+
         obstacle_space = (self.occ > 0).astype(np.uint8)
         dist_inside = cv2.distanceTransform(obstacle_space, cv2.DIST_L2, 5)
         
@@ -3120,9 +3137,7 @@ class STOMPPlanner(BasePlanner):
     
     def _compute_distance_field(self) -> np.ndarray:
         """Compute distance field from obstacles."""
-        free_space = (self.occ == 0).astype(np.uint8)
-        dist_from_obstacle = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
-        return dist_from_obstacle
+        return make_distance_field(self.occ)
     
     def _compute_smoothing_matrix(self):
         """Pre-compute the smoothing matrix R for trajectory smoothing."""
@@ -3449,7 +3464,7 @@ class PRMPlanner(BasePlanner):
     description = "Two-phase probabilistic roadmap with query-time start/goal connection"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                  num_samples: int = 500, k_neighbors: int = 10, max_edge_dist: int = 100, seed: int = 42):
+                  num_samples: int = 500, k_neighbors: int = 15, max_edge_dist: int = 100, seed: int = 42):
         super().__init__(occ, start, goal)
         
         self.num_samples = int(max(1, num_samples))
@@ -4315,7 +4330,12 @@ class AStarPlanner(BasePlanner):
                 x1, x2 = gx * grid_size, min((gx + 1) * grid_size, self.w)
                 if np.any(self.occ[y1:y2, x1:x2] > 0):
                     self.grid_occ[gy, gx] = True
-        
+
+        # The clicked start/goal pixels are known free, so never let the
+        # conservative supercell occupancy make their cells unreachable.
+        self.grid_occ[self.start_grid[1], self.start_grid[0]] = False
+        self.grid_occ[self.goal_grid[1], self.goal_grid[0]] = False
+
         # A* data structures
         import heapq
         self.open_set: List[Tuple[float, Tuple[int, int]]] = []
@@ -4414,8 +4434,17 @@ class AStarPlanner(BasePlanner):
     def extract_path(self) -> List[Tuple[int, int]]:
         if not self.path_grid:
             return []
-        return [(gx * self.grid_size + self.grid_size // 2,
-                 gy * self.grid_size + self.grid_size // 2) for gx, gy in self.path_grid]
+        centers = [(gx * self.grid_size + self.grid_size // 2,
+                    gy * self.grid_size + self.grid_size // 2) for gx, gy in self.path_grid]
+        # Stitch the actual clicked start/goal pixels onto the cell-center
+        # polyline so the path connects to the markers and metrics use the
+        # real endpoints rather than the quantized cell centers.
+        stitched = [self.start] + centers + [self.goal]
+        deduped: List[Tuple[int, int]] = []
+        for p in stitched:
+            if not deduped or deduped[-1] != p:
+                deduped.append(p)
+        return deduped
     
     def get_status(self) -> str:
         return f"A*: explored {len(self.closed_set)}, open {len(self.open_set)}"
@@ -4496,7 +4525,12 @@ class DijkstraPlanner(BasePlanner):
                 x1, x2 = gx * grid_size, min((gx + 1) * grid_size, self.w)
                 if np.any(self.occ[y1:y2, x1:x2] > 0):
                     self.grid_occ[gy, gx] = True
-        
+
+        # The clicked start/goal pixels are known free, so never let the
+        # conservative supercell occupancy make their cells unreachable.
+        self.grid_occ[self.start_grid[1], self.start_grid[0]] = False
+        self.grid_occ[self.goal_grid[1], self.goal_grid[0]] = False
+
         # Dijkstra data structures
         import heapq
         self.open_set: List[Tuple[float, Tuple[int, int]]] = []
@@ -4581,8 +4615,17 @@ class DijkstraPlanner(BasePlanner):
     def extract_path(self) -> List[Tuple[int, int]]:
         if not self.path_grid:
             return []
-        return [(gx * self.grid_size + self.grid_size // 2,
-                 gy * self.grid_size + self.grid_size // 2) for gx, gy in self.path_grid]
+        centers = [(gx * self.grid_size + self.grid_size // 2,
+                    gy * self.grid_size + self.grid_size // 2) for gx, gy in self.path_grid]
+        # Stitch the actual clicked start/goal pixels onto the cell-center
+        # polyline so the path connects to the markers and metrics use the
+        # real endpoints rather than the quantized cell centers.
+        stitched = [self.start] + centers + [self.goal]
+        deduped: List[Tuple[int, int]] = []
+        for p in stitched:
+            if not deduped or deduped[-1] != p:
+                deduped.append(p)
+        return deduped
     
     def get_status(self) -> str:
         return f"Dijkstra: explored {len(self.closed_set)}, open {len(self.open_set)}"
@@ -4689,8 +4732,7 @@ class APFPlanner(BasePlanner):
         self.path: List[Tuple[int, int]] = [start]
         
         # Compute distance field
-        free_space = (self.occ == 0).astype(np.uint8)
-        self.dist_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        self.dist_field = make_distance_field(self.occ)
         
         # Goal tolerance
         self.goal_tolerance = 10.0
@@ -5693,8 +5735,7 @@ class TrajOptPlanner(BasePlanner):
         self.collision_weight = collision_weight
         
         # Compute signed distance field
-        free_space = (self.occ == 0).astype(np.uint8)
-        self.dist_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        self.dist_field = make_distance_field(self.occ)
         
         # Initialize straight-line trajectory
         self.trajectory = np.zeros((num_points, 2), dtype=np.float64)
@@ -5996,8 +6037,7 @@ class PSOPlanner(BasePlanner):
         self.g_best_cost = float('inf')
         
         # Distance field for obstacle cost - MUST be initialized before _evaluate_path
-        free_space = (self.occ == 0).astype(np.uint8)
-        self.dist_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        self.dist_field = make_distance_field(self.occ)
 
         # Collision/clearance tuning
         self.collision_penalty = 1e7
@@ -6516,8 +6556,7 @@ class GeneticPlanner(BasePlanner):
             self.population[i, -1] = goal_arr
 
         # Distance field must be ready before fitness evaluation.
-        free_space = (self.occ == 0).astype(np.uint8)
-        self.dist_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        self.dist_field = make_distance_field(self.occ)
 
         # Collision/clearance penalties for segment-aware fitness.
         self.collision_penalty = 3000.0
@@ -6940,8 +6979,7 @@ class ITOMPPlanner(BasePlanner):
             self.trajectory[i] = np.array(start) * (1 - t) + np.array(goal) * t
         
         # Distance field
-        free_space = (self.occ == 0).astype(np.uint8)
-        self.dist_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        self.dist_field = make_distance_field(self.occ)
         
         # Current execution index (simulates robot progress)
         self.exec_idx = 0
@@ -7128,8 +7166,7 @@ class GPMPPlanner(BasePlanner):
         self.prior_weight = 1.0 / max(1e-6, self.sigma ** 2)
         
         # Distance field
-        free_space = (self.occ == 0).astype(np.uint8)
-        self.dist_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        self.dist_field = make_distance_field(self.occ)
         self.grad_x = cv2.Sobel(self.dist_field, cv2.CV_64F, 1, 0, ksize=3) / 8.0
         self.grad_y = cv2.Sobel(self.dist_field, cv2.CV_64F, 0, 1, ksize=3) / 8.0
 
@@ -8366,8 +8403,7 @@ class MainWindow(QMainWindow):
         if np.mean(bw == 255) < 0.5:
             bw = 255 - bw
         self.occ = (bw == 0)
-        free_space = (~self.occ).astype(np.uint8)
-        self.clearance_field = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+        self.clearance_field = make_distance_field(self.occ)
         
         rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         h, w, _ = rgb.shape
