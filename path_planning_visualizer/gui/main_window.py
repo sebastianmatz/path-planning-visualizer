@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..types import Point, OccupancyGrid
 from ..geometry import make_distance_field
 from ..mapping import (
@@ -76,7 +77,7 @@ class MainWindow(QMainWindow):
     
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Path Planning Visualizer Beta (0.1.0b7)")
+        self.setWindowTitle(f"Path Planning Visualizer {__version__}")
         
         self._setup_canvas()
         self._setup_algorithm_controls()

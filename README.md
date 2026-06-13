@@ -1,182 +1,184 @@
 # Path Planning Visualizer
 
 [![CI](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml/badge.svg)](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+![Status](https://img.shields.io/badge/status-beta%20(0.1.0b8)-orange)
 
-Path Planning Visualizer is a desktop application for exploring, comparing, and tuning path-planning algorithms for a 2D point robot on occupancy-grid maps.
+An interactive desktop application for **exploring, comparing, and tuning path-planning algorithms** for a 2D point robot on occupancy-grid maps. It bundles 19 planners — sampling-based, graph-search, potential-field, trajectory-optimization, and metaheuristic — behind one UI, with step-through visualization, live path metrics, an interactive map editor, and a reproducible headless benchmark.
 
-Current release status: `0.1.0b7` (`Beta`)
-
-## What's New in `0.1.0b7`
-
-- Interactive map editor: draw obstacles (left-drag) and erase (right-drag) with an adjustable brush, start a blank map with **New Map**, and **Save Map** to a PNG
-- Planner construction now runs off the UI thread, so heavy setup (PRM/FMT*/BIT* on large maps) shows a "Preparing…" state instead of freezing the window
-- New `path_planning_visualizer.mapping` helpers (load/save/brush) with tests
-
-## What's New in `0.1.0b6`
-
-- Added continuous integration (GitHub Actions): `ruff` + the full `pytest` suite + a benchmark smoke run on every push and pull request
-- `RRT*` cost propagation is now O(affected subtree) via a children adjacency, and the returned path cost is now monotone non-increasing (a stale-incumbent goal reconnection could previously make it rise)
-- Enforced the full Pyflakes rule set (`F841` unused-locals no longer ignored)
-
-## What's New in `0.1.0b5`
-
-- `RRT*` now uses the shrinking RGG radius `min(gamma*(log n/n)^(1/2), step)` by default, making it asymptotically optimal (Karaman & Frazzoli 2011); set the search radius to `0` for this auto mode or a positive value for the legacy fixed radius
-- `BIT*` now connects within the full RGG radius by default (asymptotically optimal, Gammell et al. 2015); the previous step-size connection cap is now an optional visualization toggle
-- `STOMP`, `TrajOpt`, `ITOMP`, and `GPMP` were reworked to implement the defining mechanism of their source papers (per-timestep STOMP updates, TrajOpt sequential convex optimization, incremental covariant ITOMP, and GPMP2-style GP + Gauss-Newton) for a 2D point robot
-- Added a reproducible benchmark CLI: `python -m path_planning_visualizer.benchmark`
-- Added optimality/anytime-improvement evidence tests and a shared RGG-radius helper used by `FMT*`, `BIT*`, and `RRT*`
-
-## Preview
-
-The demo below shows the typical workflow: loading a map, placing start and goal points, adjusting planner settings, and running the visualization.
+It is built as a **teaching and visualization environment**: each planner follows the defining mechanism of its source paper, adapted to a 2D occupancy grid, with the adaptations stated explicitly (see [Scientific scope](#scientific-scope)).
 
 ![Path Planning Visualizer demo showing map setup and planner execution](assets/demo.gif)
 
-## Features
+## Contents
 
-- Interactive map loading with click-to-set start and goal points
-- Side-by-side parameter configuration for multiple planner families
-- Step mode and continuous playback for algorithm visualization
-- Geometric path metrics including path length, minimum clearance, mean clearance, and smoothness
-- Compute-time tracking for time-to-first-path and total run time
-- Reproducible seeds for stochastic planners
-- Built-in example maps for quick testing
+- [Quick start](#quick-start)
+- [Using the app](#using-the-app)
+- [Algorithms](#algorithms)
+- [Scientific scope](#scientific-scope)
+- [Benchmarking](#benchmarking)
+- [Status panel reference](#status-panel-reference)
+- [Development](#development)
+- [Project layout](#project-layout)
+- [Versioning](#versioning)
+- [License](#license)
 
-## Included Algorithms
+## Quick start
 
-- Sampling-Based: `RRT`, `RRT-Connect`, `BiTRRT`, `KPIECE`, `RRT*`, `PRM`, `SBL`, `FMT*`, `BIT*`
-- Graph Search: `A*`, `Dijkstra`
-- Potential Field: `APF`
-- Trajectory Optimization: `CHOMP`, `STOMP`, `TrajOpt`, `ITOMP`, `GPMP`
-- Metaheuristic: `PSO`, `Genetic`
+Requirements: **Python 3.11+** and a desktop environment capable of running PyQt6.
 
-## Scientific Scope
+```bash
+# 1. create and activate a virtual environment
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # macOS / Linux
 
-- The tool is best understood as a teaching and visualization environment, not as a benchmark suite.
-- Core baseline planners are implemented in a comparatively direct way for 2D occupancy-grid pathfinding.
-- `A*` and `Dijkstra` should be interpreted as optimal on the induced search grid, not on the continuous image plane.
-- `RRT` follows the paper's `GENERATE_RRT(x_init, K, Delta t)` structure in a 2D holonomic specialization: uniform bounded workspace sampling, Euclidean nearest-neighbor search, explicit `SELECT_INPUT/NEW_STATE` semantics via `x_dot = u`, a fixed vertex budget `K`, and an optional OMPL-style `goal_bias` parameter for goal-directed sampling.
-- `CHOMP` is implemented as a 2D point-robot specialization with a signed distance field, covariant preconditioned updates, and the functional obstacle-gradient structure from the original method, rather than a full articulated-robot configuration-space system.
-- `BiTRRT` follows the OMPL planner structure closely, but in this application its optimization objective is adapted to a 2D occupancy grid through a clearance-derived cost field rather than an arbitrary user-supplied cost objective.
-- `PRM` now follows a clearer two-phase structure with query-independent roadmap construction followed by query-time start/goal attachment.
-- `SBL` is implemented as a 2D adaptation with lazy segment validation and lightweight path optimization, not as a full general-configuration-space reproduction of the original system.
-- `KPIECE` is implemented here as a single-level geometric adaptation with projection-grid cell selection, state sampling along motions, and progress-based cell penalties, rather than the full multilevel kinodynamic formulation from the original paper.
-- `RRT*` uses the shrinking RGG radius `min(gamma*(log n/n)^(1/2), step)` by default, which makes it asymptotically optimal in the sense of Karaman & Frazzoli (2011); a fixed search radius remains selectable for comparison.
-- `FMT*` is implemented as a cleaner 2D geometric adaptation with uniform free-space samples, open-wavefront parent selection, one-shot lazy collision checking, and the paper's shrinking connection radius.
-- `BIT*` connects within the full RGG radius by default (asymptotically optimal, Gammell et al. 2015) with ordered vertex/edge queues, rewiring, informed batches, and incumbent-based pruning; an optional step-size cap is available purely for tidier visualization.
-- The trajectory optimizers implement the defining mechanism of their source papers for a 2D point robot: `CHOMP` (covariant gradient on a signed distance field), `STOMP` (smooth noisy rollouts with per-timestep probability-weighted updates and the M projection), `TrajOpt` (sequential convex optimization with l1 collision penalties and trust regions), `ITOMP` (incremental covariant optimization over a receding execution horizon; static-map adaptation), and `GPMP` (GPMP2-style LTI GP prior with GP-interpolated obstacle factors and Gauss-Newton inference). They are local optimizers and can fail on problems that require a large topological change from the straight-line initialization.
-- The environment model is a binary occupancy map with a point robot, so results do not directly transfer to higher-dimensional robot dynamics or configuration spaces.
-- For a reproducible cross-planner comparison (success rate, path length, clearance, time, collision checks) run `python -m path_planning_visualizer.benchmark`.
+# 2. install (editable install also registers the console command)
+pip install -e .
 
-## Requirements
-
-- Python 3.11+
-- A desktop environment capable of running PyQt6 applications
-
-## Setup
-
-1. Create and activate a virtual environment:
-
-   ```
-   python -m venv .venv
-   # Windows
-   .venv\Scripts\activate
-   # macOS / Linux
-   source .venv/bin/activate
-   ```
-
-2. Install the dependencies, either directly:
-
-   ```
-   pip install -r requirements.txt
-   ```
-
-   or as an editable install (this also registers the `path-planning-visualizer` console command):
-
-   ```
-   pip install -e .
-   ```
-
-## Run
-
-Start the application with:
-
-```
+# 3. run
 python -m path_planning_visualizer
 ```
 
-If you installed it with `pip install -e .`, you can instead run the console command:
+After `pip install -e .` you can also launch it with the console command:
 
-```
+```bash
 path-planning-visualizer
 ```
 
-> Note: the project is now a package, so the old `python path_planning_visualizer.py` command is
-> replaced by `python -m path_planning_visualizer`.
+> The project is a package, so the old `python path_planning_visualizer.py` entry point has been
+> replaced by `python -m path_planning_visualizer`. To install runtime dependencies without the
+> package, use `pip install -r requirements.txt`.
 
-## Development
+## Using the app
 
-Install the dev extras and run the test suite:
+1. A bundled example maze loads automatically on startup.
+2. Click a free (white) pixel to place the **start**, then another to place the **goal**.
+3. Pick an algorithm from the grouped dropdown and adjust its parameters in the left panel.
+4. **Step** advances the planner incrementally; **Run** plays it continuously; **Reset** clears the run.
+5. The **Status** panel shows live path metrics, compute times, and the planner's status string.
+6. For sampling-based planners, pause once a path is found and click **CHOMP Optimize** to smooth it.
 
-```
-pip install -e .[dev]
-pytest
-```
+**Editing maps.** Toggle **Edit Map** and left-drag to draw obstacles or right-drag to erase (the
+**Brush** spin sets the radius). **New Map** starts from a blank grid; **Save Map** writes the current
+grid to a PNG you can reload later. On large maps the planner is built on a background thread, so the
+window stays responsive and shows a brief *Preparing…* state before it starts.
 
-Run the cross-planner benchmark (headless, no GUI):
+## Algorithms
 
-```
+19 planners across five families. Each row links the planner to the source paper it is modeled on
+(the same citation shown in the app's info panel).
+
+| Family | Algorithm | Reference |
+| --- | --- | --- |
+| Sampling-based | `RRT` | LaValle, 1998 |
+| Sampling-based | `RRT-Connect` | Kuffner & LaValle, 2000 |
+| Sampling-based | `BiTRRT` | Devaurs et al., 2013 / OMPL |
+| Sampling-based | `KPIECE` | Şucan & Kavraki, 2008 |
+| Sampling-based | `RRT*` | Karaman & Frazzoli, 2011 |
+| Sampling-based | `PRM` | Kavraki et al., 1996 |
+| Sampling-based | `SBL` | Sánchez & Latombe, 2001 |
+| Sampling-based | `FMT*` | Janson et al., 2015 |
+| Sampling-based | `BIT*` | Gammell et al., 2015 |
+| Graph search | `A*` | Hart et al., 1968 |
+| Graph search | `Dijkstra` | Dijkstra, 1959 |
+| Potential field | `APF` | Khatib, 1986 |
+| Trajectory optimization | `CHOMP` | Ratliff et al., 2009 |
+| Trajectory optimization | `STOMP` | Kalakrishnan et al., 2011 |
+| Trajectory optimization | `TrajOpt` | Schulman et al., 2014 |
+| Trajectory optimization | `ITOMP` | Park et al., 2012 |
+| Trajectory optimization | `GPMP` | Mukadam et al., 2016 |
+| Metaheuristic | `PSO` | Kennedy & Eberhart, 1995 |
+| Metaheuristic | `Genetic` | Holland, 1975 |
+
+## Scientific scope
+
+This is a teaching and visualization tool, **not a benchmark suite**. The environment is a binary
+occupancy map with a holonomic 2D point robot, so results do not directly transfer to higher
+dimensional robot dynamics or configuration spaces. Graph-search planners are optimal only on the
+induced search grid, and the trajectory optimizers are *local* methods that can fail when a problem
+requires a large topological change away from the straight-line initialization.
+
+Within that scope, each planner implements the defining mechanism of its paper. The adaptations are:
+
+| Planner | Adaptation / fidelity note |
+| --- | --- |
+| `RRT` | Follows the paper's `GENERATE_RRT(x_init, K, Δt)` structure as a 2D holonomic specialization: uniform sampling, Euclidean nearest-neighbor, explicit `SELECT_INPUT`/`NEW_STATE` (`ẋ = u`), a fixed vertex budget `K`, and an optional OMPL-style `goal_bias`. |
+| `RRT*` | Shrinking RGG radius `min(γ·(log n / n)^(1/2), step)` by default → asymptotically optimal (Karaman & Frazzoli, 2011); a fixed search radius is selectable for comparison. |
+| `BIT*` | Connects within the full RGG radius by default → asymptotically optimal (Gammell et al., 2015), with ordered vertex/edge queues, rewiring, informed batches, and incumbent pruning; an optional step-size cap is purely for tidier visuals. |
+| `FMT*` | 2D geometric adaptation: uniform free-space samples, open-wavefront parent selection, one-shot lazy collision checking, and the paper's shrinking connection radius. |
+| `PRM` | Two-phase: query-independent roadmap construction followed by query-time start/goal attachment. |
+| `SBL` | 2D adaptation with an L∞ neighborhood, lazy segment validation, and a lightweight random path optimizer (not a full configuration-space reproduction). |
+| `KPIECE` | Single-level *geometric* adaptation with projection-grid cell selection and progress-based penalties (not the full multilevel kinodynamic formulation). |
+| `BiTRRT` | Follows the OMPL planner structure, but its optimization objective is a clearance-derived cost field rather than an arbitrary user-supplied cost. |
+| `A*` / `Dijkstra` | Optimal with respect to the induced occupancy grid, not the continuous image plane. |
+| `CHOMP` | 2D point-robot specialization: signed distance field, covariant preconditioned updates, and functional obstacle gradients (not a full articulated configuration-space system). |
+| `STOMP`, `TrajOpt`, `ITOMP`, `GPMP` | Each implements its paper's defining mechanism for a 2D point robot — per-timestep probability-weighted STOMP updates with the M projection; TrajOpt sequential convex optimization with ℓ1 collision penalties and a trust region; incremental covariant ITOMP over a receding horizon (static-map adaptation); and GPMP2-style LTI GP prior with GP-interpolated obstacle factors and Gauss-Newton inference. |
+
+## Benchmarking
+
+For a reproducible, headless cross-planner comparison (success rate, path length, clearance, compute
+time, collision checks) across maps and seeds:
+
+```bash
 python -m path_planning_visualizer.benchmark
 python -m path_planning_visualizer.benchmark --planners "A*,RRT*,BIT*" --maps all --seeds 5 --csv results.csv
 ```
 
-## Basic Usage
+## Status panel reference
 
-1. Start the application. A bundled example maze is loaded automatically if available.
-2. Click a free white pixel to place the `start`, then click another free white pixel to place the `goal`.
-3. Choose an algorithm from the dropdown and adjust its parameters in the left panel.
-4. Use `Step` to advance the planner incrementally or `Run` to let it continue automatically.
-5. Watch the `Status` panel for path metrics, compute times, and the planner's current status string.
-6. For sampling-based planners, you can pause after a valid path is found and trigger `CHOMP Optimize` to smooth the result.
-7. Use `Reset` to clear the current run, or change the algorithm/seed to compare different planners on the same map.
+| Field | Meaning |
+| --- | --- |
+| Path length | Geometric length of the final path, in pixels |
+| Min clearance | Smallest obstacle distance anywhere along the path, in pixels |
+| Mean clearance | Average obstacle distance along the full path, in pixels |
+| Smoothness | Average squared turning angle on a resampled path (lower is smoother) |
+| Compute time to first path | Planner compute time until the first valid solution |
+| Total compute time | Total accumulated planner compute time for the current run |
 
-To author your own map, toggle `Edit Map` and left-drag to draw obstacles or right-drag to erase (the `Brush` spin sets the radius). `New Map` starts from a blank grid and `Save Map` writes the current map to a PNG you can reload later. On large maps the planner is built in the background, so the window stays responsive and shows a brief `Preparing…` state before it starts.
+## Development
 
-## Reading the Status Panel
+Install the dev extras and run the suite (headless — Qt uses the offscreen platform):
 
-- `Path length`: geometric length of the final path in pixels
-- `Min clearance`: smallest obstacle distance anywhere along the path in pixels
-- `Mean clearance`: average obstacle distance along the full path in pixels
-- `Smoothness`: average squared turning angle on a resampled path; lower is smoother
-- `Compute time to first path`: planner compute time until the first valid solution is found
-- `Total compute time`: total accumulated planner compute time for the current run
+```bash
+pip install -e ".[dev]"
+pytest
+ruff check path_planning_visualizer tests
+```
 
-## Project Layout
+Continuous integration ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `ruff`, the full
+`pytest` suite, and a benchmark smoke check on **Ubuntu, Windows, and macOS** across Python 3.11 and
+3.12 for every push and pull request, and verifies that the built wheel ships its bundled maps.
 
-- `path_planning_visualizer/`: application package
-  - `app.py`, `__main__.py`: entry point (`python -m path_planning_visualizer`)
-  - `geometry.py`, `metrics.py`: shared geometry, collision, and path-metric helpers
-  - `planners/`: one module per planner, plus the planner `registry` and shared helpers (`_spatial`, `_rgg`, `_trajectory`)
-  - `benchmark.py`: headless cross-planner benchmark CLI
-  - `gui/`: the `ImageCanvas` and the `MainWindow`
-  - `mapping.py`: occupancy-grid load/save/brush helpers used by the map editor
-  - `assets/maze.png`, `assets/maze 2.png`, `assets/maze 3.png`: bundled example maps
-- `tests/`: pytest suite
-- `assets/demo.gif`: short application walkthrough for the README
-- `pyproject.toml`: package metadata and installable script entry
-- `LICENSE`: MIT license
+## Project layout
 
-## Notes
+```
+path_planning_visualizer/      application package
+├── __main__.py, app.py        entry point (python -m path_planning_visualizer)
+├── types.py, geometry.py      shared types, geometry, and collision helpers
+├── metrics.py                 path-quality metrics (length, clearance, smoothness)
+├── mapping.py                 occupancy-grid load / save / brush helpers
+├── resources.py               bundled-asset path resolution
+├── benchmark.py               headless cross-planner benchmark CLI
+├── planners/                  one module per planner, plus:
+│   ├── registry.py            planner registry, groups, and in-app citations
+│   └── _spatial, _rgg, _trajectory   shared helpers (spatial index, RGG radius, optimizer math)
+├── gui/                       ImageCanvas, MainWindow, off-thread PlannerBuilder
+└── assets/                    bundled example maps (maze.png, maze 2.png, maze 3.png)
 
-- The application uses `opencv-python-headless` for image processing and `PyQt6` for the UI.
-- Example maps are interpreted as binary occupancy grids after grayscale thresholding.
+tests/                         pytest suite (planner behavior, optimality, GUI integration)
+assets/demo.gif                short walkthrough used in this README
+pyproject.toml                 package metadata and installable script entry
+CHANGELOG.md                   release history
+LICENSE                        MIT
+```
 
 ## Versioning
 
-- The project uses semantic versioning with Python-compatible pre-release tags.
-- Beta releases follow the pattern `0.1.0b1`, `0.1.0b2`, `0.1.0b3`, `0.1.0b4`, `0.1.0b5`, `0.1.0b6`, `0.1.0b7`, and so on.
-- The first stable release would be `0.1.0`.
-- Bugfix releases after that would continue as `0.1.1`, `0.1.2`, etc.
+Semantic versioning with Python-compatible pre-release tags: betas follow `0.1.0b1`, `0.1.0b2`, …
+`0.1.0b8`; the first stable release will be `0.1.0`, with bugfix releases continuing as `0.1.1`,
+`0.1.2`, and so on. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## License
 

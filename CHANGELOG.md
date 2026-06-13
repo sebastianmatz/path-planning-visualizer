@@ -4,6 +4,36 @@ This file tracks release notes for published versions of the project.
 
 ## [Unreleased]
 
+## [0.1.0b8] - 2026-06-14
+
+Release-readiness hardening: a single source of truth for the version, a
+top-level error handler, behavior-preserving planner speedups, and GUI
+integration tests.
+
+### Added
+
+- Top-level GUI exception handler (`app.install_excepthook`): uncaught
+  exceptions are printed to stderr and shown in an error dialog (with the full
+  traceback under "Show Details") instead of silently aborting the window;
+  `tests/test_app.py` covers it
+- Headless GUI integration tests (`tests/test_gui_integration.py`): drive the
+  real `MainWindow` end to end (off-thread build -> stepping -> collision-free
+  path), the map editor (paint / endpoint invalidation), and the save/load
+  round-trip
+
+### Changed
+
+- The version is now defined only in `pyproject.toml`. `__version__` is read
+  from the installed package metadata (`importlib.metadata`) and the window
+  title is derived from it, so the number is no longer hand-copied across the
+  package docstring, `__init__`, and the GUI title
+- `BIT*` keeps its visualization tree-edge list in sync incrementally and caches
+  it, instead of rebuilding the whole edge list from parent pointers on every
+  step (identical edges, far less per-step work)
+- `PRM` builds its sample pool from the `np.where` coordinate arrays directly
+  rather than materializing a Python tuple for every free pixel; the drawn
+  samples are byte-for-byte identical for a given seed
+
 ## [0.1.0b7] - 2026-06-13
 
 Map-authoring and responsiveness release.

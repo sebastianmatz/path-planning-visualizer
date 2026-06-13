@@ -103,19 +103,30 @@ class PRMPlanner(BasePlanner):
         self.current_path: List[int] = []
 
     def _build_sample_pool(self) -> List[Point]:
-        """Pre-sample unique free roadmap nodes, excluding query configurations."""
+        """Pre-sample unique free roadmap nodes, excluding query configurations.
+
+        Operates on the ``np.where`` coordinate arrays directly instead of
+        materializing a Python tuple per free pixel, while drawing the exact same
+        samples for a given seed (the row-major free-pixel order is preserved).
+        """
         free_y, free_x = np.where(~self.occ)
-        free_points = [
-            (int(x), int(y))
-            for x, y in zip(free_x.tolist(), free_y.tolist())
-            if (int(x), int(y)) not in {self.start, self.goal}
-        ]
-        if not free_points:
+        xs = free_x.astype(np.int64, copy=False)
+        ys = free_y.astype(np.int64, copy=False)
+
+        # Exclude the start/goal configurations from the roadmap pool.
+        keep = np.ones(xs.shape[0], dtype=bool)
+        for px, py in (self.start, self.goal):
+            keep &= ~((xs == px) & (ys == py))
+        xs = xs[keep]
+        ys = ys[keep]
+
+        n_free = xs.shape[0]
+        if n_free == 0:
             return []
 
-        sample_count = min(self.num_samples, len(free_points))
-        chosen = self.rng.choice(len(free_points), size=sample_count, replace=False)
-        return [free_points[int(i)] for i in chosen]
+        sample_count = min(self.num_samples, n_free)
+        chosen = self.rng.choice(n_free, size=sample_count, replace=False)
+        return [(int(xs[i]), int(ys[i])) for i in chosen]
 
     def _add_node(self, point: Point) -> int:
         node_idx = len(self.nodes)

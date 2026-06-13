@@ -1,6 +1,6 @@
 """
-Path Planning Visualizer Beta (0.1.0b7)
-=======================================
+Path Planning Visualizer
+========================
 
 Interactive desktop application for exploring and comparing path-planning
 algorithms on occupancy-grid maps.
@@ -18,7 +18,15 @@ Usage:
 
 from __future__ import annotations
 
-__version__ = "0.1.0b7"
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+# The version lives in exactly one place: the ``version`` field of
+# ``pyproject.toml``. Installing the package (``pip install -e .``) records it as
+# package metadata, which we read back here so nothing else has to hardcode it.
+try:
+    __version__ = _pkg_version("path-planning-visualizer")
+except PackageNotFoundError:  # running from a raw source tree without an install
+    __version__ = "0.0.0+dev"
 
 from .types import Point, FloatPoint, Edge, OccupancyGrid
 from .geometry import (

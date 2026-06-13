@@ -118,6 +118,11 @@ class BITStarPlanner(BasePlanner):
         self.children: Dict[int, Set[int]] = {0: set()}
         self.g_cost: Dict[int, float] = {0: 0.0}
 
+        # Visualization edges kept in sync incrementally (child_idx -> edge), so
+        # the GUI no longer rebuilds the whole tree from parent pointers per step.
+        self._edge_by_child: Dict[int, Edge] = {}
+        self._tree_edges_cache: Optional[List[Edge]] = None
+
         # Unconnected samples, including a single goal sample.
         self.X_samples: List[Optional[np.ndarray]] = [self.goal_state.copy()]
         self.sample_point_keys: Set[Point] = {self.goal}
@@ -295,6 +300,15 @@ class BITStarPlanner(BasePlanner):
         if parent_idx is not None:
             self.children.setdefault(parent_idx, set()).add(child_idx)
         self.children.setdefault(child_idx, set())
+        # Mirror the topology change into the visualization-edge map.
+        if parent_idx is None:
+            self._edge_by_child.pop(child_idx, None)
+        else:
+            self._edge_by_child[child_idx] = (
+                self._point_key(self.V[parent_idx]),
+                self._point_key(self.V[child_idx]),
+            )
+        self._tree_edges_cache = None
 
     def _propagate_cost_delta(self, root_idx: int, delta: float) -> None:
         stack = [root_idx]
@@ -568,16 +582,11 @@ class BITStarPlanner(BasePlanner):
         return smooth_display_path(path, self.occ, spacing=spacing, iterations=1)
 
     def extract_tree_edges(self) -> List[Edge]:
-        edges: List[Edge] = []
-        for child_idx, parent_idx in self.parent.items():
-            if parent_idx is None:
-                continue
-            if child_idx >= len(self.V) or parent_idx >= len(self.V):
-                continue
-            parent_pt = self._point_key(self.V[parent_idx])
-            child_pt = self._point_key(self.V[child_idx])
-            edges.append((parent_pt, child_pt))
-        return edges
+        # Served from the incrementally maintained edge map; only rebuilt when the
+        # tree changed since the last call (the cache is invalidated in _set_parent).
+        if self._tree_edges_cache is None:
+            self._tree_edges_cache = list(self._edge_by_child.values())
+        return self._tree_edges_cache
     
     def get_status(self) -> str:
         cost_str = f"{self.best_cost:.1f}" if self.best_cost < float('inf') else "inf"
