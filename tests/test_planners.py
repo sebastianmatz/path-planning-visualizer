@@ -43,27 +43,29 @@ def occ() -> np.ndarray:
     return wall_map()
 
 
-# Per-planner parameters tuned to keep the suite fast but reliable.
+# Per-planner parameters tuned to keep the suite fast but reliable. Budgets are
+# deliberately small: the 60x60 map solves in well under these limits, and the
+# experimental optimizers only need a short run (they may legitimately skip).
 TUNED = {
-    "RRT": dict(delta_t=12.0, goal_region_radius=14.0, goal_bias=0.1, max_vertices=8000, seed=1),
-    "RRT-Connect": dict(step_size=10, max_iters=8000, seed=1),
-    "BiTRRT": dict(range=12.0, max_iters=8000, seed=1),
-    "KPIECE": dict(range=12.0, goal_tolerance=14, cell_size=8, max_iters=8000, seed=1),
-    "RRT*": dict(step_size=10, goal_tolerance=14, search_radius=24, max_iters=6000, seed=1),
-    "PRM": dict(num_samples=500, k_neighbors=15, max_edge_dist=40, seed=1),
-    "SBL": dict(max_iters=10000, rho=20, grid_cells=8, seed=1),
-    "FMT*": dict(num_samples=600, seed=1),
-    "BIT*": dict(batch_size=200, max_iters=12000, step_size=18.0, seed=1),
+    "RRT": dict(delta_t=12.0, goal_region_radius=14.0, goal_bias=0.1, max_vertices=4000, seed=1),
+    "RRT-Connect": dict(step_size=10, max_iters=4000, seed=1),
+    "BiTRRT": dict(range=12.0, max_iters=4000, seed=1),
+    "KPIECE": dict(range=12.0, goal_tolerance=14, cell_size=8, max_iters=4000, seed=1),
+    "RRT*": dict(step_size=10, goal_tolerance=14, search_radius=24, max_iters=2500, seed=1),
+    "PRM": dict(num_samples=400, k_neighbors=15, max_edge_dist=40, seed=1),
+    "SBL": dict(max_iters=5000, rho=20, grid_cells=8, seed=1),
+    "FMT*": dict(num_samples=500, seed=1),
+    "BIT*": dict(batch_size=200, max_iters=5000, step_size=18.0, seed=1),
     "A*": dict(grid_size=5, allow_diagonal=True),
     "Dijkstra": dict(grid_size=5, allow_diagonal=True),
-    "APF": dict(max_iters=4000, seed=1),
-    "CHOMP": dict(num_points=40, max_iters=600),
-    "STOMP": dict(num_points=40, max_iters=400, seed=1),
-    "TrajOpt": dict(num_points=40, max_iters=400),
-    "ITOMP": dict(num_points=30, max_iters=800, seed=1),
-    "GPMP": dict(num_points=25, max_iters=600),
-    "PSO": dict(num_particles=30, num_points=20, max_iters=300, seed=1),
-    "Genetic": dict(pop_size=40, num_points=20, max_iters=300, seed=1),
+    "APF": dict(max_iters=2000, seed=1),
+    "CHOMP": dict(num_points=40, max_iters=400),
+    "STOMP": dict(num_points=40, max_iters=250, seed=1),
+    "TrajOpt": dict(num_points=40, max_iters=250),
+    "ITOMP": dict(num_points=30, max_iters=400, seed=1),
+    "GPMP": dict(num_points=25, max_iters=400),
+    "PSO": dict(num_particles=30, num_points=20, max_iters=150, seed=1),
+    "Genetic": dict(pop_size=40, num_points=20, max_iters=150, seed=1),
 }
 
 # Planners that should always find a path on the simple wall map.
@@ -173,3 +175,13 @@ def test_rrt_connect_join_is_collision_free(occ, seed):
     path = planner.extract_path()
     assert segments_collision_free(path, occ)
     assert path[0] == START and path[-1] == GOAL
+
+
+@pytest.mark.parametrize("name", ["RRT", "RRT-Connect", "BiTRRT", "RRT*"])
+def test_seeded_runs_are_deterministic(name, occ):
+    """Same seed must produce the same path (guards reproducibility and the
+    spatial-index nearest-neighbor, which is exact-equivalent to the old scan)."""
+    p1 = run(build(name, occ))
+    p2 = run(build(name, occ))
+    assert p1.found_path == p2.found_path
+    assert p1.extract_path() == p2.extract_path()

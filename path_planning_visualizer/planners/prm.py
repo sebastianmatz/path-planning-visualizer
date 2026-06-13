@@ -1,0 +1,299 @@
+from __future__ import annotations
+
+import heapq
+from typing import Dict, List, Optional, Set, Tuple
+
+import numpy as np
+
+from PyQt6.QtWidgets import (
+    QFormLayout,
+    QSpinBox,
+    QWidget,
+)
+
+from ..types import Point, Edge
+from ..geometry import (
+    dist,
+    line_collision_free,
+)
+from .base import BasePlanner, StepResult
+
+
+class PRMParamsWidget(QWidget):
+    """Parameters widget for PRM planner."""
+    
+    def __init__(self):
+        super().__init__()
+        layout = QFormLayout()
+        
+        self.spin_num_samples = QSpinBox()
+        self.spin_num_samples.setRange(50, 10000)
+        self.spin_num_samples.setValue(500)
+        self.spin_num_samples.setToolTip("Number of random samples to generate")
+        
+        self.spin_k_neighbors = QSpinBox()
+        self.spin_k_neighbors.setRange(3, 50)
+        self.spin_k_neighbors.setValue(15)
+        self.spin_k_neighbors.setToolTip("Number of nearest neighbors to connect")
+        
+        self.spin_max_edge_dist = QSpinBox()
+        self.spin_max_edge_dist.setRange(10, 500)
+        self.spin_max_edge_dist.setValue(100)
+        self.spin_max_edge_dist.setToolTip("Maximum edge length")
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 10_000_000)
+        self.spin_seed.setValue(42)
+        self.spin_seed.setToolTip("Random seed for reproducibility")
+        
+        layout.addRow("Num samples:", self.spin_num_samples)
+        layout.addRow("K neighbors:", self.spin_k_neighbors)
+        layout.addRow("Max edge dist:", self.spin_max_edge_dist)
+        layout.addRow("Seed:", self.spin_seed)
+        
+        self.setLayout(layout)
+    
+    def get_params(self) -> dict:
+        return {
+            'num_samples': self.spin_num_samples.value(),
+            'k_neighbors': self.spin_k_neighbors.value(),
+            'max_edge_dist': self.spin_max_edge_dist.value(),
+            'seed': self.spin_seed.value(),
+        }
+
+
+class PRMPlanner(BasePlanner):
+    """PRM - Probabilistic Roadmap planner.
+    
+    Two phases:
+    1. Learning phase: Build a roadmap of collision-free random samples
+    2. Query phase: Connect start/goal to the roadmap and search the graph
+    """
+    
+    name = "PRM"
+    description = "Two-phase probabilistic roadmap with query-time start/goal connection"
+    
+    def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
+                  num_samples: int = 500, k_neighbors: int = 15, max_edge_dist: int = 100, seed: int = 42):
+        super().__init__(occ, start, goal)
+        
+        self.num_samples = int(max(1, num_samples))
+        self.k_neighbors = int(max(1, k_neighbors))
+        self.max_edge_dist = float(max(1.0, max_edge_dist))
+        self.rng = np.random.default_rng(seed)
+
+        # Roadmap is learned independently of the query.
+        self.nodes: List[Point] = []
+        self.edges: Dict[int, List[Tuple[int, float]]] = {}
+        self.roadmap_size = 0
+        self.sample_pool: List[Point] = self._build_sample_pool()
+
+        # Query nodes are added only after roadmap learning.
+        self.start_idx: Optional[int] = None
+        self.goal_idx: Optional[int] = None
+
+        # Phase tracking
+        self.phase = "sampling"  # sampling -> connecting -> query_start -> query_goal -> searching -> done
+        self.sample_idx = 0
+        self.connect_idx = 0
+        self.search_open: List[Tuple[float, float, int]] = []  # (f_cost, g_cost, node)
+        self.search_closed: Set[int] = set()
+        self.search_parent: Dict[int, int] = {}
+        self.search_g: Dict[int, float] = {}
+        self.current_path: List[int] = []
+
+    def _build_sample_pool(self) -> List[Point]:
+        """Pre-sample unique free roadmap nodes, excluding query configurations."""
+        free_y, free_x = np.where(~self.occ)
+        free_points = [
+            (int(x), int(y))
+            for x, y in zip(free_x.tolist(), free_y.tolist())
+            if (int(x), int(y)) not in {self.start, self.goal}
+        ]
+        if not free_points:
+            return []
+
+        sample_count = min(self.num_samples, len(free_points))
+        chosen = self.rng.choice(len(free_points), size=sample_count, replace=False)
+        return [free_points[int(i)] for i in chosen]
+
+    def _add_node(self, point: Point) -> int:
+        node_idx = len(self.nodes)
+        self.nodes.append(point)
+        self.edges[node_idx] = []
+        return node_idx
+
+    def _edge_exists(self, a: int, b: int) -> bool:
+        return any(neighbor == b for neighbor, _ in self.edges[a])
+
+    def _candidate_neighbors(self, point: Point, candidate_indices: List[int]) -> List[Tuple[float, int]]:
+        distances: List[Tuple[float, int]] = []
+        for idx in candidate_indices:
+            other = self.nodes[idx]
+            d = dist(point, other)
+            if d <= self.max_edge_dist:
+                distances.append((d, idx))
+        distances.sort(key=lambda item: item[0])
+        return distances[:self.k_neighbors]
+
+    def _connect_node(self, node_idx: int, candidate_indices: List[int]) -> List[Edge]:
+        node = self.nodes[node_idx]
+        added_edges: List[Edge] = []
+        for edge_dist, neighbor_idx in self._candidate_neighbors(node, candidate_indices):
+            if neighbor_idx == node_idx or self._edge_exists(node_idx, neighbor_idx):
+                continue
+            if not line_collision_free(node, self.nodes[neighbor_idx], self.occ):
+                continue
+            self.edges[node_idx].append((neighbor_idx, edge_dist))
+            self.edges[neighbor_idx].append((node_idx, edge_dist))
+            added_edges.append((node, self.nodes[neighbor_idx]))
+        return added_edges
+    
+    def step_once(self) -> StepResult:
+        if self.done:
+            return StepResult(done=True, found_path=self.found_path)
+        
+        # If already found path, just return done
+        if self.found_path:
+            self.done = True
+            return StepResult(done=True, found_path=True)
+        
+        self.iteration += 1
+        
+        if self.phase == "sampling":
+            return self._sampling_step()
+        elif self.phase == "connecting":
+            return self._connecting_step()
+        elif self.phase == "query_start":
+            return self._query_connect_step(self.start)
+        elif self.phase == "query_goal":
+            return self._query_connect_step(self.goal)
+        elif self.phase == "searching":
+            return self._searching_step()
+        
+        return StepResult(done=True)
+    
+    def _sampling_step(self) -> StepResult:
+        """Sample random points in free space."""
+        if self.sample_idx >= len(self.sample_pool):
+            self.roadmap_size = len(self.nodes)
+            self.phase = "connecting"
+            return StepResult()
+
+        x, y = self.sample_pool[self.sample_idx]
+        self._add_node((x, y))
+        self.sample_idx += 1
+        return StepResult(edge=((x - 2, y - 2), (x + 2, y + 2)))  # Small marker
+    
+    def _connecting_step(self) -> StepResult:
+        """Connect roadmap nodes to nearby roadmap neighbors."""
+        if self.connect_idx >= self.roadmap_size:
+            self.phase = "query_start"
+            return StepResult()
+
+        candidate_indices = [idx for idx in range(self.roadmap_size) if idx != self.connect_idx]
+        edges = self._connect_node(self.connect_idx, candidate_indices)
+        self.connect_idx += 1
+        return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if len(edges) > 1 else None)
+
+    def _query_connect_step(self, query_point: Point) -> StepResult:
+        """Attach a query configuration to the learned roadmap."""
+        if self.roadmap_size == 0:
+            self.phase = "done"
+            self.done = True
+            return StepResult(done=True, found_path=False)
+
+        node_idx = self._add_node(query_point)
+        # Query nodes connect to the previously built roadmap and, once available,
+        # to earlier query nodes as well (e.g. direct start-goal visibility).
+        edges = self._connect_node(node_idx, list(range(node_idx)))
+
+        if query_point == self.start:
+            self.start_idx = node_idx
+            self.phase = "query_goal"
+        else:
+            self.goal_idx = node_idx
+            if not edges or self.start_idx is None:
+                self.phase = "done"
+                self.done = True
+                return StepResult(done=True, found_path=False)
+            self.phase = "searching"
+            self.search_open = []
+            self.search_closed = set()
+            self.search_parent = {}
+            self.search_g = {self.start_idx: 0.0}
+            heapq.heappush(self.search_open, (self._heuristic(self.start_idx), 0.0, self.start_idx))
+
+        return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if len(edges) > 1 else None)
+    
+    def _searching_step(self) -> StepResult:
+        """A* search on the roadmap."""
+        if self.start_idx is None or self.goal_idx is None:
+            self.phase = "done"
+            self.done = True
+            return StepResult(done=True, found_path=False)
+
+        if not self.search_open:
+            self.phase = "done"
+            self.done = True
+            return StepResult(done=True, found_path=False)
+        
+        _, current_g, current = heapq.heappop(self.search_open)
+
+        if current == self.goal_idx:
+            self.current_path = [current]
+            while current in self.search_parent:
+                current = self.search_parent[current]
+                self.current_path.append(current)
+            self.current_path.reverse()
+            self.found_path = True
+            self.phase = "done"
+            self.done = True
+            return StepResult(done=True, found_path=True)
+        
+        if current in self.search_closed:
+            return StepResult()
+        
+        self.search_closed.add(current)
+        
+        edge = None
+        for neighbor, cost in self.edges[current]:
+            if neighbor in self.search_closed:
+                continue
+
+            tentative_g = current_g + cost
+            if tentative_g < self.search_g.get(neighbor, float('inf')):
+                self.search_parent[neighbor] = current
+                self.search_g[neighbor] = tentative_g
+                h_cost = self._heuristic(neighbor)
+                heapq.heappush(self.search_open, (tentative_g + h_cost, tentative_g, neighbor))
+                edge = (self.nodes[current], self.nodes[neighbor])
+        
+        return StepResult(edge=edge)
+    
+    def _heuristic(self, node_idx: int) -> float:
+        """Euclidean distance to goal."""
+        node = self.nodes[node_idx]
+        return np.sqrt((node[0] - self.goal[0])**2 + (node[1] - self.goal[1])**2)
+    
+    def extract_path(self) -> List[Tuple[int, int]]:
+        if not self.current_path:
+            return []
+        return [self.nodes[i] for i in self.current_path]
+    
+    def get_status(self) -> str:
+        total_edges = sum(len(e) for e in self.edges.values()) // 2
+        return (
+            f"PRM: {self.phase}, roadmap nodes: {self.roadmap_size}, "
+            f"total nodes: {len(self.nodes)}, edges: {total_edges}"
+        )
+    
+    @staticmethod
+    def get_params_widget() -> QWidget:
+        return PRMParamsWidget()
+    
+    @staticmethod
+    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
+                          params_widget: QWidget) -> 'PRMPlanner':
+        params = params_widget.get_params()
+        return PRMPlanner(occ, start, goal, **params)

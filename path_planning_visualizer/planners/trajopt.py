@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+import numpy as np
+
+from PyQt6.QtWidgets import (
+    QDoubleSpinBox,
+    QFormLayout,
+    QSpinBox,
+    QWidget,
+)
+
+from ._trajectory import (
+    escape_init,
+    fd_acceleration_matrix,
+    make_sdf,
+    sdf_query,
+    straight_line,
+)
+from ..geometry import line_collision_free
+from .base import BasePlanner, StepResult
+
+
+class TrajOptParamsWidget(QWidget):
+    """Parameters widget for TrajOpt planner."""
+
+    def __init__(self):
+        super().__init__()
+        layout = QFormLayout()
+
+        self.spin_num_points = QSpinBox()
+        self.spin_num_points.setRange(10, 200)
+        self.spin_num_points.setValue(50)
+        self.spin_num_points.setToolTip("Number of waypoints")
+
+        self.spin_max_iters = QSpinBox()
+        self.spin_max_iters.setRange(10, 20000)
+        self.spin_max_iters.setValue(1000)
+        self.spin_max_iters.setToolTip("Maximum iterations")
+
+        self.spin_trust_region = QDoubleSpinBox()
+        self.spin_trust_region.setRange(1.0, 100.0)
+        self.spin_trust_region.setSingleStep(5.0)
+        self.spin_trust_region.setValue(20.0)
+        self.spin_trust_region.setToolTip("Initial trust-region box size")
+
+        self.spin_collision_weight = QDoubleSpinBox()
+        self.spin_collision_weight.setRange(1.0, 1000.0)
+        self.spin_collision_weight.setSingleStep(10.0)
+        self.spin_collision_weight.setValue(100.0)
+        self.spin_collision_weight.setToolTip("Initial collision penalty coefficient")
+
+        layout.addRow("Waypoints:", self.spin_num_points)
+        layout.addRow("Max iterations:", self.spin_max_iters)
+        layout.addRow("Trust region:", self.spin_trust_region)
+        layout.addRow("Collision weight:", self.spin_collision_weight)
+
+        self.setLayout(layout)
+
+    def get_params(self) -> dict:
+        return {
+            'num_points': self.spin_num_points.value(),
+            'max_iters': self.spin_max_iters.value(),
+            'trust_region': self.spin_trust_region.value(),
+            'collision_weight': self.spin_collision_weight.value(),
+        }
+
+
+class TrajOptPlanner(BasePlanner):
+    """TrajOpt - trajectory optimization by Sequential Convex Optimization.
+
+    Implements the penalty / trust-region SCO loop of Schulman et al. (2014) for
+    a 2D point robot:
+
+    * the (convex, quadratic) objective is the sum of squared accelerations;
+    * the non-convex collision constraint ``sd(x) >= d_safe`` is convexified by
+      linearizing the signed distance, ``sd(x) ~ sd(x0) + grad_sd . dx``, and
+      penalized with an l1 hinge ``mu * max(0, d_safe - sd_lin)``;
+    * each iteration solves the resulting convex subproblem inside a box trust
+      region, then accepts/rejects the step and grows/shrinks the trust region
+      from the ratio of true to predicted merit improvement;
+    * when the inner loop converges but the trajectory is still infeasible the
+      penalty coefficient ``mu`` is increased (the outer penalty loop).
+    """
+
+    name = "TrajOpt"
+    description = "Sequential convex optimization with l1 penalties and trust regions (Schulman et al. 2014)"
+
+    def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
+                 num_points: int = 50, max_iters: int = 500, trust_region: float = 20.0,
+                 collision_weight: float = 100.0, d_safe: float = 10.0):
+        super().__init__(occ, start, goal)
+
+        self.num_points = num_points
+        self.max_iters = max_iters
+        self.trust_region = float(trust_region)
+        self.collision_weight = float(collision_weight)
+        self.d_safe = float(d_safe)
+
+        # Signed distance field and its gradient (points away from obstacles).
+        self.dist_field, self.grad_x, self.grad_y = make_sdf(self.occ)
+
+        # Straight-line init, bent off obstacles if it collides.
+        self.trajectory = escape_init(
+            straight_line(start, goal, num_points), start, goal, self.occ
+        )
+
+        # SCO state.
+        self.mu = self.collision_weight          # current penalty coefficient
+        self.trust_size = self.trust_region      # current trust-region box size
+        self.mu_scale = 10.0
+        self.mu_max = 1e7
+        self.trust_expand = 2.0
+        self.trust_shrink = 0.5
+        self.trust_min = 1e-2
+        self.trust_max = max(50.0, 2.0 * self.trust_region)
+
+        # Smoothness quadratic: accel = A @ theta_internal + c, with the fixed
+        # endpoints folded into c. Hessian Hs = 2 A^T A is constant.
+        self.n_int = max(0, num_points - 2)
+        if self.n_int > 0:
+            self.A = fd_acceleration_matrix(self.n_int)
+            self.Hs = 2.0 * (self.A.T @ self.A) + 1e-6 * np.eye(self.n_int)
+            self.c = np.zeros((self.n_int, 2), dtype=np.float64)
+            self.c[0] = np.asarray(start, dtype=np.float64)
+            self.c[-1] = np.asarray(goal, dtype=np.float64)
+        else:
+            self.A = np.zeros((0, 0))
+            self.Hs = np.zeros((0, 0))
+            self.c = np.zeros((0, 2))
+
+        self.converged = False
+        self.total_cost = float('inf')
+        self.collision_cost = float('inf')
+        self.best_valid_trajectory: Optional[np.ndarray] = None
+        self._check_path_validity()
+        if self.found_path:
+            self.best_valid_trajectory = self.trajectory.copy()
+
+    def _distances_and_normals(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        d = np.empty(self.n_int, dtype=np.float64)
+        normals = np.empty((self.n_int, 2), dtype=np.float64)
+        for j in range(self.n_int):
+            dj, gj = sdf_query(self.dist_field, self.grad_x, self.grad_y,
+                               theta[j, 0], theta[j, 1])
+            d[j] = dj
+            normals[j] = gj
+        return d, normals
+
+    def _smoothness(self, theta: np.ndarray) -> Tuple[float, np.ndarray]:
+        accel = self.A @ theta + self.c
+        f = float(np.sum(accel * accel))
+        grad = 2.0 * (self.A.T @ accel)
+        return f, grad
+
+    def step_once(self) -> StepResult:
+        if self.done:
+            return StepResult(done=True, found_path=self.found_path)
+
+        if self.iteration >= self.max_iters or self.n_int <= 0:
+            self._finalize()
+            self.done = True
+            return StepResult(done=True, found_path=self.found_path)
+
+        self.iteration += 1
+
+        theta = self.trajectory[1:-1].copy()
+
+        # --- current merit -------------------------------------------------
+        f_smooth0, grad_smooth = self._smoothness(theta)
+        d0, normals = self._distances_and_normals(theta)
+        hinge0 = np.maximum(0.0, self.d_safe - d0)
+        merit0 = f_smooth0 + self.mu * float(np.sum(hinge0))
+
+        # --- convex subproblem: Newton step on smoothness + linearized hinge
+        active = d0 < self.d_safe
+        grad_coll = np.zeros((self.n_int, 2), dtype=np.float64)
+        grad_coll[active] = -self.mu * normals[active]
+        grad_total = grad_smooth + grad_coll
+        delta = -np.linalg.solve(self.Hs, grad_total)
+        np.clip(delta, -self.trust_size, self.trust_size, out=delta)
+
+        theta_new = theta + delta
+        theta_new[:, 0] = np.clip(theta_new[:, 0], 0, self.w - 1)
+        theta_new[:, 1] = np.clip(theta_new[:, 1], 0, self.h - 1)
+        delta_eff = theta_new - theta
+
+        # --- model (predicted) vs true merit at the proposed step ----------
+        f_smooth_new, _ = self._smoothness(theta_new)  # smoothness is exact
+        d_lin = d0 + np.sum(normals * delta_eff, axis=1)
+        model_merit = f_smooth_new + self.mu * float(np.sum(np.maximum(0.0, self.d_safe - d_lin)))
+        predicted = merit0 - model_merit
+
+        d_new, _ = self._distances_and_normals(theta_new)
+        hinge_new = np.maximum(0.0, self.d_safe - d_new)
+        true_merit = f_smooth_new + self.mu * float(np.sum(hinge_new))
+        actual = merit0 - true_merit
+
+        ratio = actual / predicted if predicted > 1e-12 else (1.0 if actual > 1e-9 else -1.0)
+
+        # --- accept / reject + trust-region update -------------------------
+        accepted = actual > 1e-9
+        if accepted:
+            self.trajectory[1:-1] = theta_new
+            cur_hinge = hinge_new
+            if ratio > 0.75:
+                self.trust_size = min(self.trust_max, self.trust_size * self.trust_expand)
+            elif ratio < 0.25:
+                self.trust_size = max(self.trust_min, self.trust_size * self.trust_shrink)
+        else:
+            cur_hinge = hinge0
+            self.trust_size = max(self.trust_min, self.trust_size * self.trust_shrink)
+
+        max_viol = float(np.max(cur_hinge)) if self.n_int > 0 else 0.0
+        self.collision_cost = float(np.mean(cur_hinge))
+        self.total_cost = (true_merit if accepted else merit0)
+
+        self._check_path_validity()
+        if self.found_path:
+            self.best_valid_trajectory = self.trajectory.copy()
+
+        # --- outer penalty loop / convergence ------------------------------
+        inner_converged = self.trust_size <= self.trust_min * 2.0 or abs(predicted) < 1e-4
+        if inner_converged:
+            if max_viol > 1e-2 and self.mu < self.mu_max:
+                self.mu *= self.mu_scale
+                self.trust_size = self.trust_region
+            elif self.found_path:
+                self.converged = True
+                self._finalize()
+                self.done = True
+
+        # Visualization edge.
+        idx = self.iteration % (self.num_points - 1)
+        p1 = (int(round(self.trajectory[idx, 0])), int(round(self.trajectory[idx, 1])))
+        p2 = (int(round(self.trajectory[idx + 1, 0])), int(round(self.trajectory[idx + 1, 1])))
+        return StepResult(edge=(p1, p2), path_improved=(accepted and self.found_path))
+
+    def _finalize(self):
+        """Restore the best collision-free trajectory found, if any."""
+        if self.best_valid_trajectory is not None:
+            self.trajectory = self.best_valid_trajectory.copy()
+            self.found_path = True
+        else:
+            self._check_path_validity()
+
+    def _check_path_validity(self):
+        """Check if trajectory is collision-free."""
+        for i in range(len(self.trajectory) - 1):
+            p1 = (int(np.rint(self.trajectory[i, 0])), int(np.rint(self.trajectory[i, 1])))
+            p2 = (int(np.rint(self.trajectory[i + 1, 0])), int(np.rint(self.trajectory[i + 1, 1])))
+            if not line_collision_free(p1, p2, self.occ):
+                self.found_path = False
+                return
+        self.found_path = True
+
+    def extract_path(self) -> List[Tuple[int, int]]:
+        return [(int(np.rint(p[0])), int(np.rint(p[1]))) for p in self.trajectory]
+
+    def get_status(self) -> str:
+        status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
+        return (f"TrajOpt: iter {self.iteration}, mu {self.mu:.0f}, trust {self.trust_size:.2f}, "
+                f"viol {self.collision_cost:.2f}, {status}")
+
+    @staticmethod
+    def get_params_widget() -> QWidget:
+        return TrajOptParamsWidget()
+
+    @staticmethod
+    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
+                          params_widget: QWidget) -> 'TrajOptPlanner':
+        params = params_widget.get_params()
+        return TrajOptPlanner(occ, start, goal, **params)
