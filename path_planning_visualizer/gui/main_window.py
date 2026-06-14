@@ -127,7 +127,7 @@ class MainWindow(QMainWindow):
         self.btn_pause = QPushButton("Pause")
         self.btn_pause.setFixedWidth(130)
 
-        # Map-editing controls
+        # Map-editing controls (collapsed by default behind the "Map Tools" toggle)
         self.btn_edit = QPushButton("Edit Map")
         self.btn_edit.setCheckable(True)
         self.btn_edit.setToolTip("Draw obstacles: left-drag adds walls, right-drag erases")
@@ -138,6 +138,10 @@ class MainWindow(QMainWindow):
         self.spin_brush.setRange(1, 80)
         self.spin_brush.setValue(8)
         self.spin_brush.setToolTip("Brush radius in pixels")
+
+        self.btn_map_tools = QPushButton("▸ Map Tools")
+        self.btn_map_tools.setCheckable(True)
+        self.btn_map_tools.setToolTip("Show or hide the map editing tools")
 
         for btn in [self.btn_step, self.btn_run, self.btn_pause]:
             btn.setEnabled(False)
@@ -165,6 +169,12 @@ class MainWindow(QMainWindow):
         self.lbl_total_compute_time = QLabel("-")
         self.lbl_info = QLabel("Load an image, then click START and GOAL.")
         self.lbl_info.setWordWrap(True)
+        # Reserve a stable height (~3 lines) and top-align: the info line changes
+        # every step during optimization (e.g. the CHOMP status), and letting it
+        # rewrap to a different line count would reflow the panel and make the
+        # Animation Speed / Status boxes jump.
+        self.lbl_info.setMinimumHeight(self.lbl_info.fontMetrics().lineSpacing() * 3)
+        self.lbl_info.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.lbl_path_length.setToolTip("Geometric path length in pixels. Lower is usually better.")
         self.lbl_min_clearance.setToolTip("Smallest obstacle distance anywhere along the path in pixels. Higher is safer.")
         self.lbl_mean_clearance.setToolTip("Average obstacle distance along the full path in pixels. Higher means the path stays farther from walls overall.")
@@ -223,13 +233,20 @@ class MainWindow(QMainWindow):
         controls_row1 = QHBoxLayout()
         controls_row1.addWidget(self.btn_load)
         controls_row1.addWidget(self.btn_reset)
+        controls_row1.addWidget(self.btn_map_tools)
 
-        controls_row_edit = QHBoxLayout()
-        controls_row_edit.addWidget(self.btn_edit)
-        controls_row_edit.addWidget(QLabel("Brush:"))
-        controls_row_edit.addWidget(self.spin_brush)
-        controls_row_edit.addWidget(self.btn_new_map)
-        controls_row_edit.addWidget(self.btn_save_map)
+        # Map-editing tools live in a panel that is collapsed by default and shown
+        # only when the "Map Tools" toggle is expanded.
+        self.map_tools_container = QWidget()
+        map_tools_row = QHBoxLayout()
+        map_tools_row.setContentsMargins(0, 0, 0, 0)
+        map_tools_row.addWidget(self.btn_edit)
+        map_tools_row.addWidget(QLabel("Brush:"))
+        map_tools_row.addWidget(self.spin_brush)
+        map_tools_row.addWidget(self.btn_new_map)
+        map_tools_row.addWidget(self.btn_save_map)
+        self.map_tools_container.setLayout(map_tools_row)
+        self.map_tools_container.setVisible(False)
 
         controls_row2 = QHBoxLayout()
         controls_row2.addWidget(self.btn_step)
@@ -239,7 +256,7 @@ class MainWindow(QMainWindow):
         # Left panel
         left = QVBoxLayout()
         left.addLayout(controls_row1)
-        left.addLayout(controls_row_edit)
+        left.addWidget(self.map_tools_container)
         left.addLayout(controls_row2)
         left.addWidget(algo_box)
         left.addWidget(params_box)
@@ -382,6 +399,7 @@ class MainWindow(QMainWindow):
         self.btn_edit.toggled.connect(self._on_edit_toggled)
         self.btn_new_map.clicked.connect(self.new_map)
         self.btn_save_map.clicked.connect(self.save_map)
+        self.btn_map_tools.toggled.connect(self._on_map_tools_toggled)
     
     def _populate_algo_combo(self):
         """Populate algorithm dropdown with grouped items."""
@@ -588,10 +606,17 @@ class MainWindow(QMainWindow):
             return
         self._update_status_display(info=f"Saved map to {os.path.basename(path)}")
 
+    def _on_map_tools_toggled(self, expanded: bool):
+        """Show or hide the collapsible map-editing tools panel."""
+        self.map_tools_container.setVisible(expanded)
+        self.btn_map_tools.setText(("▾ " if expanded else "▸ ") + "Map Tools")
+
     def _on_edit_toggled(self, checked: bool):
         """Enter/leave map-editing mode."""
         self.canvas.edit_mode = checked
         if checked:
+            if not self.btn_map_tools.isChecked():
+                self.btn_map_tools.setChecked(True)  # reveal the tools panel
             self.pause()
             self.canvas.on_paint = self._on_paint
             self.canvas.pick_mode = None  # suspend start/goal picking while editing

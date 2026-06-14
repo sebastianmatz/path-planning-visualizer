@@ -103,84 +103,78 @@ class RRTConnectPlanner(BasePlanner):
         self._index_b.add(goal[0], goal[1])
 
     def _sample(self) -> Tuple[int, int]:
-        """Sample a random point in free space."""
-        for _ in range(100):
-            p = (int(self.rng.integers(0, self.w)), int(self.rng.integers(0, self.h)))
-            if self.is_free(p):
-                return p
-        return (int(self.rng.integers(0, self.w)), int(self.rng.integers(0, self.h)))
-    
-    def _extend(self, nodes: List[Tuple[int, int]], parent: List[int], index: GridIndex,
-                target: Tuple[int, int]) -> Tuple[str, Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+        """RANDOM_CONFIG: sample uniformly over the whole space C.
+
+        An occupied configuration is fine -- it is only a steering target; the new
+        vertex produced by EXTEND is collision-checked.
         """
-        Extend tree towards target.
-        Returns: (status, new_point, rejected_point)
-        status: 'reached' if target reached, 'advanced' if extended, 'trapped' if blocked
+        return (int(self.rng.integers(0, self.w)), int(self.rng.integers(0, self.h)))
+
+    def _extend(self, nodes: List[Tuple[int, int]], parent: List[int], index: GridIndex,
+                target: Tuple[int, int]) -> Tuple[str, Optional[int], Optional[Tuple[Tuple[int, int], Tuple[int, int]]], Optional[Tuple[int, int]]]:
+        """EXTEND (paper Fig. 2): one eps-step from the nearest vertex toward target.
+
+        Returns ``(status, new_idx, edge, rejected)`` where ``status`` is
+        ``'reached'`` (q_new == target), ``'advanced'`` (a step was taken), or
+        ``'trapped'`` (blocked); ``new_idx`` is the index of the resulting vertex.
         """
         i_near = index.nearest(target[0], target[1])
         q_near = nodes[i_near]
-        q_new = clamp_point(steer(q_near, target, self.step_size), self.w, self.h)
+
+        # NEW_CONFIG: step eps toward target, landing exactly on it when within range.
+        reached_target = dist(q_near, target) <= self.step_size
+        q_new = target if reached_target else clamp_point(steer(q_near, target, self.step_size), self.w, self.h)
+
+        if q_new == q_near:
+            # No motion possible; if we are already at the target the tree reaches it.
+            if reached_target:
+                return ('reached', i_near, None, None)
+            return ('trapped', None, None, q_new)
 
         if not self.is_free(q_new):
-            return ('trapped', None, q_new)
+            return ('trapped', None, None, q_new)
         if not line_collision_free(q_near, q_new, self.occ, samples=self.collision_samples):
-            return ('trapped', None, q_new)
+            return ('trapped', None, None, q_new)
 
         nodes.append(q_new)
         parent.append(i_near)
         index.add(q_new[0], q_new[1])
+        new_idx = len(nodes) - 1
+        edge = (q_near, q_new)
 
-        if dist(q_new, target) < self.step_size:
-            return ('reached', q_new, None)
-        return ('advanced', q_new, None)
+        if q_new == target:  # NEW_CONFIG reached q exactly
+            return ('reached', new_idx, edge, None)
+        return ('advanced', new_idx, edge, None)
 
     def _connect(self, nodes: List[Tuple[int, int]], parent: List[int], index: GridIndex,
-                 target: Tuple[int, int]) -> Tuple[str, List[Tuple[Tuple[int,int], Tuple[int,int]]], Optional[Tuple[int, int]]]:
-        """
-        Try to connect tree to target point by repeatedly extending.
-        Returns: (status, edges_added, last_rejected)
-        """
-        edges = []
+                 target: Tuple[int, int]) -> Tuple[str, Optional[int], List[Tuple[Tuple[int, int], Tuple[int, int]]], Optional[Tuple[int, int]]]:
+        """CONNECT (paper Fig. 5): repeat EXTEND until the result is not Advanced.
 
+        Returns ``(status, connect_idx, edges, rejected)`` where ``connect_idx`` is
+        the index of the vertex at the connection target when ``status='reached'``.
+        """
+        edges: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        last_idx: Optional[int] = None
         while True:
-            i_near = index.nearest(target[0], target[1])
-            q_near = nodes[i_near]
+            status, new_idx, edge, rejected = self._extend(nodes, parent, index, target)
+            if edge is not None:
+                edges.append(edge)
+            if new_idx is not None:
+                last_idx = new_idx
+            if status != 'advanced':
+                return (status, last_idx, edges, rejected)
 
-            # Final step: land exactly on the target so the two trees share a
-            # vertex. The residual segment is collision-checked, so the joined
-            # path has no unchecked gap (see RRT-Connect "CONNECT" semantics).
-            if dist(q_near, target) <= self.step_size:
-                if not line_collision_free(q_near, target, self.occ, samples=self.collision_samples):
-                    return ('trapped', edges, target)
-                nodes.append(target)
-                parent.append(i_near)
-                index.add(target[0], target[1])
-                edges.append((q_near, target))
-                return ('reached', edges, None)
-
-            q_new = clamp_point(steer(q_near, target, self.step_size), self.w, self.h)
-
-            if not self.is_free(q_new):
-                return ('trapped', edges, q_new)
-            if not line_collision_free(q_near, q_new, self.occ, samples=self.collision_samples):
-                return ('trapped', edges, q_new)
-
-            nodes.append(q_new)
-            parent.append(i_near)
-            index.add(q_new[0], q_new[1])
-            edges.append((q_near, q_new))
-    
     def step_once(self) -> StepResult:
         if self.done:
             return StepResult(done=True, found_path=self.found_path)
-        
+
         if self.iteration >= self.max_iters:
             self.done = True
             return StepResult(done=True, found_path=False)
-        
+
         self.iteration += 1
-        
-        # Alternate which tree extends and which connects
+
+        # Alternate which tree extends (one step) and which connects (greedy).
         if self.swap_trees:
             nodes_extend, parent_extend, index_extend = self.nodes_b, self.parent_b, self._index_b
             nodes_connect, parent_connect, index_connect = self.nodes_a, self.parent_a, self._index_a
@@ -188,39 +182,42 @@ class RRTConnectPlanner(BasePlanner):
             nodes_extend, parent_extend, index_extend = self.nodes_a, self.parent_a, self._index_a
             nodes_connect, parent_connect, index_connect = self.nodes_b, self.parent_b, self._index_b
 
-        # Sample random point and extend first tree
+        # EXTEND(T_a, q_rand): one step of the first tree toward a random config.
         q_rand = self._sample()
-        status, q_new, rejected = self._extend(nodes_extend, parent_extend, index_extend, q_rand)
+        status, extend_idx, extend_edge, rejected = self._extend(
+            nodes_extend, parent_extend, index_extend, q_rand
+        )
 
         if status == 'trapped':
             self.swap_trees = not self.swap_trees
             return StepResult(rejected_point=rejected)
 
-        # Try to connect second tree to the new point
-        connect_status, connect_edges, connect_rejected = self._connect(
+        # CONNECT(T_b, q_new): greedily grow the other tree toward the new vertex.
+        q_new = nodes_extend[extend_idx]
+        connect_status, connect_idx, connect_edges, connect_rejected = self._connect(
             nodes_connect, parent_connect, index_connect, q_new
         )
-        
-        # Determine the edge to visualize (from extend step)
-        i_new = len(nodes_extend) - 1
-        i_parent = parent_extend[i_new]
-        edge = (nodes_extend[i_parent], q_new)
-        
+
+        edges = ([extend_edge] if extend_edge is not None else []) + connect_edges
+
         if connect_status == 'reached':
-            # Trees connected!
-            if self.swap_trees:
-                self.connect_idx_b = len(self.nodes_b) - 1
-                self.connect_idx_a = len(self.nodes_a) - 1
-            else:
-                self.connect_idx_a = len(self.nodes_a) - 1
-                self.connect_idx_b = len(self.nodes_b) - 1
-            
+            # Trees meet at the shared, collision-checked vertex q_new.
+            if self.swap_trees:  # extend tree is T_b, connect tree is T_a
+                self.connect_idx_b = extend_idx
+                self.connect_idx_a = connect_idx
+            else:                # extend tree is T_a, connect tree is T_b
+                self.connect_idx_a = extend_idx
+                self.connect_idx_b = connect_idx
             self.done = True
             self.found_path = True
-            return StepResult(edge=edge, done=True, found_path=True)
-        
+            if len(edges) > 1:
+                return StepResult(edges=edges, done=True, found_path=True)
+            return StepResult(edge=edges[0] if edges else None, done=True, found_path=True)
+
         self.swap_trees = not self.swap_trees
-        return StepResult(edge=edge, rejected_point=connect_rejected)
+        if len(edges) > 1:
+            return StepResult(edges=edges, rejected_point=connect_rejected)
+        return StepResult(edge=edges[0] if edges else None, rejected_point=connect_rejected)
     
     def extract_path(self) -> List[Tuple[int, int]]:
         if self.connect_idx_a is None or self.connect_idx_b is None:

@@ -13,7 +13,6 @@ from PyQt6.QtWidgets import (
 
 from ._trajectory import (
     escape_init,
-    fd_acceleration_matrix,
     make_sdf,
     sdf_query,
     straight_line,
@@ -89,7 +88,7 @@ class TrajOptPlanner(BasePlanner):
 
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 50, max_iters: int = 500, trust_region: float = 20.0,
-                 collision_weight: float = 100.0, d_safe: float = 10.0):
+                 collision_weight: float = 100.0, d_safe: float = 10.0, accept_ratio: float = 0.1):
         super().__init__(occ, start, goal)
 
         self.num_points = num_points
@@ -97,9 +96,10 @@ class TrajOptPlanner(BasePlanner):
         self.trust_region = float(trust_region)
         self.collision_weight = float(collision_weight)
         self.d_safe = float(d_safe)
+        self.accept_ratio = float(accept_ratio)  # step acceptance parameter c (Alg. 1)
 
-        # Signed distance field and its gradient (points away from obstacles).
-        self.dist_field, self.grad_x, self.grad_y = make_sdf(self.occ)
+        # True signed distance field and its gradient (negative inside obstacles).
+        self.dist_field, self.grad_x, self.grad_y = make_sdf(self.occ, signed=True)
 
         # Straight-line init, bent off obstacles if it collides.
         self.trajectory = escape_init(
@@ -116,14 +116,23 @@ class TrajOptPlanner(BasePlanner):
         self.trust_min = 1e-2
         self.trust_max = max(50.0, 2.0 * self.trust_region)
 
-        # Smoothness quadratic: accel = A @ theta_internal + c, with the fixed
-        # endpoints folded into c. Hessian Hs = 2 A^T A is constant.
+        # Smoothness objective (Eq. 5): sum of squared displacements
+        # ||theta_{t+1} - theta_t||^2. A is the first-difference operator over the
+        # n_int+1 segments; the fixed endpoints are folded into c. disp = A theta + c,
+        # f = ||disp||^2, Hessian Hs = 2 A^T A is constant.
         self.n_int = max(0, num_points - 2)
         if self.n_int > 0:
-            self.A = fd_acceleration_matrix(self.n_int)
-            self.Hs = 2.0 * (self.A.T @ self.A) + 1e-6 * np.eye(self.n_int)
-            self.c = np.zeros((self.n_int, 2), dtype=np.float64)
-            self.c[0] = np.asarray(start, dtype=np.float64)
+            m = self.n_int
+            A = np.zeros((m + 1, m), dtype=np.float64)
+            A[0, 0] = 1.0
+            for i in range(1, m):
+                A[i, i - 1] = -1.0
+                A[i, i] = 1.0
+            A[m, m - 1] = -1.0
+            self.A = A
+            self.Hs = 2.0 * (A.T @ A) + 1e-6 * np.eye(m)
+            self.c = np.zeros((m + 1, 2), dtype=np.float64)
+            self.c[0] = -np.asarray(start, dtype=np.float64)
             self.c[-1] = np.asarray(goal, dtype=np.float64)
         else:
             self.A = np.zeros((0, 0))
@@ -149,9 +158,9 @@ class TrajOptPlanner(BasePlanner):
         return d, normals
 
     def _smoothness(self, theta: np.ndarray) -> Tuple[float, np.ndarray]:
-        accel = self.A @ theta + self.c
-        f = float(np.sum(accel * accel))
-        grad = 2.0 * (self.A.T @ accel)
+        disp = self.A @ theta + self.c  # consecutive displacements (Eq. 5)
+        f = float(np.sum(disp * disp))
+        grad = 2.0 * (self.A.T @ disp)
         return f, grad
 
     def step_once(self) -> StepResult:
@@ -199,15 +208,13 @@ class TrajOptPlanner(BasePlanner):
 
         ratio = actual / predicted if predicted > 1e-12 else (1.0 if actual > 1e-9 else -1.0)
 
-        # --- accept / reject + trust-region update -------------------------
-        accepted = actual > 1e-9
+        # --- accept / reject + trust-region update (Alg. 1 lines 6-10) ------
+        # Accept and expand iff TrueImprove/ModelImprove > c, else reject + shrink.
+        accepted = ratio > self.accept_ratio
         if accepted:
             self.trajectory[1:-1] = theta_new
             cur_hinge = hinge_new
-            if ratio > 0.75:
-                self.trust_size = min(self.trust_max, self.trust_size * self.trust_expand)
-            elif ratio < 0.25:
-                self.trust_size = max(self.trust_min, self.trust_size * self.trust_shrink)
+            self.trust_size = min(self.trust_max, self.trust_size * self.trust_expand)
         else:
             cur_hinge = hinge0
             self.trust_size = max(self.trust_min, self.trust_size * self.trust_shrink)

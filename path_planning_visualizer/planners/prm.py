@@ -63,23 +63,35 @@ class PRMParamsWidget(QWidget):
 
 
 class PRMPlanner(BasePlanner):
-    """PRM - Probabilistic Roadmap planner.
-    
+    """sPRM - simplified Probabilistic Roadmap (Karaman & Frazzoli 2011).
+
     Two phases:
-    1. Learning phase: Build a roadmap of collision-free random samples
-    2. Query phase: Connect start/goal to the roadmap and search the graph
+    1. Learning phase: build a roadmap of collision-free random samples, each
+       connected to its neighbours within ``max_edge_dist`` (capped at
+       ``k_neighbors``) via a straight-line local planner.
+    2. Query phase: connect start/goal to the roadmap and search the graph.
+
+    ``remove_cycles=True`` reproduces the original Kavraki et al. (1996)
+    construction step, which skips edges between nodes already in the same
+    connected component (a cycle-free forest). The default ``False`` keeps cycles,
+    i.e. the asymptotically-optimal sPRM (see ``ClassicPRMPlanner`` for the forest).
     """
-    
-    name = "PRM"
-    description = "Two-phase probabilistic roadmap with query-time start/goal connection"
-    
+
+    name = "sPRM"
+    description = "Simplified probabilistic roadmap (asymptotically optimal; keeps cycles)"
+
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                  num_samples: int = 500, k_neighbors: int = 15, max_edge_dist: int = 100, seed: int = 42):
+                  num_samples: int = 500, k_neighbors: int = 15, max_edge_dist: int = 100,
+                  seed: int = 42, remove_cycles: bool = False):
         super().__init__(occ, start, goal)
-        
+
         self.num_samples = int(max(1, num_samples))
         self.k_neighbors = int(max(1, k_neighbors))
         self.max_edge_dist = float(max(1.0, max_edge_dist))
+        self.remove_cycles = bool(remove_cycles)
+        # Union-find over node indices, used only when remove_cycles is set to
+        # build the original Kavraki (1996) cycle-free forest.
+        self._uf_parent: List[int] = []
         self.rng = np.random.default_rng(seed)
 
         # Roadmap is learned independently of the query.
@@ -132,10 +144,22 @@ class PRMPlanner(BasePlanner):
         node_idx = len(self.nodes)
         self.nodes.append(point)
         self.edges[node_idx] = []
+        self._uf_parent.append(node_idx)  # make-set (used only when remove_cycles)
         return node_idx
 
     def _edge_exists(self, a: int, b: int) -> bool:
         return any(neighbor == b for neighbor, _ in self.edges[a])
+
+    def _uf_find(self, i: int) -> int:
+        while self._uf_parent[i] != i:
+            self._uf_parent[i] = self._uf_parent[self._uf_parent[i]]  # path compression
+            i = self._uf_parent[i]
+        return i
+
+    def _uf_union(self, a: int, b: int) -> None:
+        ra, rb = self._uf_find(a), self._uf_find(b)
+        if ra != rb:
+            self._uf_parent[rb] = ra
 
     def _candidate_neighbors(self, point: Point, candidate_indices: List[int]) -> List[Tuple[float, int]]:
         distances: List[Tuple[float, int]] = []
@@ -153,10 +177,16 @@ class PRMPlanner(BasePlanner):
         for edge_dist, neighbor_idx in self._candidate_neighbors(node, candidate_indices):
             if neighbor_idx == node_idx or self._edge_exists(node_idx, neighbor_idx):
                 continue
+            # Kavraki (1996) construction step: skip nodes already in the same
+            # connected component (yields a cycle-free forest). sPRM keeps them.
+            if self.remove_cycles and self._uf_find(node_idx) == self._uf_find(neighbor_idx):
+                continue
             if not line_collision_free(node, self.nodes[neighbor_idx], self.occ):
                 continue
             self.edges[node_idx].append((neighbor_idx, edge_dist))
             self.edges[neighbor_idx].append((node_idx, edge_dist))
+            if self.remove_cycles:
+                self._uf_union(node_idx, neighbor_idx)
             added_edges.append((node, self.nodes[neighbor_idx]))
         return added_edges
     
@@ -308,3 +338,28 @@ class PRMPlanner(BasePlanner):
                           params_widget: QWidget) -> 'PRMPlanner':
         params = params_widget.get_params()
         return PRMPlanner(occ, start, goal, **params)
+
+
+class ClassicPRMPlanner(PRMPlanner):
+    """PRM - the original Kavraki et al. (1996) construction step.
+
+    Identical to ``sPRM`` (``PRMPlanner``) except that it skips connections
+    between nodes already in the same connected component, producing the paper's
+    cycle-free forest roadmap. This is *not* asymptotically optimal and tends to
+    return longer query paths than ``sPRM`` (a difference the original paper notes
+    and addresses with smoothing).
+    """
+
+    name = "PRM"
+    description = "Original Kavraki et al. (1996) construction: a cycle-free forest roadmap"
+
+    def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
+                 **kwargs) -> None:
+        kwargs.pop('remove_cycles', None)
+        super().__init__(occ, start, goal, remove_cycles=True, **kwargs)
+
+    @staticmethod
+    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
+                          params_widget: QWidget) -> 'ClassicPRMPlanner':
+        params = params_widget.get_params()
+        return ClassicPRMPlanner(occ, start, goal, **params)

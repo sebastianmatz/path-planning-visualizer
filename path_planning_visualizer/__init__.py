@@ -6,7 +6,7 @@ Interactive desktop application for exploring and comparing path-planning
 algorithms on occupancy-grid maps.
 
 Supported algorithms:
-- Sampling-Based: RRT, RRT-Connect, BiTRRT, KPIECE, RRT*, PRM, SBL, FMT*, BIT*
+- Sampling-Based: RRT, RRT-Connect, BiTRRT, KPIECE, RRT*, PRM, sPRM, SBL, FMT*, BIT*
 - Graph Search: A*, Dijkstra
 - Potential Field: APF
 - Trajectory Optimization: CHOMP, STOMP, TrajOpt, ITOMP, GPMP
@@ -31,6 +31,7 @@ except PackageNotFoundError:  # running from a raw source tree without an instal
 from .types import Point, FloatPoint, Edge, OccupancyGrid
 from .geometry import (
     bilinear_sample_scalar,
+    bilinear_sample_scalar_batch,
     bilinear_sample_vector,
     blend_float_paths,
     clamp_point,
@@ -81,6 +82,7 @@ from .planners import (
     BiTRRTPlanner,
     BITStarPlanner,
     CHOMPPlanner,
+    ClassicPRMPlanner,
     DijkstraPlanner,
     FMTStarPlanner,
     GeneticPlanner,
@@ -107,7 +109,7 @@ __all__ = [
     # geometry
     "dist", "l1_dist", "linf_dist", "round_point", "select_holonomic_input",
     "integrate_holonomic_state", "steer", "clamp_point", "make_distance_field",
-    "bilinear_sample_scalar", "bilinear_sample_vector", "segment_points",
+    "bilinear_sample_scalar", "bilinear_sample_scalar_batch", "bilinear_sample_vector", "segment_points",
     "line_collision_free", "float_polyline_collision_free", "iter_path_pixels",
     "compute_path_length", "resample_path_points", "resample_float_path_points",
     "resample_float_path_fixed_count", "smooth_float_polyline", "smooth_display_path",
@@ -121,7 +123,7 @@ __all__ = [
     "BasePlanner", "StepResult", "AVAILABLE_PLANNERS", "ALGORITHM_GROUPS",
     "SAMPLING_BASED_ALGOS", "ANYTIME_ALGOS", "ALGORITHM_INFO",
     "RRTPlanner", "RRTConnectPlanner", "BiTRRTPlanner", "KPIECEPlanner",
-    "RRTStarPlanner", "PRMPlanner", "SBLPlanner", "FMTStarPlanner", "BITStarPlanner",
+    "RRTStarPlanner", "PRMPlanner", "ClassicPRMPlanner", "SBLPlanner", "FMTStarPlanner", "BITStarPlanner",
     "AStarPlanner", "DijkstraPlanner", "APFPlanner", "CHOMPPlanner", "STOMPPlanner",
     "TrajOptPlanner", "ITOMPPlanner", "GPMPPlanner", "PSOPlanner", "GeneticPlanner",
     # gui + entry

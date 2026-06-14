@@ -93,12 +93,26 @@ def smoothness_hessian(n_internal: int, reg: float = 1e-6) -> np.ndarray:
     return a.T @ a + reg * np.eye(n_internal, dtype=np.float64)
 
 
-def make_sdf(occ: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def signed_distance_field(occ: np.ndarray) -> np.ndarray:
+    """True signed distance field: positive in free space, negative inside obstacles.
+
+    ``d(x) = dist_to_obstacle(x) - dist_inside_obstacle(x)`` (the signed Euclidean
+    distance transform used by CHOMP/STOMP), so the sign and penetration depth are
+    correct when a trajectory passes through an obstacle.
+    """
+    dist_outside = make_distance_field(occ)
+    inside = cv2.distanceTransform((occ > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    return dist_outside - inside
+
+
+def make_sdf(occ: np.ndarray, signed: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Distance field and its Sobel gradient (``dist``, ``grad_x``, ``grad_y``).
 
-    ``grad`` points toward increasing clearance (away from obstacles).
+    With ``signed=True`` the field is the true signed distance (negative inside
+    obstacles); otherwise it is the unsigned clearance field. ``grad`` points
+    toward increasing clearance (away from obstacles).
     """
-    dist_field = make_distance_field(occ)
+    dist_field = signed_distance_field(occ) if signed else make_distance_field(occ)
     grad_x = cv2.Sobel(dist_field, cv2.CV_64F, 1, 0, ksize=3) / 8.0
     grad_y = cv2.Sobel(dist_field, cv2.CV_64F, 0, 1, ksize=3) / 8.0
     return dist_field, grad_x, grad_y

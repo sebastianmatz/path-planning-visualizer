@@ -116,7 +116,9 @@ def test_bit_star_cap_is_optional():
 
 @pytest.mark.parametrize("name,kwargs", [
     ("FMT*", dict(num_samples=800, seed=1)),
-    ("PRM", dict(num_samples=600, k_neighbors=15, max_edge_dist=40, seed=1)),
+    # sPRM (cycles kept) is the asymptotically-optimal variant; the original
+    # forest PRM is not, so the near-optimal bound is asserted on sPRM.
+    ("sPRM", dict(num_samples=600, k_neighbors=15, max_edge_dist=40, seed=1)),
 ])
 def test_batch_planners_near_optimal(name, kwargs, reference_cost):
     occ = wall_map()

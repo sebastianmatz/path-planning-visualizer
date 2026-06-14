@@ -5,6 +5,7 @@ from typing import List, Tuple
 import numpy as np
 
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QFormLayout,
     QSpinBox,
     QWidget,
@@ -39,23 +40,34 @@ class PSOParamsWidget(QWidget):
         self.spin_max_iters.setValue(1200)
         self.spin_max_iters.setToolTip("Maximum iterations")
 
+        self.chk_safeguards = QCheckBox("Enable safeguards (non-1995)")
+        self.chk_safeguards.setChecked(False)
+        self.chk_safeguards.setToolTip(
+            "Off = exact Kennedy & Eberhart (1995) update: v += 2*r1*(pbest-x) + 2*r2*(gbest-x), "
+            "Vmax clamp, full momentum (w=1.0).\n"
+            "On = non-1995 robustness: adaptive inertia/social gain, diversity injection, "
+            "random immigrants, and swarm restart for cluttered maps."
+        )
+
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(0, 10_000_000)
         self.spin_seed.setValue(42)
         self.spin_seed.setToolTip("Random seed for reproducibility")
-        
+
         layout.addRow("Particles:", self.spin_num_particles)
         layout.addRow("Waypoints:", self.spin_num_points)
         layout.addRow("Max iters:", self.spin_max_iters)
+        layout.addRow(self.chk_safeguards)
         layout.addRow("Seed:", self.spin_seed)
-        
+
         self.setLayout(layout)
-    
+
     def get_params(self) -> dict:
         return {
             'num_particles': self.spin_num_particles.value(),
             'num_points': self.spin_num_points.value(),
             'max_iters': self.spin_max_iters.value(),
+            'enable_safeguards': self.chk_safeguards.isChecked(),
             'seed': self.spin_seed.value(),
         }
 
@@ -68,19 +80,26 @@ class PSOPlanner(BasePlanner):
     """
     
     name = "PSO"
-    description = "Particle Swarm Optimization"
+    description = "Particle Swarm Optimization (Kennedy & Eberhart 1995) over waypoint paths"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_particles: int = 30, num_points: int = 20, max_iters: int = 500,
-                 w: float = 0.5, c1: float = 1.5, c2: float = 1.5, seed: int = 42):
+                 w: float = 1.0, c1: float = 2.0, c2: float = 2.0, vmax: float = 20.0,
+                 enable_safeguards: bool = False, seed: int = 42):
         super().__init__(occ, start, goal)
-        
+
         self.num_particles = num_particles
         self.num_points = num_points
         self.max_iters = max_iters
-        self.w_inertia = w  # Inertia weight
+        # Exact Kennedy & Eberhart (1995, sec. 3.6) defaults: full momentum (no
+        # inertia weight, w = 1.0), acceleration constants c1 = c2 = 2.0, Vmax clamp.
+        self.w_inertia = w  # Inertia weight (1.0 = the 1995 form, full momentum)
         self.c1 = c1  # Cognitive coefficient
         self.c2 = c2  # Social coefficient
+        self.vmax = float(vmax)  # velocity clamp |v| <= Vmax
+        # Off-by-default non-1995 robustness heuristics (adaptive inertia/social
+        # gain, diversity injection, random immigrants, swarm restart).
+        self.enable_safeguards = bool(enable_safeguards)
         self.rng = np.random.default_rng(seed)
         
         # Initialize particles (each is a path with num_points waypoints)
@@ -398,16 +417,23 @@ class PSOPlanner(BasePlanner):
         prev_best_cost = self.g_best_cost
         prev_best_valid = self.g_best_is_valid
         valid_count = 0
-        progress = min(1.0, self.iteration / max(1, self.max_iters))
-        inertia = self.w_max - (self.w_max - self.w_min) * progress
-        valid_ratio = self.valid_particle_count / max(1, self.num_particles)
 
-        # Keep social pull very low while no valid particles exist.
-        if valid_ratio <= 0.0:
-            social_gain_dynamic = self.social_gain_when_invalid
-        elif valid_ratio < 0.25:
-            social_gain_dynamic = self.social_gain_when_invalid + (valid_ratio / 0.25) * (0.60 - self.social_gain_when_invalid)
+        if self.enable_safeguards:
+            # Non-1995: adaptive inertia (Shi & Eberhart 1998) and a social gain
+            # that stays low until valid paths exist.
+            progress = min(1.0, self.iteration / max(1, self.max_iters))
+            inertia = self.w_max - (self.w_max - self.w_min) * progress
+            valid_ratio = self.valid_particle_count / max(1, self.num_particles)
+            if valid_ratio <= 0.0:
+                social_gain_dynamic = self.social_gain_when_invalid
+            elif valid_ratio < 0.25:
+                social_gain_dynamic = self.social_gain_when_invalid + (valid_ratio / 0.25) * (0.60 - self.social_gain_when_invalid)
+            else:
+                social_gain_dynamic = 1.0
         else:
+            # Exact Kennedy & Eberhart (1995): constant momentum w (= 1.0) and the
+            # full social term -- v <- w*v + c1*r1*(pbest-x) + c2*r2*(gbest-x).
+            inertia = self.w_inertia
             social_gain_dynamic = 1.0
         
         # Update velocities and positions for each particle
@@ -420,9 +446,9 @@ class PSOPlanner(BasePlanner):
             social_gain = 1.0 if self.g_best_is_valid else social_gain_dynamic
             social = self.c2 * social_gain * r2 * (self.g_best - self.particles[i])
             self.velocities[i] = inertia * self.velocities[i] + cognitive + social
-            
-            # Clamp velocity
-            self.velocities[i] = np.clip(self.velocities[i], -20, 20)
+
+            # Clamp velocity to +/- Vmax (Kennedy & Eberhart 1995)
+            self.velocities[i] = np.clip(self.velocities[i], -self.vmax, self.vmax)
             self.velocities[i, 0] = 0  # Don't move start
             self.velocities[i, -1] = 0  # Don't move goal
             
@@ -467,14 +493,15 @@ class PSOPlanner(BasePlanner):
         else:
             self.zero_valid_iters = 0
 
-        if (not self.g_best_is_valid and self.iteration % 4 == 0) or (self.no_improve_iters >= self.stagnation_window):
-            self._inject_diversity()
-            if self.no_improve_iters >= self.stagnation_window:
-                self.no_improve_iters = 0
+        if self.enable_safeguards:
+            if (not self.g_best_is_valid and self.iteration % 4 == 0) or (self.no_improve_iters >= self.stagnation_window):
+                self._inject_diversity()
+                if self.no_improve_iters >= self.stagnation_window:
+                    self.no_improve_iters = 0
 
-        if self.zero_valid_iters >= self.zero_valid_restart_window:
-            self._restart_swarm_worst()
-            self.zero_valid_iters = 0
+            if self.zero_valid_iters >= self.zero_valid_restart_window:
+                self._restart_swarm_worst()
+                self.zero_valid_iters = 0
         
         # Check if best path is collision-free
         self.found_path = self.g_best_is_valid

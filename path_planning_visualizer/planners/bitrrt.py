@@ -166,7 +166,8 @@ class BiTRRTPlanner(BasePlanner):
 
         self.max_distance = float(max(1.0, range))
         self.temp_change_factor_param = float(temp_change_factor)
-        self.temp_change_multiplier = float(np.exp(temp_change_factor))
+        # Reject-step temperature increase T <- T * 2^(T_rate) (Alg. 2 line 6).
+        self.temp_change_multiplier = float(np.power(2.0, temp_change_factor))
         self.init_temperature = float(max(1e-6, init_temperature))
         self.temp = self.init_temperature
         self.max_iters = int(max_iters)
@@ -179,12 +180,14 @@ class BiTRRTPlanner(BasePlanner):
         self.cost_field = 100.0 / (1.0 + self.clearance_field.astype(np.float64))
 
         self.max_extent = float(np.hypot(max(1, self.w - 1), max(1, self.h - 1)))
+        # refinementControl threshold = the step size delta (Alg. 3 line 1).
         self.frontier_threshold = (
             float(frontier_threshold)
             if frontier_threshold > 0.0
-            else max(1e-6, 0.01 * self.max_extent)
+            else self.max_distance
         )
-        self.connection_range = max(1e-6, 0.10 * self.max_extent)
+        # attemptLink is only tried when the trees are within 10*delta (Alg. 5 line 1).
+        self.connection_range = max(1e-6, 10.0 * self.max_distance)
 
         start_cost = self._state_cost(start)
         goal_cost = self._state_cost(goal)
@@ -253,20 +256,24 @@ class BiTRRTPlanner(BasePlanner):
 
         transition_probability = float(np.exp(-motion_cost / max(self.temp, 1e-9)))
         if transition_probability > 0.5:
+            # Accept uphill: decrease T by 2^((c_j - c_i)/(0.1*costRange)) (Alg. 2 line 4).
             cost_range = self.worst_cost - self.best_cost
             if abs(cost_range) > 1e-4:
-                self.temp /= float(np.exp(motion_cost / (0.1 * cost_range)))
+                self.temp /= float(np.power(2.0, motion_cost / (0.1 * cost_range)))
             return True
 
         self.temp *= self.temp_change_multiplier
         return False
 
     def _min_expansion_control(self, distance_from_nearest: float) -> bool:
+        # refinementControl (Alg. 3): an extension shorter than delta is a refinement
+        # node; reject it once refinement nodes exceed rho * total nodes.
         if distance_from_nearest > self.frontier_threshold:
             self.frontier_count += 1
             return True
 
-        if (self.nonfrontier_count / max(1, self.frontier_count)) > self.frontier_node_ratio:
+        total = self.frontier_count + self.nonfrontier_count
+        if self.nonfrontier_count > self.frontier_node_ratio * total:
             return False
 
         self.nonfrontier_count += 1
@@ -314,20 +321,29 @@ class BiTRRTPlanner(BasePlanner):
         if dist(nearest_point, source_point) > self.connection_range:
             return False, [], None, None
 
+        # attemptLink (Alg. 5): extend the target tree toward source along flat/downhill
+        # slopes only (no transition test), merging if it reaches source.
         connect_edges: List[Edge] = []
         current_nearest_idx = nearest_idx
         while True:
-            result, new_idx, edge, rejected = self._extend_tree(
-                current_nearest_idx, target_motions, source_point, target_tree_is_start
+            q_near = target_motions[current_nearest_idx].point
+            reach = dist(q_near, source_point) <= self.max_distance
+            q_new = clamp_point(
+                source_point if reach else steer(q_near, source_point, self.max_distance),
+                self.w, self.h,
             )
-            if edge is not None:
-                connect_edges.append(edge)
-            if result == self.ADVANCED and new_idx is not None:
-                current_nearest_idx = new_idx
-                continue
-            if result == self.SUCCESS and new_idx is not None:
+            if q_new == q_near or not self.is_free(q_new):
+                return False, connect_edges, None, q_new
+            if not line_collision_free(q_near, q_new, self.occ):
+                return False, connect_edges, None, q_new
+            # Downhill-only junction (Alg. 5 line 3): reject if the cost increases.
+            if self._state_cost(q_new) > self._state_cost(q_near) + 1e-9:
+                return False, connect_edges, None, q_new
+            new_idx = self._add_motion(q_new, target_motions, current_nearest_idx)
+            connect_edges.append((q_near, q_new))
+            if reach:
                 return True, connect_edges, new_idx, None
-            return False, connect_edges, None, rejected
+            current_nearest_idx = new_idx
 
     def _backtrack_path(self, motions: List[BiTRRTMotion], index: int) -> List[Point]:
         path: List[Point] = []

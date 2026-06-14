@@ -6,7 +6,7 @@ from .rrt_connect import RRTConnectParamsWidget, RRTConnectPlanner
 from .bitrrt import BiTRRTParamsWidget, BiTRRTPlanner
 from .kpiece import KPIECEParamsWidget, KPIECEPlanner
 from .rrt_star import RRTStarParamsWidget, RRTStarPlanner
-from .prm import PRMParamsWidget, PRMPlanner
+from .prm import ClassicPRMPlanner, PRMParamsWidget, PRMPlanner
 from .sbl import SBLParamsWidget, SBLPlanner
 from .fmt_star import FMTStarParamsWidget, FMTStarPlanner
 from .bit_star import BITStarParamsWidget, BITStarPlanner
@@ -35,7 +35,7 @@ __all__ = [
     "BiTRRTParamsWidget", "BiTRRTPlanner",
     "KPIECEParamsWidget", "KPIECEPlanner",
     "RRTStarParamsWidget", "RRTStarPlanner",
-    "PRMParamsWidget", "PRMPlanner",
+    "PRMParamsWidget", "PRMPlanner", "ClassicPRMPlanner",
     "SBLParamsWidget", "SBLPlanner",
     "FMTStarParamsWidget", "FMTStarPlanner",
     "BITStarParamsWidget", "BITStarPlanner",

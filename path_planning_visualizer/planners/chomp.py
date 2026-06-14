@@ -16,6 +16,7 @@ from ..types import Point
 from ..geometry import (
     _resample_to_targets,
     bilinear_sample_scalar,
+    bilinear_sample_scalar_batch,
     bilinear_sample_vector,
     line_collision_free,
     make_distance_field,
@@ -44,8 +45,8 @@ class CHOMPParamsWidget(QWidget):
         self.spin_learning_rate = QDoubleSpinBox()
         self.spin_learning_rate.setRange(0.001, 10.0)
         self.spin_learning_rate.setSingleStep(0.1)
-        self.spin_learning_rate.setValue(1.0)
-        self.spin_learning_rate.setToolTip("Base step size for the covariant CHOMP update")
+        self.spin_learning_rate.setValue(0.3)
+        self.spin_learning_rate.setToolTip("Base step size (1/lambda) for the covariant CHOMP update; lower damps obstacle-term overshoot")
         
         self.spin_smoothness_weight = QDoubleSpinBox()
         self.spin_smoothness_weight.setRange(0.0, 100.0)
@@ -107,7 +108,7 @@ class CHOMPPlanner(BasePlanner):
     description = "Covariant trajectory optimization for a 2D point robot"
     
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                 num_points: int = 50, max_iters: int = 500, learning_rate: float = 1.0,
+                 num_points: int = 50, max_iters: int = 500, learning_rate: float = 0.3,
                  smoothness_weight: float = 1.0, obstacle_weight: float = 100.0,
                  obstacle_epsilon: int = 20, path_length_weight: float = 0.0,
                  init_trajectory: Optional[List[Tuple[int, int]]] = None):
@@ -139,6 +140,8 @@ class CHOMPPlanner(BasePlanner):
         self.total_cost = float('inf')
         self.obs_cost = float('inf')
         self.converged = False
+        self.iters_since_improvement = 0
+        self.stagnation_limit = 40  # stop if the best cost stalls (e.g. an obstacle-term limit cycle)
         self.best_trajectory = self.trajectory.copy()
         self.best_cost = float('inf')
         self.best_valid_trajectory: Optional[np.ndarray] = None
@@ -384,36 +387,63 @@ class CHOMPPlanner(BasePlanner):
         trajectory: np.ndarray,
         compute_gradients: bool,
     ) -> Tuple[float, np.ndarray, float, np.ndarray]:
-        """Return CHOMP obstacle/length functionals and their gradients."""
+        """Return CHOMP obstacle/length functionals and their gradients.
+
+        Vectorized over the free waypoints: this is the per-waypoint Ratliff (2009)
+        obstacle functional ``Sigma c(q)*||q_dot||`` with gradient
+        ``||q_dot|| * (P grad(c) - c * kappa)`` (``P = I - t t^T`` the velocity
+        projector, ``kappa`` the curvature) -- identical math to the original
+        per-waypoint loop, evaluated as array operations.
+        """
         n = len(trajectory)
-        obs_grad = np.zeros((max(0, n - 2), 2), dtype=np.float64)
-        length_grad = np.zeros_like(obs_grad)
-        obs_cost = 0.0
-        length_cost = 0.0
-        identity = np.eye(2, dtype=np.float64)
+        m = max(0, n - 2)
+        empty = np.zeros((m, 2), dtype=np.float64)
+        if m == 0:
+            return 0.0, empty, 0.0, empty.copy()
 
-        for i in range(1, n - 1):
-            q_prev = trajectory[i - 1]
-            q_curr = trajectory[i]
-            q_next = trajectory[i + 1]
+        q_prev = trajectory[:-2]
+        q_curr = trajectory[1:-1]
+        q_next = trajectory[2:]
 
-            velocity = 0.5 * (q_next - q_prev)
-            speed = float(np.linalg.norm(velocity))
-            speed_safe = max(speed, 1e-6)
-            tangent = velocity / speed_safe
-            projector = identity - np.outer(tangent, tangent)
-            acceleration = q_next - 2.0 * q_curr + q_prev
-            curvature = (projector @ acceleration) / (speed_safe ** 2)
+        velocity = 0.5 * (q_next - q_prev)
+        speed_safe = np.maximum(np.linalg.norm(velocity, axis=1), 1e-6)   # (m,)
+        tangent = velocity / speed_safe[:, None]                          # (m, 2)
 
-            workspace_cost, workspace_grad = self._workspace_cost_and_gradient(q_curr[0], q_curr[1])
-            obs_cost += workspace_cost * speed_safe
-            length_cost += speed_safe
+        # Workspace cost c(x) and its gradient at each waypoint (three-case form,
+        # Ratliff et al. 2009 Sec. II-D) over the signed distance field.
+        x, y = q_curr[:, 0], q_curr[:, 1]
+        distance = bilinear_sample_scalar_batch(self.dist_field, x, y)    # (m,)
+        dist_grad = np.stack(
+            (bilinear_sample_scalar_batch(self.grad_x, x, y),
+             bilinear_sample_scalar_batch(self.grad_y, x, y)),
+            axis=1,
+        )                                                                # (m, 2)
 
-            if not compute_gradients:
-                continue
+        epsilon = float(self.obstacle_epsilon)
+        cost = np.zeros(m, dtype=np.float64)
+        cost_grad = np.zeros((m, 2), dtype=np.float64)
+        inside = distance < 0.0
+        near = (~inside) & (distance <= epsilon)
+        cost[inside] = -distance[inside] + 0.5 * epsilon
+        cost_grad[inside] = -dist_grad[inside]
+        d_near = distance[near]
+        cost[near] = 0.5 * (d_near - epsilon) ** 2 / epsilon
+        cost_grad[near] = ((d_near - epsilon) / epsilon)[:, None] * dist_grad[near]
 
-            obs_grad[i - 1] = speed_safe * (projector @ workspace_grad - workspace_cost * curvature)
-            length_grad[i - 1] = -speed_safe * curvature
+        obs_cost = float(np.sum(cost * speed_safe))
+        length_cost = float(np.sum(speed_safe))
+
+        if not compute_gradients:
+            return obs_cost, empty, length_cost, empty.copy()
+
+        acceleration = q_next - 2.0 * q_curr + q_prev
+        # projector @ v = v - t (t . v), applied to acceleration and to grad(c).
+        proj_accel = acceleration - tangent * np.sum(tangent * acceleration, axis=1)[:, None]
+        curvature = proj_accel / (speed_safe ** 2)[:, None]
+        proj_grad = cost_grad - tangent * np.sum(tangent * cost_grad, axis=1)[:, None]
+
+        obs_grad = speed_safe[:, None] * (proj_grad - cost[:, None] * curvature)
+        length_grad = -speed_safe[:, None] * curvature
 
         return float(obs_cost), obs_grad, float(length_cost), length_grad
 
@@ -490,55 +520,41 @@ class CHOMPPlanner(BasePlanner):
             + self.path_length_weight * path_length_cost
         )
 
-        rhs = (
+        # CHOMP covariant gradient step (Ratliff et al. 2009, Sec. II-A):
+        #   xi <- xi - (1/lambda) A^-1 g,   g = grad(f_prior + f_obs).
+        # learning_rate plays the role of 1/lambda; a single total-step-norm cap is
+        # the only stability guard (no line search).
+        g = (
             self.smoothness_weight * smooth_grad
             + self.obstacle_weight * obs_grad
             + self.path_length_weight * length_grad
         )
-        preconditioned_grad = self._solve_metric(rhs)
-
-        accepted_update = np.zeros_like(preconditioned_grad)
+        accepted_update = np.zeros_like(g)
         accepted_total_cost = total_cost
         accepted_obs_cost = obs_cost
         accepted_smooth_cost = smooth_cost
 
         if self.num_free > 0:
-            best_candidate = self.trajectory.copy()
-            best_candidate_cost = total_cost
-            best_candidate_obs_cost = obs_cost
-            best_candidate_smooth_cost = smooth_cost
+            delta = -self.learning_rate * self._solve_metric(g)
+            delta_norm = float(np.linalg.norm(delta))
+            if delta_norm > 25.0:
+                delta *= 25.0 / delta_norm
 
-            for backtrack in range(8):
-                step_size = self.learning_rate * (0.5 ** backtrack)
-                delta = -step_size * preconditioned_grad
-                delta_norm = float(np.linalg.norm(delta))
-                if delta_norm > 25.0:
-                    delta *= 25.0 / delta_norm
+            self.trajectory[1:-1] += delta
+            self.trajectory[1:-1, 0] = np.clip(self.trajectory[1:-1, 0], 0, self.w - 1)
+            self.trajectory[1:-1, 1] = np.clip(self.trajectory[1:-1, 1], 0, self.h - 1)
 
-                candidate = self.trajectory.copy()
-                candidate[1:-1] += delta
-                candidate[1:-1, 0] = np.clip(candidate[1:-1, 0], 0, self.w - 1)
-                candidate[1:-1, 1] = np.clip(candidate[1:-1, 1], 0, self.h - 1)
-
-                candidate_total, candidate_obs, candidate_smooth, candidate_length = self._evaluate_trajectory(candidate)
-                if candidate_total < best_candidate_cost - 1e-9:
-                    best_candidate = candidate
-                    best_candidate_cost = candidate_total
-                    best_candidate_obs_cost = candidate_obs
-                    best_candidate_smooth_cost = candidate_smooth
-                    accepted_update = delta
-                    break
-
-            self.trajectory = best_candidate
-            accepted_total_cost = best_candidate_cost
-            accepted_obs_cost = best_candidate_obs_cost
-            accepted_smooth_cost = best_candidate_smooth_cost
+            accepted_update = delta
+            accepted_total_cost, accepted_obs_cost, accepted_smooth_cost, _ = self._evaluate_trajectory(self.trajectory)
 
         self.path_length = self._trajectory_length(self.trajectory)
 
-        if accepted_total_cost < self.best_cost:
+        if accepted_total_cost < self.best_cost - 1e-6:
             self.best_cost = accepted_total_cost
             self.best_trajectory = self.trajectory.copy()
+            self.iters_since_improvement = 0
+        else:
+            self.iters_since_improvement += 1
 
         path_improved = False
         if self.iteration % 5 == 0:
@@ -551,10 +567,12 @@ class CHOMPPlanner(BasePlanner):
         self.obs_cost = accepted_obs_cost
         self.smooth_cost = accepted_smooth_cost
 
+        step_settled = cost_change < 8e-4 or update_norm < 8e-3
+        stalled = self.iters_since_improvement >= self.stagnation_limit  # caught in a limit cycle
         if (
             self.iteration > 40
             and self.best_valid_trajectory is not None
-            and (cost_change < 8e-4 or update_norm < 8e-3)
+            and (step_settled or stalled)
         ):
             self.converged = True
             self.done = True

@@ -147,6 +147,41 @@ def bilinear_sample_vector(
     )
 
 
+def bilinear_sample_scalar_batch(
+    field: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+) -> np.ndarray:
+    """Bilinearly sample a 2D scalar field at many points at once.
+
+    Vectorized equivalent of :func:`bilinear_sample_scalar` (identical
+    interpolation, identical edge clamping) for arrays of coordinates. Used by the
+    trajectory optimizers' per-waypoint distance/gradient lookups.
+    """
+    h, w = field.shape
+    xs = np.clip(np.asarray(xs, dtype=np.float64), 0.0, w - 1)
+    ys = np.clip(np.asarray(ys, dtype=np.float64), 0.0, h - 1)
+
+    x0 = np.floor(xs).astype(np.intp)
+    y0 = np.floor(ys).astype(np.intp)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    tx = xs - x0
+    ty = ys - y0
+
+    v00 = field[y0, x0]
+    v10 = field[y0, x1]
+    v01 = field[y1, x0]
+    v11 = field[y1, x1]
+
+    return (
+        (1.0 - tx) * (1.0 - ty) * v00
+        + tx * (1.0 - ty) * v10
+        + (1.0 - tx) * ty * v01
+        + tx * ty * v11
+    )
+
+
 def segment_points(a: Point, b: Point, samples: Optional[int] = None) -> List[Point]:
     """Return rasterized sample points along a segment.
 

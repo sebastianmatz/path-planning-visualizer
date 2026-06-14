@@ -129,7 +129,7 @@ class BITStarPlanner(BasePlanner):
 
         # Ordered search queues
         self.Q_V: List[Tuple[float, int, int]] = []
-        self.Q_E: List[Tuple[float, int, int, int, int]] = []
+        self.Q_E: List[Tuple[float, float, int, int, int, int]] = []
         self._queue_counter = 0
         self.vertex_expanded_batch: Dict[int, int] = {}
 
@@ -147,6 +147,9 @@ class BITStarPlanner(BasePlanner):
         self.user_radius = rewire_radius
         self.r = self._compute_radius(rewire_radius)
         self.edge_collision_checks = 0
+        # Snapshot of |V| at batch start: only vertices new in the batch enqueue
+        # vertex-vertex (rewiring) edges (Alg. 2 line 4).
+        self.v_old_count = len(self.V)
         self._new_batch()
     
     def _rotation_to_world(self) -> np.ndarray:
@@ -245,7 +248,12 @@ class BITStarPlanner(BasePlanner):
 
     def _push_edge(self, key: float, parent_idx: int, target_kind: int, target_idx: int) -> None:
         self._queue_counter += 1
-        heapq.heappush(self.Q_E, (key, self._queue_counter, parent_idx, target_kind, target_idx))
+        # Tie-break by the source vertex cost-to-come g_T(v) (Alg. 1 line 12),
+        # then insertion order.
+        heapq.heappush(
+            self.Q_E,
+            (key, self._g_hat(parent_idx), self._queue_counter, parent_idx, target_kind, target_idx),
+        )
 
     def _iter_active_samples(self):
         for idx, sample in enumerate(self.X_samples):
@@ -344,8 +352,8 @@ class BITStarPlanner(BasePlanner):
                 heapq.heappush(new_qv, (self._vertex_key(v_idx), self._queue_counter, v_idx))
         self.Q_V = new_qv
 
-        new_qe: List[Tuple[float, int, int, int, int]] = []
-        for _, _, parent_idx, target_kind, target_idx in self.Q_E:
+        new_qe: List[Tuple[float, float, int, int, int, int]] = []
+        for _, _, _, parent_idx, target_kind, target_idx in self.Q_E:
             if target_kind == 0:
                 if target_idx >= len(self.X_samples) or self.X_samples[target_idx] is None:
                     continue
@@ -356,12 +364,22 @@ class BITStarPlanner(BasePlanner):
                 key = self._edge_key(parent_idx, self.V[target_idx])
             if key < self.best_cost:
                 self._queue_counter += 1
-                heapq.heappush(new_qe, (key, self._queue_counter, parent_idx, target_kind, target_idx))
+                heapq.heappush(
+                    new_qe,
+                    (key, self._g_hat(parent_idx), self._queue_counter, parent_idx, target_kind, target_idx),
+                )
         self.Q_E = new_qe
     
     def _new_batch(self):
-        """Add a new batch of samples."""
+        """Add a new batch of samples (Alg. 1 lines 4-9)."""
         self.batch_count += 1
+
+        # Alg. 1 line 5: prune samples/edges that cannot improve the incumbent.
+        self._prune()
+
+        # Alg. 1 line 7: V_old <- V. Only vertices added during this batch will
+        # enqueue vertex-vertex (rewiring) edges in ExpandVertex (Alg. 2 line 4).
+        self.v_old_count = len(self.V)
 
         for _ in range(self.batch_size):
             x_new = self._sample_free()
@@ -392,15 +410,18 @@ class BITStarPlanner(BasePlanner):
             if f_est < self.best_cost:
                 self._push_edge(f_est, v_idx, 0, x_idx)
 
-        for w_idx, dist_vw in self._near_vertices(v_idx):
-            if self._is_ancestor(w_idx, v_idx):
-                continue
-            g_new = g_v + dist_vw
-            if g_new + self._h_hat(self.V[w_idx]) >= self.best_cost:
-                continue
-            if g_new + 1e-9 >= self.g_cost.get(w_idx, float('inf')):
-                continue
-            self._push_edge(g_new + self._h_hat(self.V[w_idx]), v_idx, 1, w_idx)
+        # Alg. 2 line 4: only vertices added in this batch enqueue vertex-vertex
+        # (rewiring) edges; old-old pairs were already considered in earlier batches.
+        if v_idx >= self.v_old_count:
+            for w_idx, dist_vw in self._near_vertices(v_idx):
+                if self._is_ancestor(w_idx, v_idx):
+                    continue
+                g_new = g_v + dist_vw
+                if g_new + self._h_hat(self.V[w_idx]) >= self.best_cost:
+                    continue
+                if g_new + 1e-9 >= self.g_cost.get(w_idx, float('inf')):
+                    continue
+                self._push_edge(g_new + self._h_hat(self.V[w_idx]), v_idx, 1, w_idx)
     
     def _is_goal(self, x: np.ndarray) -> bool:
         """Check if x is the goal."""
@@ -438,7 +459,7 @@ class BITStarPlanner(BasePlanner):
                 self._new_batch()
                 return StepResult()
 
-            _, _, parent_idx, target_kind, target_idx = heapq.heappop(self.Q_E)
+            _, _, _, parent_idx, target_kind, target_idx = heapq.heappop(self.Q_E)
             if parent_idx >= len(self.V):
                 continue
 
@@ -539,7 +560,7 @@ class BITStarPlanner(BasePlanner):
     def _best_edge_cost(self) -> float:
         """Get the best potential cost in edge queue."""
         while self.Q_E:
-            key, _, parent_idx, target_kind, target_idx = self.Q_E[0]
+            key, _, _, parent_idx, target_kind, target_idx = self.Q_E[0]
             if parent_idx >= len(self.V):
                 heapq.heappop(self.Q_E)
                 continue

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -11,150 +11,143 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..geometry import (
-    line_collision_free,
-    make_distance_field,
-)
-from ._trajectory import straight_line, escape_init, fd_acceleration_matrix
+from ..geometry import line_collision_free
+from ._trajectory import straight_line, escape_init, fd_acceleration_matrix, signed_distance_field
 from .base import BasePlanner, StepResult
 
 
 class STOMPParamsWidget(QWidget):
     """Parameters widget for STOMP planner."""
-    
+
     def __init__(self):
         super().__init__()
         layout = QFormLayout()
-        
+
         self.spin_num_points = QSpinBox()
         self.spin_num_points.setRange(10, 200)
         self.spin_num_points.setValue(50)
         self.spin_num_points.setToolTip("Number of waypoints in trajectory")
-        
+
         self.spin_max_iters = QSpinBox()
         self.spin_max_iters.setRange(10, 20000)
         self.spin_max_iters.setValue(500)
         self.spin_max_iters.setToolTip("Maximum optimization iterations")
-        
+
         self.spin_num_rollouts = QSpinBox()
         self.spin_num_rollouts.setRange(5, 100)
         self.spin_num_rollouts.setValue(20)
-        self.spin_num_rollouts.setToolTip("Number of noisy trajectory samples per iteration")
-        
+        self.spin_num_rollouts.setToolTip("Number K of noisy trajectory rollouts per iteration")
+
         self.spin_noise_std = QDoubleSpinBox()
         self.spin_noise_std.setRange(0.1, 50.0)
         self.spin_noise_std.setSingleStep(1.0)
         self.spin_noise_std.setValue(10.0)
-        self.spin_noise_std.setToolTip("Standard deviation of exploration noise")
-        
-        self.spin_smoothness_weight = QDoubleSpinBox()
-        self.spin_smoothness_weight.setRange(0.0, 100.0)
-        self.spin_smoothness_weight.setSingleStep(0.1)
-        self.spin_smoothness_weight.setValue(0.1)
-        self.spin_smoothness_weight.setToolTip("Weight for smoothness cost")
-        
-        self.spin_obstacle_weight = QDoubleSpinBox()
-        self.spin_obstacle_weight.setRange(0.0, 1000.0)
-        self.spin_obstacle_weight.setSingleStep(10.0)
-        self.spin_obstacle_weight.setValue(100.0)
-        self.spin_obstacle_weight.setToolTip("Weight for obstacle cost")
-        
-        self.spin_temperature = QDoubleSpinBox()
-        self.spin_temperature.setRange(0.1, 100.0)
-        self.spin_temperature.setSingleStep(1.0)
-        self.spin_temperature.setValue(10.0)
-        self.spin_temperature.setToolTip("Temperature for probability weighting (lower = more greedy)")
+        self.spin_noise_std.setToolTip("Magnitude of the exploration noise (the only open STOMP parameter)")
+
+        self.spin_epsilon = QDoubleSpinBox()
+        self.spin_epsilon.setRange(0.0, 100.0)
+        self.spin_epsilon.setSingleStep(1.0)
+        self.spin_epsilon.setValue(10.0)
+        self.spin_epsilon.setToolTip("Obstacle clearance margin epsilon in the cost max(eps - d, 0) (Eq. 13)")
+
+        self.spin_h = QDoubleSpinBox()
+        self.spin_h.setRange(1.0, 100.0)
+        self.spin_h.setSingleStep(1.0)
+        self.spin_h.setValue(10.0)
+        self.spin_h.setToolTip("Cost sensitivity h in the probability exponent (Eq. 11; paper uses 10)")
 
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(0, 10_000_000)
         self.spin_seed.setValue(42)
         self.spin_seed.setToolTip("Random seed for reproducibility")
-        
+
         layout.addRow("Waypoints:", self.spin_num_points)
         layout.addRow("Max iterations:", self.spin_max_iters)
-        layout.addRow("Num rollouts:", self.spin_num_rollouts)
+        layout.addRow("Num rollouts (K):", self.spin_num_rollouts)
         layout.addRow("Noise std:", self.spin_noise_std)
-        layout.addRow("Smoothness weight:", self.spin_smoothness_weight)
-        layout.addRow("Obstacle weight:", self.spin_obstacle_weight)
-        layout.addRow("Temperature:", self.spin_temperature)
+        layout.addRow("Clearance margin (eps):", self.spin_epsilon)
+        layout.addRow("Cost sensitivity (h):", self.spin_h)
         layout.addRow("Seed:", self.spin_seed)
-        
+
         self.setLayout(layout)
-    
+
     def get_params(self) -> dict:
         return {
             'num_points': self.spin_num_points.value(),
             'max_iters': self.spin_max_iters.value(),
             'num_rollouts': self.spin_num_rollouts.value(),
             'noise_std': self.spin_noise_std.value(),
-            'smoothness_weight': self.spin_smoothness_weight.value(),
-            'obstacle_weight': self.spin_obstacle_weight.value(),
-            'temperature': self.spin_temperature.value(),
+            'epsilon': self.spin_epsilon.value(),
+            'h': self.spin_h.value(),
             'seed': self.spin_seed.value(),
         }
 
 
 class STOMPPlanner(BasePlanner):
-    """STOMP - Stochastic Trajectory Optimization for Motion Planning.
-    
-    Uses stochastic sampling to optimize trajectories:
-    1. Generate K noisy trajectories by adding Gaussian noise
-    2. Evaluate cost of each trajectory
-    3. Compute probability-weighted average of updates
-    4. Update trajectory with weighted combination
+    """STOMP - Stochastic Trajectory Optimization for Motion Planning (Kalakrishnan et al. 2011).
+
+    Faithful 2D point-robot specialization of the Table I algorithm:
+
+    1. sample ``K`` noisy rollouts ``theta + eps``, ``eps ~ N(0, R^-1)``;
+    2. per-timestep state cost ``S = q_o`` and per-timestep probabilities from the
+       paper's exponent ``exp(-h (S - min)/(max - min))`` (Eq. 11);
+    3. probability-weighted noise per timestep, projected with ``M`` (R^-1 scaled
+       so each column's max is 1/N) to keep updates smooth and endpoints fixed;
+    4. obstacle cost ``q_o = max(eps - d, 0) * ||x_dot||`` on a signed distance
+       field (Eq. 13); the convergence metric is ``Q = sum q + 1/2 theta^T R theta``.
     """
-    
+
     name = "STOMP"
     description = "Stochastic Trajectory Optimization for Motion Planning (Kalakrishnan et al. 2011)"
-    
+
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                 num_points: int = 50, max_iters: int = 300, num_rollouts: int = 20,
-                 noise_std: float = 10.0, smoothness_weight: float = 0.1,
-                 obstacle_weight: float = 100.0, temperature: float = 10.0, seed: int = 42):
+                 num_points: int = 50, max_iters: int = 500, num_rollouts: int = 20,
+                 noise_std: float = 10.0, epsilon: float = 10.0, h: float = 10.0, seed: int = 42):
         super().__init__(occ, start, goal)
-        
+
         self.num_points = num_points
         self.max_iters = max_iters
         self.num_rollouts = num_rollouts
         self.noise_std = noise_std
-        self.smoothness_weight = smoothness_weight
-        self.obstacle_weight = obstacle_weight
-        self.temperature = temperature
-        
-        # Random generator
+        self.epsilon = float(epsilon)
+        self.cost_h = float(h)  # cost sensitivity (named to avoid shadowing BasePlanner's grid height self.h)
+
         self.rng = np.random.default_rng(seed)
-        
-        # Compute distance field from obstacles
-        self.dist_field = self._compute_distance_field()
-        
-        # Initialize trajectory with collision-avoiding initialization
-        self.trajectory = self._initialize_trajectory()
-        
-        # Track optimization state
+
+        # Signed distance field: negative inside obstacles, positive in free space.
+        self.sdf = signed_distance_field(self.occ)
+
+        # Straight-line init, bent off obstacles if it collides.
+        self.trajectory = escape_init(
+            straight_line(self.start, self.goal, self.num_points), self.start, self.goal, self.occ
+        )
+
+        # Control matrices: R = A^T A, noise covariance R^-1, and the M projection.
+        self._compute_smoothing_matrix()
+
+        # Optimization state.
         self.total_cost = float('inf')
         self.obs_cost = float('inf')
         self.smooth_cost = 0.0
         self.converged = False
-        self.best_trajectory = self.trajectory.copy()
+        self.best_traj = self.trajectory.copy()
         self.best_cost = float('inf')
-        
-        # Pre-compute smoothing matrix (finite difference matrix for acceleration)
-        self._compute_smoothing_matrix()
-    
-    def _compute_distance_field(self) -> np.ndarray:
-        """Compute distance field from obstacles."""
-        return make_distance_field(self.occ)
-    
-    def _compute_smoothing_matrix(self):
-        """Pre-compute the STOMP control matrices (Kalakrishnan et al. 2011).
+        self.best_valid_traj: Optional[np.ndarray] = None
+        self.best_valid_cost = float('inf')
+        self.stall = 0
+        self.patience = 40
 
-        ``R = AᵀA`` is the finite-difference acceleration (control) cost metric.
-        ``R⁻¹`` is the noise covariance, so exploration noise is smooth and keeps
-        the endpoints fixed.  ``M`` is ``R⁻¹`` with each column scaled so its
-        largest element is ``1/N``; multiplying the per-timestep update by ``M``
-        keeps the trajectory smooth while leaving the endpoints unchanged.
-        """
-        n = self.num_points - 2  # Internal points only
+        q0, obs0, ctrl0 = self._compute_trajectory_cost(self.trajectory)
+        self.total_cost, self.obs_cost, self.smooth_cost = q0, obs0, ctrl0
+        self.best_cost = q0
+        if self._is_collision_free(self.trajectory):
+            self.best_valid_traj = self.trajectory.copy()
+            self.best_valid_cost = q0
+            self.found_path = True
+
+    def _compute_smoothing_matrix(self):
+        """Precompute R = A^T A, the noise covariance R^-1, and the M projection."""
+        n = self.num_points - 2  # internal points only
         if n <= 0:
             self.R = np.eye(1)
             self.R_inv = np.eye(1)
@@ -166,177 +159,152 @@ class STOMPPlanner(BasePlanner):
         self.R = A.T @ A + 1e-6 * np.eye(n)
         self.R_inv = np.linalg.inv(self.R)
 
-        # M: scale each column of R_inv so its maximum element equals 1/N.
+        # M: scale each column of R_inv so its largest element equals 1/N.
         col_max = np.max(np.abs(self.R_inv), axis=0, keepdims=True)
         self.M = self.R_inv / (n * (col_max + 1e-12))
 
-        # Cholesky factor of the (SPD) noise covariance R_inv, so that
-        # L @ z (z ~ N(0, I)) is distributed as N(0, R_inv).
+        # Cholesky factor of R_inv: L @ z (z ~ N(0, I)) ~ N(0, R_inv).
         self.noise_factor = np.linalg.cholesky(self.R_inv)
-    
-    def _initialize_trajectory(self) -> np.ndarray:
-        """Straight-line init, bent off obstacles if it collides."""
-        trajectory = straight_line(self.start, self.goal, self.num_points)
-        return escape_init(trajectory, self.start, self.goal, self.occ)
-    
-    def _compute_trajectory_cost(self, traj: np.ndarray) -> Tuple[float, float, float]:
-        """Compute total cost of a trajectory."""
+
+    def _state_cost_along(self, traj: np.ndarray) -> np.ndarray:
+        """Per-timestep obstacle cost q_o = max(eps - d, 0) * ||x_dot|| (Eq. 13).
+
+        Returns one value per interior waypoint (signed distance d; ``r_b = 0``).
+        """
         n = len(traj)
-        
-        # Obstacle cost
-        obs_cost = 0.0
-        for i in range(n):
-            x = int(np.clip(traj[i, 0], 0, self.w - 1))
-            y = int(np.clip(traj[i, 1], 0, self.h - 1))
-            
-            # High cost inside obstacles
-            if self.occ[y, x] > 0:
-                obs_cost += 1000.0
-            else:
-                # Cost increases near obstacles
-                dist = self.dist_field[y, x]
-                if dist < 10:
-                    obs_cost += (10 - dist) ** 2
-        
-        # Smoothness cost (sum of squared accelerations)
-        smooth_cost = 0.0
-        for i in range(1, n - 1):
-            accel_x = traj[i+1, 0] - 2 * traj[i, 0] + traj[i-1, 0]
-            accel_y = traj[i+1, 1] - 2 * traj[i, 1] + traj[i-1, 1]
-            smooth_cost += accel_x ** 2 + accel_y ** 2
-        
-        # Normalize
-        obs_cost /= n
-        smooth_cost /= max(1, n - 2)
-        
-        total = self.obstacle_weight * obs_cost + self.smoothness_weight * smooth_cost
-        return total, obs_cost, smooth_cost
-    
-    def _compute_point_cost(self, x: float, y: float) -> float:
-        """Compute cost at a single point."""
-        ix = int(np.clip(x, 0, self.w - 1))
-        iy = int(np.clip(y, 0, self.h - 1))
-        
-        if self.occ[iy, ix] > 0:
-            return 1000.0
-        
-        dist = self.dist_field[iy, ix]
-        if dist < 10:
-            return (10 - dist) ** 2
-        return 0.0
-    
+        idx = np.arange(1, n - 1)
+        xs = np.clip(traj[idx, 0], 0, self.w - 1).astype(np.intp)
+        ys = np.clip(traj[idx, 1], 0, self.h - 1).astype(np.intp)
+        d = self.sdf[ys, xs]
+        hinge = np.maximum(self.epsilon - d, 0.0)
+        velocity = np.linalg.norm((traj[idx + 1] - traj[idx - 1]) * 0.5, axis=1)
+        return hinge * velocity
+
+    def _probabilities(self, S: np.ndarray) -> np.ndarray:
+        """Per-timestep rollout probabilities P(theta_k, i) from Eq. 11.
+
+        ``S`` is ``(K, n_internal)``; returns probabilities of the same shape that
+        sum to one over the K rollouts at each timestep. Uniform where costs tie.
+        """
+        s_min = np.min(S, axis=0, keepdims=True)
+        s_max = np.max(S, axis=0, keepdims=True)
+        denom = np.where((s_max - s_min) > 1e-10, s_max - s_min, 1.0)
+        exponent = -self.cost_h * (S - s_min) / denom
+        P = np.exp(exponent)
+        return P / np.sum(P, axis=0, keepdims=True)
+
+    def _compute_trajectory_cost(self, traj: np.ndarray) -> Tuple[float, float, float]:
+        """Q = sum_i q_o(theta_i) + 1/2 theta^T R theta (Eq. 1 / Table I step 6)."""
+        obs = float(np.sum(self._state_cost_along(traj)))
+        accel = traj[2:] - 2.0 * traj[1:-1] + traj[:-2]
+        control = 0.5 * float(np.sum(accel * accel))
+        return obs + control, obs, control
+
+    def _is_collision_free(self, traj: np.ndarray) -> bool:
+        for i in range(len(traj) - 1):
+            p1 = (int(traj[i, 0]), int(traj[i, 1]))
+            p2 = (int(traj[i + 1, 0]), int(traj[i + 1, 1]))
+            if not line_collision_free(p1, p2, self.occ):
+                return False
+        return True
+
     def step_once(self) -> StepResult:
         if self.done:
             return StepResult(done=True, found_path=self.found_path)
-        
-        if self.iteration >= self.max_iters:
-            self.done = True
-            self.trajectory = self.best_trajectory.copy()
-            self._check_path_validity()
-            return StepResult(done=True, found_path=self.found_path)
-        
-        self.iteration += 1
-        
+
         n = self.num_points
-        n_internal = n - 2  # Only internal points are modified
-        
+        n_internal = n - 2
         if n_internal <= 0:
             self.done = True
             return StepResult(done=True, found_path=False)
-        
+
+        if self.iteration >= self.max_iters:
+            self._finalize()
+            self.done = True
+            return StepResult(done=True, found_path=self.found_path)
+
+        self.iteration += 1
         K = self.num_rollouts
 
-        # Annealed exploration magnitude (keeps the STOMP structure intact).
-        scale = self.noise_std * (1.0 - 0.5 * self.iteration / self.max_iters)
-
-        # Smooth, endpoint-preserving exploration noise: eps ~ N(0, scale^2 R^-1)
-        # sampled per axis via the cached Cholesky factor of R^-1.
+        # Smooth, endpoint-preserving exploration noise eps ~ N(0, noise_std^2 R^-1),
+        # sampled per axis via the cached Cholesky factor (fixed magnitude, per paper).
         z = self.rng.standard_normal((K, n_internal, 2))
         eps = np.empty_like(z)
         for k in range(K):
-            eps[k, :, 0] = scale * (self.noise_factor @ z[k, :, 0])
-            eps[k, :, 1] = scale * (self.noise_factor @ z[k, :, 1])
+            eps[k, :, 0] = self.noise_std * (self.noise_factor @ z[k, :, 0])
+            eps[k, :, 1] = self.noise_std * (self.noise_factor @ z[k, :, 1])
 
-        # Per-timestep state cost S[k, i] of each noisy rollout.
+        # Noisy rollouts (interior perturbed, endpoints fixed) and their per-timestep cost.
         S = np.zeros((K, n_internal))
         for k in range(K):
-            for i in range(n_internal):
-                x = self.trajectory[i + 1, 0] + eps[k, i, 0]
-                y = self.trajectory[i + 1, 1] + eps[k, i, 1]
-                S[k, i] = self._compute_point_cost(x, y)
+            noisy = self.trajectory.copy()
+            noisy[1:-1] += eps[k]
+            noisy[:, 0] = np.clip(noisy[:, 0], 0, self.w - 1)
+            noisy[:, 1] = np.clip(noisy[:, 1], 0, self.h - 1)
+            S[k] = self._state_cost_along(noisy)
 
-        # Per-timestep probabilities: softmax over rollouts at each waypoint.
-        S_min = np.min(S, axis=0, keepdims=True)
-        exp_S = np.exp(-(S - S_min) / self.temperature)
-        P = exp_S / (np.sum(exp_S, axis=0, keepdims=True) + 1e-10)  # (K, n_internal)
-
-        # Probability-weighted noise per timestep, then project with M so the
-        # update stays smooth and leaves the endpoints fixed.
+        # Per-timestep probabilities (Eq. 11), probability-weighted noise, M projection.
+        P = self._probabilities(S)
         delta_tilde = np.zeros((n_internal, 2))
         for dim in range(2):
             delta_tilde[:, dim] = np.sum(P * eps[:, :, dim], axis=0)
         delta = self.M @ delta_tilde
 
-        # Update interior waypoints and clamp to bounds.
         self.trajectory[1:-1] += delta
         self.trajectory[:, 0] = np.clip(self.trajectory[:, 0], 0, self.w - 1)
         self.trajectory[:, 1] = np.clip(self.trajectory[:, 1], 0, self.h - 1)
-        
-        # Compute current cost
+
+        # Convergence metric Q and best-trajectory bookkeeping.
         self.total_cost, self.obs_cost, self.smooth_cost = self._compute_trajectory_cost(self.trajectory)
-        
-        # Track best
         if self.total_cost < self.best_cost:
             self.best_cost = self.total_cost
-            self.best_trajectory = self.trajectory.copy()
-        
-        # Check path validity periodically
+            self.best_traj = self.trajectory.copy()
+
         path_improved = False
-        if self.iteration % 5 == 0 or self.obs_cost < 1.0:
-            old_found = self.found_path
-            self._check_path_validity()
-            if self.found_path and not old_found:
-                path_improved = True
-                self.best_trajectory = self.trajectory.copy()
-        
-        # Check convergence
-        if self.obs_cost < 0.5 and self.iteration > 20:
-            # Verify path is valid
-            self._check_path_validity()
-            if self.found_path:
-                self.converged = True
-                self.done = True
-        
-        # Create edge for visualization (point_idx is always in [0, n-2]).
+        if self._is_collision_free(self.trajectory):
+            if self.best_valid_traj is None or self.total_cost < self.best_valid_cost - 1e-9:
+                self.best_valid_traj = self.trajectory.copy()
+                self.best_valid_cost = self.total_cost
+                path_improved = not self.found_path
+                self.found_path = True
+                self.stall = 0
+            else:
+                self.stall += 1
+        else:
+            self.stall += 1
+
+        # Converge once a valid trajectory has stopped improving (Q stabilized).
+        if self.found_path and self.iteration > 20 and self.stall > self.patience:
+            self.converged = True
+            self._finalize()
+            self.done = True
+
+        # Visualization edge.
         point_idx = self.iteration % (n - 1)
         p1 = (int(self.trajectory[point_idx, 0]), int(self.trajectory[point_idx, 1]))
         p2 = (int(self.trajectory[point_idx + 1, 0]), int(self.trajectory[point_idx + 1, 1]))
-        edge = (p1, p2)
-        
-        return StepResult(edge=edge, path_improved=path_improved)
-    
-    def _check_path_validity(self):
-        """Check if current trajectory is collision-free."""
-        for i in range(len(self.trajectory) - 1):
-            p1 = (int(self.trajectory[i, 0]), int(self.trajectory[i, 1]))
-            p2 = (int(self.trajectory[i + 1, 0]), int(self.trajectory[i + 1, 1]))
-            if not line_collision_free(p1, p2, self.occ):
-                self.found_path = False
-                return
-        self.found_path = True
-    
+        return StepResult(edge=(p1, p2), path_improved=path_improved)
+
+    def _finalize(self):
+        """Return the best collision-free rollout result (or the lowest-cost one)."""
+        if self.best_valid_traj is not None:
+            self.trajectory = self.best_valid_traj.copy()
+            self.found_path = True
+        else:
+            self.trajectory = self.best_traj.copy()
+            self.found_path = self._is_collision_free(self.trajectory)
+
     def extract_path(self) -> List[Tuple[int, int]]:
-        """Extract current trajectory as path."""
         return [(int(p[0]), int(p[1])) for p in self.trajectory]
-    
+
     def get_status(self) -> str:
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
-        return f"STOMP: iter {self.iteration}/{self.max_iters}, obs: {self.obs_cost:.1f}, smooth: {self.smooth_cost:.1f}, {status}"
-    
+        return f"STOMP: iter {self.iteration}/{self.max_iters}, obs: {self.obs_cost:.1f}, ctrl: {self.smooth_cost:.1f}, {status}"
+
     @staticmethod
     def get_params_widget() -> QWidget:
         return STOMPParamsWidget()
-    
+
     @staticmethod
     def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                           params_widget: QWidget) -> 'STOMPPlanner':

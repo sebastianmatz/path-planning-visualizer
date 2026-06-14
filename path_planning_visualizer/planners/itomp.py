@@ -91,11 +91,11 @@ class ITOMPPlanner(BasePlanner):
         self.replan_interval = max(1, replan_interval)
         self.learning_rate = learning_rate
         self.epsilon = 14.0
-        self.obstacle_weight = 8.0
+        self.obstacle_weight = 50.0
         self.smooth_weight = 0.1
 
-        # SDF and gradient.
-        self.dist_field, self.grad_x, self.grad_y = make_sdf(self.occ)
+        # True signed distance field and gradient (negative inside obstacles; Eq. 8).
+        self.dist_field, self.grad_x, self.grad_y = make_sdf(self.occ, signed=True)
 
         # Straight-line init, bent off obstacles if it collides.
         self.trajectory = escape_init(
@@ -121,6 +121,19 @@ class ITOMPPlanner(BasePlanner):
         self.total_cost = float('inf')
         self._check_path_validity()
 
+    def _static_obstacle_cost(self) -> float:
+        """ITOMP static obstacle cost (Eq. 8): sum of max(eps - d, 0) * ||x_dot||."""
+        full = self.trajectory
+        total = 0.0
+        for j in range(self.n_int):
+            d, _ = sdf_query(self.dist_field, self.grad_x, self.grad_y,
+                             full[j + 1, 0], full[j + 1, 1])
+            hinge = max(self.epsilon - d, 0.0)
+            if hinge > 0.0:
+                vel = (full[j + 2] - full[j]) * 0.5
+                total += hinge * float(np.linalg.norm(vel))
+        return total
+
     def step_once(self) -> StepResult:
         if self.done:
             return StepResult(done=True, found_path=self.found_path)
@@ -139,13 +152,18 @@ class ITOMPPlanner(BasePlanner):
         if active:
             idx = np.array(active)
 
-            # Obstacle gradient (push away from obstacles where d < epsilon).
+            # Obstacle cost gradient: ITOMP Eq. 8 hinge max(eps - d, 0) * ||x_dot||
+            # on the signed distance d. The gradient of the (linear) hinge where it
+            # is active (d < eps) is -||x_dot|| * grad(d), pushing away from obstacles.
+            full = self.trajectory
             g = np.zeros((self.n_int, 2), dtype=np.float64)
             for j in active:
                 d, normal = sdf_query(self.dist_field, self.grad_x, self.grad_y,
                                       theta[j, 0], theta[j, 1])
                 if d < self.epsilon:
-                    g[j] = -self.obstacle_weight * (self.epsilon - d) * normal
+                    vel = (full[j + 2] - full[j]) * 0.5  # workspace velocity at interior point j
+                    vmag = float(np.linalg.norm(vel))
+                    g[j] = -self.obstacle_weight * vmag * normal
 
             # Smoothness gradient (acceleration energy).
             accel = self.A @ theta + self.c

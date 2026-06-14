@@ -152,11 +152,20 @@ class FMTStarPlanner(BasePlanner):
             heapq.heappop(self.open_heap)
 
         if not self.open_heap:
+            # Alg. 1 line 9.1: V_open empty -> report failure.
             self.done = True
             return StepResult(done=True, found_path=False)
-        
+
         _, z = heapq.heappop(self.open_heap)
-        
+
+        # Alg. 1 line 9.2: terminate when the lowest-cost node in V_open is the
+        # goal (the goal is connected like any other sample; its cost is final
+        # once it enters V_open, so popping it returns the unique optimal path).
+        if z == self.goal_idx:
+            self.found_path = True
+            self.done = True
+            return StepResult(done=True, found_path=True)
+
         z_neighbors = self._neighbors_in_set(z, self.V_unvisited)
 
         edges: List[Edge] = []
@@ -195,14 +204,11 @@ class FMTStarPlanner(BasePlanner):
             heapq.heappush(self.open_heap, (self.cost[x], x))
 
         # In FMT*, z stays in the open wavefront while its neighbors are
-        # processed, then moves to closed after the batch update.
+        # processed, then moves to closed after the batch update. The goal is
+        # connected like any other sample; termination happens when it is later
+        # popped as the lowest-cost node in V_open (handled at the top).
         self.V_open.remove(z)
         self.V_closed.add(z)
-
-        if self.goal_idx in H_new:
-            self.found_path = True
-            self.done = True
-            return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if edges else None, done=True, found_path=True)
 
         return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if edges else None)
     

@@ -3,9 +3,9 @@
 [![CI](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml/badge.svg)](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Status](https://img.shields.io/badge/status-beta%20(0.1.0b8)-orange)
+![Status](https://img.shields.io/badge/status-beta%20(0.1.0b9)-orange)
 
-An interactive desktop application for **exploring, comparing, and tuning path-planning algorithms** for a 2D point robot on occupancy-grid maps. It bundles 19 planners — sampling-based, graph-search, potential-field, trajectory-optimization, and metaheuristic — behind one UI, with step-through visualization, live path metrics, an interactive map editor, and a reproducible headless benchmark.
+An interactive desktop application for **exploring, comparing, and tuning path-planning algorithms** for a 2D point robot on occupancy-grid maps. It bundles 20 planners — sampling-based, graph-search, potential-field, trajectory-optimization, and metaheuristic — behind one UI, with step-through visualization, live path metrics, an interactive map editor, and a reproducible headless benchmark.
 
 It is built as a **teaching and visualization environment**: each planner follows the defining mechanism of its source paper, adapted to a 2D occupancy grid, with the adaptations stated explicitly (see [Scientific scope](#scientific-scope)).
 
@@ -60,24 +60,26 @@ path-planning-visualizer
 5. The **Status** panel shows live path metrics, compute times, and the planner's status string.
 6. For sampling-based planners, pause once a path is found and click **CHOMP Optimize** to smooth it.
 
-**Editing maps.** Toggle **Edit Map** and left-drag to draw obstacles or right-drag to erase (the
-**Brush** spin sets the radius). **New Map** starts from a blank grid; **Save Map** writes the current
-grid to a PNG you can reload later. On large maps the planner is built on a background thread, so the
-window stays responsive and shows a brief *Preparing…* state before it starts.
+**Editing maps.** The map tools are collapsed by default behind the **Map Tools** toggle in the left
+panel — click it to reveal them. Toggle **Edit Map** and left-drag to draw obstacles or right-drag to
+erase (the **Brush** spin sets the radius). **New Map** starts from a blank grid; **Save Map** writes
+the current grid to a PNG you can reload later. On large maps the planner is built on a background
+thread, so the window stays responsive and shows a brief *Preparing…* state before it starts.
 
 ## Algorithms
 
-19 planners across five families. Each row links the planner to the source paper it is modeled on
+20 planners across five families. Each row links the planner to the source paper it is modeled on
 (the same citation shown in the app's info panel).
 
 | Family | Algorithm | Reference |
 | --- | --- | --- |
 | Sampling-based | `RRT` | LaValle, 1998 |
 | Sampling-based | `RRT-Connect` | Kuffner & LaValle, 2000 |
-| Sampling-based | `BiTRRT` | Devaurs et al., 2013 / OMPL |
-| Sampling-based | `KPIECE` | Şucan & Kavraki, 2008 |
+| Sampling-based | `BiTRRT` | Devaurs et al., 2013 |
+| Sampling-based | `KPIECE` | Şucan & Kavraki, 2009 |
 | Sampling-based | `RRT*` | Karaman & Frazzoli, 2011 |
 | Sampling-based | `PRM` | Kavraki et al., 1996 |
+| Sampling-based | `sPRM` | Karaman & Frazzoli, 2011 |
 | Sampling-based | `SBL` | Sánchez & Latombe, 2001 |
 | Sampling-based | `FMT*` | Janson et al., 2015 |
 | Sampling-based | `BIT*` | Gammell et al., 2015 |
@@ -105,16 +107,20 @@ Within that scope, each planner implements the defining mechanism of its paper. 
 | Planner | Adaptation / fidelity note |
 | --- | --- |
 | `RRT` | Follows the paper's `GENERATE_RRT(x_init, K, Δt)` structure as a 2D holonomic specialization: uniform sampling, Euclidean nearest-neighbor, explicit `SELECT_INPUT`/`NEW_STATE` (`ẋ = u`), a fixed vertex budget `K`, and an optional OMPL-style `goal_bias`. |
-| `RRT*` | Shrinking RGG radius `min(γ·(log n / n)^(1/2), step)` by default → asymptotically optimal (Karaman & Frazzoli, 2011); a fixed search radius is selectable for comparison. |
+| `RRT-Connect` | Paper-exact Kuffner & LaValle (2000): EXTEND takes one step toward a uniform sample over `C` and lands exactly on it when within range; CONNECT greedily repeats EXTEND; the two trees swap and meet at one shared, collision-checked vertex. |
+| `RRT*` | Paper-exact Algorithm 6 (Karaman & Frazzoli, 2011): ChooseParent + Rewire over the shrinking RGG radius `min(γ·(log n / n)^(1/2), step)` with `γ = 2(1+1/d)^(1/d)(μ/ζ_d)^(1/d)` → asymptotically optimal; a fixed search radius is selectable for comparison. |
 | `BIT*` | Connects within the full RGG radius by default → asymptotically optimal (Gammell et al., 2015), with ordered vertex/edge queues, rewiring, informed batches, and incumbent pruning; an optional step-size cap is purely for tidier visuals. |
-| `FMT*` | 2D geometric adaptation: uniform free-space samples, open-wavefront parent selection, one-shot lazy collision checking, and the paper's shrinking connection radius. |
-| `PRM` | Two-phase: query-independent roadmap construction followed by query-time start/goal attachment. |
-| `SBL` | 2D adaptation with an L∞ neighborhood, lazy segment validation, and a lightweight random path optimizer (not a full configuration-space reproduction). |
-| `KPIECE` | Single-level *geometric* adaptation with projection-grid cell selection and progress-based penalties (not the full multilevel kinodynamic formulation). |
-| `BiTRRT` | Follows the OMPL planner structure, but its optimization objective is a clearance-derived cost field rather than an arbitrary user-supplied cost. |
-| `A*` / `Dijkstra` | Optimal with respect to the induced occupancy grid, not the continuous image plane. |
-| `CHOMP` | 2D point-robot specialization: signed distance field, covariant preconditioned updates, and functional obstacle gradients (not a full articulated configuration-space system). |
-| `STOMP`, `TrajOpt`, `ITOMP`, `GPMP` | Each implements its paper's defining mechanism for a 2D point robot — per-timestep probability-weighted STOMP updates with the M projection; TrajOpt sequential convex optimization with ℓ1 collision penalties and a trust region; incremental covariant ITOMP over a receding horizon (static-map adaptation); and GPMP2-style LTI GP prior with GP-interpolated obstacle factors and Gauss-Newton inference. |
+| `FMT*` | Paper-exact Janson et al. (2015): forward DP wavefront over uniform free-space samples within the shrinking radius `r_n`, one-shot lazy collision checking on the single best parent, terminating when the goal is popped as the lowest-cost open node. |
+| `PRM` | Original Kavraki et al. (1996) construction step: random free configs connected within `max_edge_dist` (capped at `k`, increasing distance) by a straight-line local planner, **skipping same-connected-component edges** → a cycle-free forest. Two-phase learn/query with A\* search. Not asymptotically optimal (see `sPRM`). |
+| `sPRM` | The simplified PRM (Karaman & Frazzoli, 2011): the same roadmap **without** the same-component cycle removal, so it keeps cycles. Asymptotically optimal and returns shorter query paths; this is what most libraries call "PRM". |
+| `SBL` | Faithful 2D adaptation of Sánchez & Latombe (2001): density-weighted milestone selection (`π(m) ∼ 1/η(m)`), shrinking L∞ neighborhoods `B(m, ρ/i)`, the lazy dyadic `TEST-SEGMENT` (mark *safe* at `2^(−κ)·λ < ε`), `TEST-PATH` ordered most-likely-to-collide first, Fig. 4 milestone transfer on collision, and the paper's random shortcut optimizer. A finest-level exhaustive check guards the integer grid (and `ζ = ρ`). |
+| `KPIECE` | Faithful single-level *geometric* adaptation of Şucan & Kavraki (2009): the paper's importance `log(𝓘)·score/(𝓢·𝓝·𝓒)`, the `2n` interior/exterior rule (`<4` neighbours in 2D), the fixed exterior-cell bias, half-normal motion selection, boundary-split AddMotion, and the `P = α + β·(ΔC/dist)` progress penalty — not the full multilevel *kinodynamic* formulation (no forward-propagation/physics; "simulated time" is traveled distance). |
+| `BiTRRT` | Paper-exact Devaurs et al. (2013): adaptive-temperature transition test (deterministic 0.5, base-2 temperature updates), refinement control, and the downhill-only bidirectional junction (`attemptLink` within `10·δ`); the cost is a clearance-derived field (2D adaptation of the paper's generic cost). |
+| `A*` / `Dijkstra` | Dijkstra (1959, Problem 2) uniform-cost search and A\* (Hart, Nilsson & Raphael 1968) best-first search with `f = g + h` and an admissible, consistent heuristic, on the induced 8-connected grid (Euclidean edge weights); optimal with respect to that grid discretization, not the continuous image plane. |
+| `APF` | Paper-exact Khatib (1986): parabolic-well attractive force `−k(x − x_goal)`, FIRAS repulsion within `ρ₀`, integrated with velocity saturation at `V_max`. Pure APF by default, so it stalls at local minima (Khatib's documented limitation); a non-paper stochastic escape is an optional toggle. |
+| `CHOMP` | Paper-exact Ratliff et al. (2009) for a 2D point robot: a true signed distance field, the workspace cost `c(x)`, the obstacle functional gradient (Eq. 4), and the covariant step `ξ ← ξ − (1/λ)A⁻¹g` over the velocity prior. Also the *CHOMP Optimize* post-processor that refines sampling-based paths (not a full articulated configuration-space system). |
+| `STOMP`, `TrajOpt`, `ITOMP`, `GPMP` | Each implements its paper's defining mechanism for a 2D point robot — per-timestep probability-weighted STOMP updates (Eq. 11) with the M projection on a signed-distance obstacle cost (Eq. 13); TrajOpt (Schulman et al. 2013) sequential convex optimization — the displacement objective with ℓ1 collision penalties on the signed distance, in a trust region; incremental covariant ITOMP (Park et al. 2012) over a receding horizon with acceleration smoothness and a signed-distance obstacle cost (static-map adaptation; no dynamic obstacles); and GPMP (Mukadam, Yan & Boots 2016) — an LTI GP prior with GP interpolation, optimized by the covariant gradient update (gradient preconditioned by the GP covariance). |
+| `PSO` | Paper-exact Kennedy & Eberhart (1995) by default: `v ← w·v + 2·r₁·(pbest−x) + 2·r₂·(gbest−x)` with a `Vmax` clamp and full momentum (no inertia weight, `w = 1.0`), over a fixed-waypoint path encoding (fitness = length + clearance penalty + smoothness). Pure 1995 PSO can stall on cluttered maps (like pure APF); an off-by-default *safeguards* toggle adds adaptive inertia/social gain, diversity injection, random immigrants, and swarm restart. A metaheuristic, not a complete planner. |
 
 ## Benchmarking
 
@@ -177,7 +183,7 @@ LICENSE                        MIT
 ## Versioning
 
 Semantic versioning with Python-compatible pre-release tags: betas follow `0.1.0b1`, `0.1.0b2`, …
-`0.1.0b8`; the first stable release will be `0.1.0`, with bugfix releases continuing as `0.1.1`,
+`0.1.0b9`; the first stable release will be `0.1.0`, with bugfix releases continuing as `0.1.1`,
 `0.1.2`, and so on. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## License

@@ -272,12 +272,9 @@ class KPIECEPlanner(BasePlanner):
         all_cells = [cell for cell in self.cells.values() if cell.motion_indices]
         border_cells = [cell for cell in all_cells if cell.border]
         interior_cells = [cell for cell in all_cells if not cell.border]
-        border_probability = max(
-            self.border_fraction,
-            len(border_cells) / max(1, len(all_cells)),
-        )
 
-        if border_cells and (not interior_cells or self.rng.random() < border_probability):
+        # Paper Alg. 1 line 5: a fixed bias toward exterior (border) cells (70-80%).
+        if border_cells and (not interior_cells or self.rng.random() < self.border_fraction):
             pool = border_cells
         else:
             pool = interior_cells if interior_cells else all_cells

@@ -99,7 +99,7 @@ class GPMPPlanner(BasePlanner):
 
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 25, max_iters: int = 200, sigma: float = 6.0,
-                 obstacle_weight: float = 1.0, dt: float = 1.0):
+                 obstacle_weight: float = 1.0, dt: float = 1.0, eta: float = 5.0):
         super().__init__(occ, start, goal)
 
         self.num_points = int(max(3, num_points))
@@ -107,11 +107,13 @@ class GPMPPlanner(BasePlanner):
         self.qc = float(sigma) ** 2          # GP process-noise spectral density
         self.obstacle_weight = float(obstacle_weight)
         self.dt = float(dt)
+        self.eta = float(max(1e-6, eta))     # regularization; 1/eta is the covariant step size
         self.epsilon = 14.0
+        self.max_step = 20.0                  # per-iteration position-step cap (stability guard)
         self.interp_taus = [0.25, 0.5, 0.75]
 
-        # SDF and gradient.
-        self.dist_field, self.grad_x, self.grad_y = make_sdf(self.occ)
+        # True signed distance field and gradient (negative inside obstacles).
+        self.dist_field, self.grad_x, self.grad_y = make_sdf(self.occ, signed=True)
 
         # GP matrices (uniform spacing -> same for every segment).
         self.Phi = _phi(self.dt)
@@ -119,16 +121,16 @@ class GPMPPlanner(BasePlanner):
         self.Q_inv = np.linalg.inv(self.Q)
         self._build_interpolators()
 
+        # GP-prior precision K^-1 = B^T Q^-1 B over the free states (constant). It
+        # is the Riemannian metric for the covariant gradient update (Eqs. 23-24).
+        self.Kinv_prior = self._prior_precision()
+
         # Support states: positions from a (possibly bent) straight line, with a
         # constant-velocity initialization; endpoints have zero velocity.
         self.states = self._init_states()
         self.start_state = self.states[0].copy()
         self.goal_state = self.states[-1].copy()
 
-        # Levenberg-Marquardt state.
-        self.lm_lambda = 1e-2
-        self.lm_lambda_min = 1e-6
-        self.lm_lambda_max = 1e8
         self.converged = False
         self.prior_cost = float('inf')
         self.obs_cost = float('inf')
@@ -203,32 +205,45 @@ class GPMPPlanner(BasePlanner):
             return -1
         return (i - 1) * 4
 
-    def _assemble(self, states: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _prior_precision(self) -> np.ndarray:
+        """Constant GP-prior precision K^-1 = B^T Q^-1 B over the free states (Eq. 13)."""
         d = (self.num_points - 2) * 4
-        H = np.zeros((d, d), dtype=np.float64)
-        g = np.zeros(d, dtype=np.float64)
-
-        def add_factor(blocks, residual, weight):
-            # blocks: list of (state_index, jacobian wrt that 4-vector state)
+        kinv = np.zeros((d, d), dtype=np.float64)
+        I4 = np.eye(4)
+        for i in range(self.num_points - 1):
+            blocks = [(i, -self.Phi), (i + 1, I4)]
             for (ia, Ja) in blocks:
                 va = self._free_index(ia)
                 if va < 0:
                     continue
-                JaT_W = Ja.T @ weight
-                g[va:va + 4] += JaT_W @ residual
+                JaT_W = Ja.T @ self.Q_inv
                 for (ib, Jb) in blocks:
                     vb = self._free_index(ib)
                     if vb < 0:
                         continue
-                    H[va:va + 4, vb:vb + 4] += JaT_W @ Jb
+                    kinv[va:va + 4, vb:vb + 4] += JaT_W @ Jb
+        kinv += 1e-6 * np.eye(d)
+        return kinv
 
-        # GP prior factors (4-D residual, weight Q_inv).
+    def _gradient(self, states: np.ndarray) -> np.ndarray:
+        """Cost-functional gradient grad U = grad F_obs + grad F_gp (Eq. 25)."""
+        d = (self.num_points - 2) * 4
+        g = np.zeros(d, dtype=np.float64)
+
+        def add_factor(blocks, residual, weight):
+            for (ia, Ja) in blocks:
+                va = self._free_index(ia)
+                if va < 0:
+                    continue
+                g[va:va + 4] += (Ja.T @ weight) @ residual
+
+        # GP prior gradient grad F_gp = K^-1 (xi - mu), via the transition residuals.
         I4 = np.eye(4)
         for i in range(self.num_points - 1):
             e = states[i + 1] - self.Phi @ states[i]
             add_factor([(i, -self.Phi), (i + 1, I4)], e, self.Q_inv)
 
-        # Obstacle factors at support states (scalar residual, unit weight).
+        # Obstacle gradient grad F_obs at the support states (scalar hinge residual).
         w1 = np.array([[1.0]])
         for i in range(1, self.num_points - 1):
             r, drdp = self._obstacle_residual(states[i, :2])
@@ -238,7 +253,7 @@ class GPMPPlanner(BasePlanner):
             J[0, :2] = drdp
             add_factor([(i, J)], np.array([r]), w1)
 
-        # Obstacle factors at GP-interpolated states.
+        # ... and at the GP-interpolated states (Eq. 32-36).
         for i in range(self.num_points - 1):
             for k in range(len(self.interp_taus)):
                 inter = self.lambdas[k] @ states[i] + self.psis[k] @ states[i + 1]
@@ -247,11 +262,9 @@ class GPMPPlanner(BasePlanner):
                     continue
                 Jp = np.zeros((1, 4))
                 Jp[0, :2] = drdp
-                Ja = Jp @ self.lambdas[k]
-                Jb = Jp @ self.psis[k]
-                add_factor([(i, Ja), (i + 1, Jb)], np.array([r]), w1)
+                add_factor([(i, Jp @ self.lambdas[k]), (i + 1, Jp @ self.psis[k])], np.array([r]), w1)
 
-        return H, g
+        return g
 
     # ------------------------------------------------------------------- step
     def step_once(self) -> StepResult:
@@ -266,44 +279,35 @@ class GPMPPlanner(BasePlanner):
         self.iteration += 1
 
         cost0 = self._total_cost(self.states)
-        H, g = self._assemble(self.states)
-        d = H.shape[0]
 
-        # Levenberg-Marquardt: try damped Gauss-Newton steps until improvement.
-        accepted = False
-        for _ in range(8):
-            try:
-                delta = np.linalg.solve(H + self.lm_lambda * np.eye(d), -g)
-            except np.linalg.LinAlgError:
-                self.lm_lambda = min(self.lm_lambda_max, self.lm_lambda * 10.0)
-                continue
+        # GPMP covariant gradient update (Eq. 24/33): xi <- xi - (1/eta) K grad U,
+        # i.e. precondition the cost gradient by the GP covariance K = (K^-1)^-1.
+        g = self._gradient(self.states)
+        delta = -(1.0 / self.eta) * np.linalg.solve(self.Kinv_prior, g)
+        delta = delta.reshape(-1, 4)
 
-            candidate = self.states.copy()
-            candidate[1:-1] += delta.reshape(-1, 4)
-            candidate[1:-1, 0] = np.clip(candidate[1:-1, 0], 0, self.w - 1)
-            candidate[1:-1, 1] = np.clip(candidate[1:-1, 1], 0, self.h - 1)
+        # Stability guard: cap the per-iteration position change.
+        pos_norm = float(np.linalg.norm(delta[:, :2]))
+        if pos_norm > self.max_step:
+            delta *= self.max_step / pos_norm
 
-            cost1 = self._total_cost(candidate)
-            if cost1 < cost0:
-                self.states = candidate
-                self.lm_lambda = max(self.lm_lambda_min, self.lm_lambda * 0.5)
-                accepted = True
-                break
-            self.lm_lambda = min(self.lm_lambda_max, self.lm_lambda * 10.0)
+        self.states[1:-1] += delta
+        self.states[1:-1, 0] = np.clip(self.states[1:-1, 0], 0, self.w - 1)
+        self.states[1:-1, 1] = np.clip(self.states[1:-1, 1], 0, self.h - 1)
 
         self.total_cost = self._total_cost(self.states)
         self._check_path_validity()
         if self.found_path:
             self.best_valid_trajectory = self.states[:, :2].copy()
 
-        # Convergence: no accepted step (LM saturated) or negligible change.
-        if not accepted or abs(cost0 - self.total_cost) < 1e-4:
-            if self.found_path or self.lm_lambda >= self.lm_lambda_max:
+        # Convergence: negligible change in cost or a vanishing step.
+        if abs(cost0 - self.total_cost) < 1e-4 or pos_norm < 1e-3:
+            if self.found_path:
                 self.converged = True
                 self._finalize()
                 self.done = True
 
-        return StepResult(path_improved=(accepted and self.found_path))
+        return StepResult(path_improved=self.found_path)
 
     def _finalize(self):
         if self.best_valid_trajectory is not None:
@@ -331,7 +335,7 @@ class GPMPPlanner(BasePlanner):
     def get_status(self) -> str:
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
         return (f"GPMP: iter {self.iteration}, prior {self.prior_cost:.1f}, "
-                f"obs {self.obs_cost:.1f}, lambda {self.lm_lambda:.1e}, {status}")
+                f"obs {self.obs_cost:.1f}, {status}")
 
     @staticmethod
     def get_params_widget() -> QWidget:

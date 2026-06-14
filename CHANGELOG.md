@@ -2,7 +2,178 @@
 
 This file tracks release notes for published versions of the project.
 
-## [Unreleased]
+## [0.1.0b9] - 2026-06-14
+
+### Changed — paper-fidelity audit
+
+- `APF` made paper-exact to Khatib (1986): parabolic-well attractive force
+  `-k(x - x_goal)`, the FIRAS repulsive force within the influence limit, and
+  velocity-saturated integration at `V_max` (was a conic attractor with a
+  unit-normalized step). Pure APF is now the default and stalls at local minima
+  as the paper documents; the stochastic escape is an optional off-by-default
+  toggle. Added `tests/test_apf_fidelity.py`.
+- `STOMP` made paper-exact to Kalakrishnan et al. (2011): the per-timestep
+  probability now uses the paper's exponent `exp(-h·(S-min)/(max-min))` (Eq. 11),
+  the obstacle cost is `max(ε - d, 0)·‖ẋ‖` on a true **signed** distance field
+  (Eq. 13), and the convergence metric includes the control term `½θᵀRθ`. The
+  `R⁻¹` noise and M projection were already correct; exploration noise is now
+  fixed (un-annealed) per the paper. Added a shared `signed_distance_field` helper
+  and `tests/test_stomp_fidelity.py`. (Also fixed a latent attribute-shadowing
+  bug where the new sensitivity parameter collided with the grid height.)
+- `BIT*` verified line-by-line against Gammell et al. (2015) and brought to
+  paper-exact structure: vertex-vertex rewiring edges are now enqueued only from
+  vertices new to the current batch (Alg. 2 line 4), pruning runs at batch start
+  (Alg. 1 line 5), and the edge queue breaks ties by source cost-to-come `g_T(v)`
+  (Alg. 1 line 12). Added `tests/test_bit_star_fidelity.py`. Tree-vertex pruning
+  (Alg. 3 lines 2-5) remains omitted as an asymptotic-optimality-preserving
+  simplification (documented in `literature/fidelity/bit_star.md`).
+- `RRT-Connect` made paper-exact to Kuffner & LaValle (2000): `EXTEND` now lands
+  exactly on its target when within `step_size` and returns *Reached* only then
+  (Fig. 2); `CONNECT` is the paper's "repeat `EXTEND` until not *Advanced*"
+  (Fig. 5); and `RANDOM_CONFIG` samples uniformly over the whole space `C` instead
+  of rejection-sampling free space (an occupied sample is only a steering target).
+  Added `tests/test_rrt_connect_fidelity.py`.
+- `FMT*` termination aligned to the paper (Janson et al. 2015, Alg. 1 line 9.2):
+  the goal is now connected like any other sample and the planner terminates when
+  the goal is popped as the lowest-cost node in `V_open`, rather than the instant
+  it is connected. The returned path is unchanged (an FMT* node's cost is final
+  when it enters `V_open`); the wavefront, lazy single-best-parent connection, and
+  shrinking radius `r_n` were already faithful. Added `tests/test_fmt_star_fidelity.py`.
+- `CHOMP` update rule made paper-exact to Ratliff et al. (2009, Sec. II-A): the
+  backtracking line search is replaced by the covariant step
+  `ξ ← ξ − (1/λ)A⁻¹g` with a single step-norm cap. The signed distance field, the
+  workspace cost `c(x)`, the obstacle functional gradient (Eq. 4), and the
+  velocity prior (Eq. 1, `d=1`) were already faithful. The best-valid finalize is
+  kept so CHOMP still reliably returns a collision-free result, including when
+  used as the *CHOMP Optimize* post-processor for sampling-based paths (same
+  `CHOMPPlanner` via `init_trajectory`). Added `tests/test_chomp_fidelity.py`.
+- `RRT` verified against LaValle (1998) `GENERATE_RRT`: the
+  sample / nearest / `SELECT_INPUT` / `NEW_STATE` loop and the holonomic
+  `ẋ = u` (`‖u‖ ≤ 1`) model with `Δt` Euler integration are faithful. The goal
+  bias (the paper's Sec. 5 extension), the goal-region stop, `K` as a vertex
+  budget, and the grid-discretization rejections are documented as single-query
+  adaptations (`literature/fidelity/rrt.md`). Added `tests/test_rrt_fidelity.py`.
+- `RRT*` verified against Karaman & Frazzoli (2011) Algorithm 6: `ChooseParent`
+  and `Rewire` and the shrinking radius `min(γ·(log n/n)^(1/2), step)` with the
+  paper's `γ* = 2(1+1/d)^(1/d)(μ/ζ_d)^(1/d)` are faithful (the b5/b6 hardening
+  was correct). Goal handling, goal bias, and the fixed-radius option are
+  documented single-query adaptations (`literature/fidelity/rrt_star.md`). Added
+  `tests/test_rrt_star_fidelity.py` (radius cap, the `Cost(v)=Cost(parent)+‖·‖`
+  recursion, acyclic tree).
+- `PRM` verified against Kavraki et al. (1996): the two-phase learn/query
+  structure, random free configs, the `N_c` candidate set (within `max_edge_dist`,
+  capped at `k_neighbors`, increasing distance), the straight-line local planner,
+  and the A* query are faithful. The implementation is documented as the
+  asymptotically-optimal **sPRM** variant (Karaman & Frazzoli 2011) — it keeps
+  cycles rather than the paper's same-component forest, which the paper itself
+  notes yields shorter paths (`literature/fidelity/prm.md`). Added
+  `tests/test_prm_fidelity.py`.
+
+- `Dijkstra` verified against Dijkstra (1959, Problem 2): `closed_set` = the
+  finalized set A (nodes closed in increasing distance from the start), the
+  heap + `dist` map = the frontier B, `heappop` = the minimum-distance extraction
+  (Step 2), and edge relaxation = Step 1, terminating when the goal is popped. The
+  coarse induced grid, 8-connectivity with Euclidean edge weights, and corner-cut
+  prevention are documented adaptations (`literature/fidelity/dijkstra.md`). Added
+  `tests/test_dijkstra_fidelity.py`.
+- `A*` verified against Hart, Nilsson & Raphael (1968): the evaluation `f = g + h`,
+  the min-`f` selection, edge relaxation, and goal-pop termination are faithful,
+  with an admissible + consistent Euclidean heuristic (so closed nodes are never
+  reopened, per the paper's Lemma 2). Same induced-grid adaptations as Dijkstra
+  (`literature/fidelity/astar.md`). Added `tests/test_astar_fidelity.py`.
+- `TrajOpt` made paper-exact to Schulman et al. (2013): the objective is now the
+  sum of squared **displacements** `Σ‖θ_{t+1}−θ_t‖²` (Eq. 5; was accelerations),
+  the collision penalty uses a true **signed** distance field, and the trust-region
+  step is accepted iff `true/model improvement > c` (Alg. 1). Citation corrected to
+  the 2013 RSS paper. The convex subproblem remains a box-clipped Newton step (no
+  QP solver). Added `tests/test_trajopt_fidelity.py`.
+- `ITOMP` aligned to Park, Pan & Manocha (2012): the static obstacle cost is now
+  the Eq. 8 hinge `max(ε − d, 0)·‖ẋ‖` on a true **signed** distance field, and the
+  smoothness metric is confirmed acceleration-based (Eq. 6). The receding-horizon
+  incremental optimization is faithful; the dynamic-obstacle cost (Eq. 9) is
+  documented as out of scope (the tool has only static maps) — the one inherent
+  ITOMP gap. Added `tests/test_itomp_fidelity.py`.
+- `GPMP` **reworked** to the ICRA-2016 *Gaussian Process Motion Planning* paper
+  (Mukadam, Yan & Boots) requested by the user: the factor-graph Gauss-Newton/LM
+  solver (GPMP2) is replaced by the paper's **covariant gradient update**
+  `ξ ← ξ − (1/η)·K·∇U` — the cost gradient preconditioned by the GP covariance `K`
+  (`K⁻¹ = BᵀQ⁻¹B`). The constant-velocity LTI GP prior, GP interpolation, and a
+  now-**signed** SDF are kept. Citation set to Mukadam, Yan & Boots (2016). Added
+  `tests/test_gpmp_fidelity.py`.
+- `BiTRRT` made paper-exact to Devaurs, Siméon & Cortés (2013): the transition
+  test now updates the temperature with **base-2** powers — `T /= 2^(Δc/(0.1·costRange))`
+  on an accepted uphill move and `T *= 2^(T_rate)` on a rejected one (Alg. 2, was
+  base `e`); `attemptLink` only fires within `10·δ` and extends the target tree
+  toward the source along **flat/downhill slopes only** (Alg. 5, was the full
+  transition-test extension); and refinement control thresholds at the step size
+  `δ` with the `nbRefinement > ρ·nbNodes` test (Alg. 3). The deterministic
+  `exp(−Δc/T) > 0.5` acceptance and the bidirectional extend/link/swap loop were
+  already faithful; the clearance-derived cost field is the documented 2D adaptation
+  of the paper's generic cost. Citation set to Devaurs et al. (2013). Added
+  `tests/test_bitrrt_fidelity.py`.
+- `KPIECE` verified against Şucan & Kavraki (2009) and made paper-exact in cell
+  selection: the importance `log(𝓘)·score/(𝓢·𝓝·𝓒)` (p. 6), the `2n` interior/
+  exterior rule (`<4` axis-neighbours in 2D, p. 4), the half-normal motion
+  selection, the boundary-split AddMotion (Alg. 2), and the `P = α + β·(ΔC/dist)`
+  progress penalty with the `P<1 ⇒ score·=P` rule (Alg. 1 l. 16-17) were already
+  faithful; the exterior-cell bias is now the paper's *fixed* 70-80% bias
+  (Alg. 1 l. 5) rather than an inflated `max(border_fraction, ratio)`. Documented
+  as a single-level *geometric* adaptation (no forward-propagation; "simulated
+  time" is traveled distance). Citation corrected 2008→2009. Added
+  `tests/test_kpiece_fidelity.py`.
+- `SBL` verified against Sánchez & Latombe (2001): density-weighted milestone
+  selection (`π(m) ∼ 1/η(m)` via the per-tree grid), shrinking L∞ neighborhoods
+  `B(m, ρ/i)`, the lazy dyadic `TEST-SEGMENT` (mark *safe* at `2^(−κ)·λ < ε`),
+  `TEST-PATH` ordered by decreasing `2^(−κ)·λ`, the Fig. 4 milestone transfer on
+  collision, and the random shortcut optimizer are all faithful — no behavioral
+  change. Documented the 2D-grid adaptations (`ζ = ρ`; a finest-level exhaustive
+  check guards sub-`ε` pixel obstacles) in `literature/fidelity/sbl.md`. Added
+  `tests/test_sbl_fidelity.py`.
+- `PSO` reworked so the **default** velocity update is the exact Kennedy &
+  Eberhart (1995, §3.6) form `v ← w·v + 2·r₁·(pbest−x) + 2·r₂·(gbest−x)` with a
+  `Vmax` clamp: full momentum (no inertia weight, `w = 1.0`; was an adaptive
+  Shi-Eberhart 1998 schedule) and acceleration constants `c1 = c2 = 2.0` (were
+  `1.5`), with the full social term. The non-1995 robustness heuristics — adaptive
+  inertia, adaptive social gain, diversity injection, random immigrants, and swarm
+  restart — are now behind an `enable_safeguards` flag (default **off**, exposed as
+  an in-app checkbox). Pure 1995 PSO can stall on cluttered maps (documented, like
+  pure APF); soundness is unchanged (a reported path is still collision-free).
+  Added `tests/test_pso_fidelity.py`.
+
+### Changed
+
+- The map-editing controls (Edit Map, Brush, New Map, Save Map) are now collapsed
+  by default behind a **Map Tools** toggle in the left panel, instead of occupying
+  an always-visible row; expanding the toggle reveals them in place, and entering
+  edit mode auto-expands it. The editing feature is unchanged — just tucked out of
+  sight by default.
+
+### Fixed
+
+- `CHOMP` no longer burns the full iteration cap when post-optimizing a
+  sampling-based path (the "CHOMP Optimize" button). Threading an RRT path through
+  a cluttered map put the optimizer in a stable obstacle-term **limit cycle** (cost
+  oscillating by a fixed amount every iteration), which the step-size convergence
+  test (`cost_change < 8e-4` or `update_norm < 8e-3`) can never satisfy, so it ran
+  to `max_iters` (1000 from the GUI). Two changes: (1) the default `learning_rate`
+  is lowered `1.0 → 0.3` to damp the obstacle-gradient overshoot that drove the
+  oscillation, and (2) a stagnation stop ends the run once the best cost has not
+  improved for 40 iterations. The returned (best collision-free) trajectory is
+  unchanged; it just stops in ~100-200 iterations instead of 1000.
+- `CHOMP` obstacle term vectorized: the per-waypoint Python loop with scalar
+  bilinear sampling (dominated by ~120k scalar `np.clip` calls per run) is replaced
+  by array operations over all waypoints, via a new
+  `geometry.bilinear_sample_scalar_batch` helper. The math is identical (the same
+  Ratliff (2009) functional and gradient; results match the loop to ~1e-12), giving
+  ~5-6x faster iterations (~8 ms → ~1.4 ms/iter at 50 waypoints). Together with the
+  early-stop fix, a post-optimization run drops from ~8 s to ~0.3 s.
+
+- Split PRM into two selectable planners: **`PRM`** is now the literal Kavraki
+  et al. (1996) construction step (a cycle-free forest via same-connected-component
+  skipping, using union-find; not asymptotically optimal), and **`sPRM`** is the
+  simplified, cycle-keeping, asymptotically-optimal variant (Karaman & Frazzoli
+  2011) that was previously labeled "PRM". This lets the tool demonstrate the
+  optimality difference directly. (20 planners total.)
 
 ## [0.1.0b8] - 2026-06-14
 

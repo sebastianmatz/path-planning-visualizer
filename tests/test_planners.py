@@ -53,6 +53,7 @@ TUNED = {
     "KPIECE": dict(range=12.0, goal_tolerance=14, cell_size=8, max_iters=4000, seed=1),
     "RRT*": dict(step_size=10, goal_tolerance=14, search_radius=24, max_iters=2500, seed=1),
     "PRM": dict(num_samples=400, k_neighbors=15, max_edge_dist=40, seed=1),
+    "sPRM": dict(num_samples=400, k_neighbors=15, max_edge_dist=40, seed=1),
     "SBL": dict(max_iters=5000, rho=20, grid_cells=8, seed=1),
     "FMT*": dict(num_samples=500, seed=1),
     "BIT*": dict(batch_size=200, max_iters=5000, step_size=18.0, seed=1),
@@ -69,7 +70,7 @@ TUNED = {
 }
 
 # Planners that should always find a path on the simple wall map.
-COMPLETE = ["RRT", "RRT-Connect", "BiTRRT", "KPIECE", "RRT*", "PRM", "SBL", "FMT*", "BIT*", "A*", "Dijkstra"]
+COMPLETE = ["RRT", "RRT-Connect", "BiTRRT", "KPIECE", "RRT*", "PRM", "sPRM", "SBL", "FMT*", "BIT*", "A*", "Dijkstra"]
 
 ALL = list(ppv.AVAILABLE_PLANNERS)
 
