@@ -1,0 +1,48 @@
+name: Release (Windows executable)
+
+# Builds a single-file Windows .exe with PyInstaller and attaches it to the GitHub
+# Release for the pushed tag. Can also be run manually (Actions tab -> Run workflow)
+# to build and download the artifact without publishing a release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required to create/update the Release and upload the asset
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --noconfirm --clean packaging/PathPlanningVisualizer.spec
+
+      - name: Upload build artifact (download from this run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PathPlanningVisualizer-windows
+          path: dist/PathPlanningVisualizer.exe
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/PathPlanningVisualizer.exe
+          fail_on_unmatched_files: true
+          generate_release_notes: true

@@ -40,6 +40,8 @@ pip-wheel-metadata/
 *.manifest
 *.pkg
 *.spec
+# ...but keep the committed PyInstaller build spec (used by the release workflow)
+!packaging/PathPlanningVisualizer.spec
 *.exe
 *.msi
 *.app

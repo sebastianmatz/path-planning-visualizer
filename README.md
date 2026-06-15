@@ -4,6 +4,7 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-beta%20(0.1.0b10)-orange)
+[![Download](https://img.shields.io/github/v/release/sebastianmatz/path-planning-visualizer?include_prereleases&label=download%20(Windows))](https://github.com/sebastianmatz/path-planning-visualizer/releases/latest)
 
 An interactive desktop application for **exploring, comparing, and tuning path-planning algorithms** for a 2D point robot on occupancy-grid maps. It bundles 20 planners — sampling-based, graph-search, potential-field, trajectory-optimization, and metaheuristic — behind one UI, with step-through visualization, live path metrics, an interactive map editor, and a reproducible headless benchmark.
 
@@ -25,6 +26,14 @@ It is built as a **teaching and visualization environment**: each planner follow
 - [License](#license)
 
 ## Quick start
+
+**Windows download (no Python needed).** Grab the latest `PathPlanningVisualizer.exe` from the
+[**Releases**](https://github.com/sebastianmatz/path-planning-visualizer/releases/latest) page and
+double-click it. It is a single self-contained file; on first launch Windows SmartScreen may warn
+about an unknown publisher (the build is unsigned) — choose *More info → Run anyway*. To run on
+macOS/Linux, or to develop, use the source install below.
+
+### From source
 
 Requirements: **Python 3.11+** and a desktop environment capable of running PyQt6.
 
