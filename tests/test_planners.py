@@ -91,10 +91,7 @@ def run(planner, max_steps: int = 400_000):
 
 
 def segments_collision_free(path, occ) -> bool:
-    for i in range(len(path) - 1):
-        if not ppv.line_collision_free(path[i], path[i + 1], occ):
-            return False
-    return True
+    return all(ppv.line_collision_free(path[i], path[i + 1], occ) for i in range(len(path) - 1))
 
 
 # ---------------------------------------------------------------------------

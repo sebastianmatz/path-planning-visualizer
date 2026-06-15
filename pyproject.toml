@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "path-planning-visualizer"
-version = "0.1.0b9"
+version = "0.1.0b10"
 description = "Interactive desktop app for comparing path-planning algorithms on occupancy-grid maps."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -50,7 +50,12 @@ include-package-data = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.ruff]
+line-length = 110
+
 [tool.ruff.lint]
-# Pyflakes ("F") catches the real problems (unused imports, undefined names,
-# unused local variables).
-select = ["F"]
+# F (pyflakes) catches real bugs; I sorts imports; B (flake8-bugbear) flags likely
+# bugs; SIM (flake8-simplify) tidies redundant constructs. Deliberately excluded:
+# E501 (line length -- mostly docstrings/comments here) and N (naming -- it would
+# fight the intentional paper math notation A, Q, K, R, Hs, ...).
+select = ["F", "I", "B", "SIM"]

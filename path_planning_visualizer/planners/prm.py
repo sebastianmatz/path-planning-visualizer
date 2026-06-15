@@ -5,61 +5,12 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ..types import Point, Edge
 from ..geometry import (
     dist,
     line_collision_free,
 )
+from ..types import Edge, Point
 from .base import BasePlanner, StepResult
-
-
-class PRMParamsWidget(QWidget):
-    """Parameters widget for PRM planner."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_num_samples = QSpinBox()
-        self.spin_num_samples.setRange(50, 10000)
-        self.spin_num_samples.setValue(500)
-        self.spin_num_samples.setToolTip("Number of random samples to generate")
-        
-        self.spin_k_neighbors = QSpinBox()
-        self.spin_k_neighbors.setRange(3, 50)
-        self.spin_k_neighbors.setValue(15)
-        self.spin_k_neighbors.setToolTip("Number of nearest neighbors to connect")
-        
-        self.spin_max_edge_dist = QSpinBox()
-        self.spin_max_edge_dist.setRange(10, 500)
-        self.spin_max_edge_dist.setValue(100)
-        self.spin_max_edge_dist.setToolTip("Maximum edge length")
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-        
-        layout.addRow("Num samples:", self.spin_num_samples)
-        layout.addRow("K neighbors:", self.spin_k_neighbors)
-        layout.addRow("Max edge dist:", self.spin_max_edge_dist)
-        layout.addRow("Seed:", self.spin_seed)
-        
-        self.setLayout(layout)
-    
-    def get_params(self) -> dict:
-        return {
-            'num_samples': self.spin_num_samples.value(),
-            'k_neighbors': self.spin_k_neighbors.value(),
-            'max_edge_dist': self.spin_max_edge_dist.value(),
-            'seed': self.spin_seed.value(),
-        }
 
 
 class PRMPlanner(BasePlanner):
@@ -329,17 +280,7 @@ class PRMPlanner(BasePlanner):
             f"total nodes: {len(self.nodes)}, edges: {total_edges}"
         )
     
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return PRMParamsWidget()
     
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'PRMPlanner':
-        params = params_widget.get_params()
-        return PRMPlanner(occ, start, goal, **params)
-
-
 class ClassicPRMPlanner(PRMPlanner):
     """PRM - the original Kavraki et al. (1996) construction step.
 
@@ -358,8 +299,3 @@ class ClassicPRMPlanner(PRMPlanner):
         kwargs.pop('remove_cycles', None)
         super().__init__(occ, start, goal, remove_cycles=True, **kwargs)
 
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'ClassicPRMPlanner':
-        params = params_widget.get_params()
-        return ClassicPRMPlanner(occ, start, goal, **params)

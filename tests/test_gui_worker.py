@@ -10,7 +10,6 @@ import time
 
 import numpy as np
 import pytest
-
 from PyQt6.QtWidgets import QApplication
 
 import path_planning_visualizer as ppv

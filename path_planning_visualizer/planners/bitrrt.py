@@ -5,16 +5,6 @@ from typing import List, Optional, Set, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QCheckBox,
-    QDoubleSpinBox,
-    QFormLayout,
-    QHBoxLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ..types import Point, Edge
 from ..geometry import (
     clamp_point,
     dist,
@@ -23,8 +13,9 @@ from ..geometry import (
     segment_points,
     steer,
 )
-from .base import BasePlanner, StepResult
+from ..types import Edge, Point
 from ._spatial import GridIndex
+from .base import BasePlanner, StepResult
 
 
 @dataclass
@@ -34,108 +25,6 @@ class BiTRRTMotion:
     point: Point
     parent: Optional[int]
     state_cost: float
-
-
-class BiTRRTParamsWidget(QWidget):
-    """Widget for BiTRRT parameter configuration."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QFormLayout()
-
-        self.spin_range = QDoubleSpinBox()
-        self.spin_range.setRange(1.0, 500.0)
-        self.spin_range.setSingleStep(1.0)
-        self.spin_range.setValue(24.0)
-        self.spin_range.setToolTip("Maximum expansion range per tree extension")
-
-        self.spin_temp_change = QDoubleSpinBox()
-        self.spin_temp_change.setRange(0.001, 2.0)
-        self.spin_temp_change.setSingleStep(0.01)
-        self.spin_temp_change.setDecimals(3)
-        self.spin_temp_change.setValue(0.10)
-        self.spin_temp_change.setToolTip(
-            "OMPL-style temperature increase factor parameter; the actual multiplier is exp(value)"
-        )
-
-        self.spin_init_temp = QDoubleSpinBox()
-        self.spin_init_temp.setRange(0.001, 100000.0)
-        self.spin_init_temp.setDecimals(3)
-        self.spin_init_temp.setValue(100.0)
-        self.spin_init_temp.setToolTip("Initial transition-test temperature")
-
-        self.spin_frontier_threshold = QDoubleSpinBox()
-        self.spin_frontier_threshold.setRange(0.0, 1000.0)
-        self.spin_frontier_threshold.setDecimals(3)
-        self.spin_frontier_threshold.setSpecialValueText("auto")
-        self.spin_frontier_threshold.setValue(0.0)
-        self.spin_frontier_threshold.setToolTip(
-            "Distance threshold for frontier vs refinement expansion; 0 uses OMPL-style auto scaling"
-        )
-
-        self.spin_frontier_ratio = QDoubleSpinBox()
-        self.spin_frontier_ratio.setRange(0.01, 10.0)
-        self.spin_frontier_ratio.setSingleStep(0.01)
-        self.spin_frontier_ratio.setDecimals(3)
-        self.spin_frontier_ratio.setValue(0.10)
-        self.spin_frontier_ratio.setToolTip(
-            "Maximum allowed ratio of non-frontier to frontier expansions"
-        )
-
-        self.chk_cost_threshold = QCheckBox("Enable")
-        self.chk_cost_threshold.setToolTip(
-            "Enable an upper bound on accepted transition costs"
-        )
-
-        self.spin_cost_threshold = QDoubleSpinBox()
-        self.spin_cost_threshold.setRange(0.0, 1000.0)
-        self.spin_cost_threshold.setSingleStep(0.1)
-        self.spin_cost_threshold.setDecimals(3)
-        self.spin_cost_threshold.setValue(25.0)
-        self.spin_cost_threshold.setEnabled(False)
-        self.spin_cost_threshold.setToolTip(
-            "Maximum motion cost accepted by the transition test when enabled"
-        )
-        self.chk_cost_threshold.toggled.connect(self.spin_cost_threshold.setEnabled)
-
-        cost_threshold_widget = QWidget()
-        cost_threshold_layout = QHBoxLayout(cost_threshold_widget)
-        cost_threshold_layout.setContentsMargins(0, 0, 0, 0)
-        cost_threshold_layout.addWidget(self.chk_cost_threshold)
-        cost_threshold_layout.addWidget(self.spin_cost_threshold)
-
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(100, 200000)
-        self.spin_max_iters.setValue(25000)
-        self.spin_max_iters.setToolTip("Maximum number of planning iterations")
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(1)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-
-        layout.addRow("Range:", self.spin_range)
-        layout.addRow("Temp change factor:", self.spin_temp_change)
-        layout.addRow("Initial temperature:", self.spin_init_temp)
-        layout.addRow("Frontier threshold:", self.spin_frontier_threshold)
-        layout.addRow("Frontier node ratio:", self.spin_frontier_ratio)
-        layout.addRow("Cost threshold:", cost_threshold_widget)
-        layout.addRow("Max iterations:", self.spin_max_iters)
-        layout.addRow("Seed:", self.spin_seed)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'range': self.spin_range.value(),
-            'temp_change_factor': self.spin_temp_change.value(),
-            'init_temperature': self.spin_init_temp.value(),
-            'frontier_threshold': self.spin_frontier_threshold.value(),
-            'frontier_node_ratio': self.spin_frontier_ratio.value(),
-            'cost_threshold': self.spin_cost_threshold.value() if self.chk_cost_threshold.isChecked() else float('inf'),
-            'max_iters': self.spin_max_iters.value(),
-            'seed': self.spin_seed.value(),
-        }
 
 
 class BiTRRTPlanner(BasePlanner):
@@ -443,13 +332,3 @@ class BiTRRTPlanner(BasePlanner):
             f"f/nf {self.frontier_count}/{self.nonfrontier_count}, cost<= {threshold}, {status}"
         )
 
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return BiTRRTParamsWidget()
-
-    @staticmethod
-    def create_from_params(
-        occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int], params_widget: QWidget
-    ) -> 'BiTRRTPlanner':
-        params = params_widget.get_params()
-        return BiTRRTPlanner(occ, start, goal, **params)

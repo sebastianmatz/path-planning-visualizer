@@ -6,9 +6,8 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QImage, QPixmap, QStandardItem
+from PyQt6.QtGui import QColor, QFont, QImage, QKeySequence, QPixmap, QShortcut, QStandardItem
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -28,8 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import __version__
-from ..types import Point, OccupancyGrid
-from ..geometry import make_distance_field
+from ..geometry import blend_float_paths, make_distance_field
 from ..mapping import (
     blank_occupancy,
     image_to_occupancy,
@@ -37,10 +35,11 @@ from ..mapping import (
     paint_disk,
 )
 from ..metrics import PathMetrics, compute_path_metrics
-from ..resources import asset_path
-from .canvas import ImageCanvas
-from .worker import PlannerBuilder
 from ..planners.base import BasePlanner, StepResult
+from ..planners.bit_star import BITStarPlanner
+from ..planners.chomp import CHOMPPlanner
+from ..planners.gpmp import GPMPPlanner
+from ..planners.pso import PSOPlanner
 from ..planners.registry import (
     ALGORITHM_GROUPS,
     ALGORITHM_INFO,
@@ -48,10 +47,11 @@ from ..planners.registry import (
     AVAILABLE_PLANNERS,
     SAMPLING_BASED_ALGOS,
 )
-from ..planners.chomp import CHOMPPlanner
-from ..planners.pso import PSOPlanner
-from ..planners.gpmp import GPMPPlanner
-from ..planners.bit_star import BITStarPlanner
+from ..resources import asset_path
+from ..types import OccupancyGrid, Point
+from .canvas import ImageCanvas
+from .param_panels import PARAM_PANELS
+from .worker import PlannerBuilder
 
 
 class MainWindow(QMainWindow):
@@ -84,9 +84,60 @@ class MainWindow(QMainWindow):
         self._setup_playback_controls()
         self._setup_status_display()
         self._setup_layout()
+        self._apply_styles()
         self._setup_state()
         self._connect_signals()
+        self._setup_shortcuts()
         self._try_load_default_maze()
+
+    def _setup_shortcuts(self) -> None:
+        """Keyboard shortcuts: Space = run/pause, S = step, R = reset, Esc = stop."""
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self._toggle_run_pause)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.pause)
+        self.btn_step.setShortcut(QKeySequence("S"))
+        self.btn_reset.setShortcut(QKeySequence("R"))
+
+    def _toggle_run_pause(self) -> None:
+        """Space: pause if running, else start (when a run is possible)."""
+        if self.is_playing:
+            self.pause()
+        elif self.btn_run.isEnabled():
+            self.play()
+
+    def _apply_styles(self) -> None:
+        """Light, behavior-preserving visual polish: section 'cards' and an accent
+        on the primary Run action. Other widgets keep their native styling."""
+        self.setStyleSheet(
+            """
+            QGroupBox {
+                border: 1px solid #cccccc;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding: 8px 6px 6px 6px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 10px;
+                padding: 0 4px;
+                color: #2b2b2b;
+                font-weight: 600;
+            }
+            QPushButton#btn_run {
+                background-color: #2e9e5b;
+                color: white;
+                border: 1px solid #268a4f;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }
+            QPushButton#btn_run:hover { background-color: #35b266; }
+            QPushButton#btn_run:pressed { background-color: #268a4f; }
+            QPushButton#btn_run:disabled {
+                background-color: #cdcdcd; color: #8a8a8a; border-color: #c0c0c0;
+            }
+            """
+        )
     
     def _setup_canvas(self) -> None:
         """Initialize the image canvas."""
@@ -105,8 +156,8 @@ class MainWindow(QMainWindow):
         # Stacked widget for algorithm-specific parameters
         self.params_stack = QStackedWidget()
         self.params_widgets: Dict[str, QWidget] = {}
-        for name, planner_class in AVAILABLE_PLANNERS.items():
-            widget = planner_class.get_params_widget()
+        for name in AVAILABLE_PLANNERS:
+            widget = PARAM_PANELS[name]()
             self.params_widgets[name] = widget
             self.params_stack.addWidget(widget)
         
@@ -124,8 +175,18 @@ class MainWindow(QMainWindow):
         self.btn_reset = QPushButton("Reset")
         self.btn_step = QPushButton("Step")
         self.btn_run = QPushButton("Run")
+        self.btn_run.setObjectName("btn_run")  # accent-styled primary action
         self.btn_pause = QPushButton("Pause")
         self.btn_pause.setFixedWidth(130)
+
+        self.btn_reset.setToolTip("Reset the run (R)")
+        self.btn_step.setToolTip("Advance one step (S)")
+        self.btn_run.setToolTip("Run / pause (Space)")
+        self.btn_pause.setToolTip("Pause (Space or Esc)")
+        # Don't take keyboard focus, so the Space shortcut never double-triggers a
+        # focused button (Space/R/S can't accidentally re-activate a focused one).
+        for _btn in (self.btn_load, self.btn_reset, self.btn_step, self.btn_run, self.btn_pause):
+            _btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         # Map-editing controls (collapsed by default behind the "Map Tools" toggle)
         self.btn_edit = QPushButton("Edit Map")
@@ -134,6 +195,10 @@ class MainWindow(QMainWindow):
         self.btn_new_map = QPushButton("New Map")
         self.btn_save_map = QPushButton("Save Map")
         self.btn_save_map.setEnabled(False)
+        self.btn_save_map.setToolTip("Save the occupancy grid (free=white, obstacle=black) as a PNG")
+        self.btn_save_view = QPushButton("Save View")
+        self.btn_save_view.setEnabled(False)
+        self.btn_save_view.setToolTip("Export the rendered view (map + tree + path + markers + legend) as a PNG")
         self.spin_brush = QSpinBox()
         self.spin_brush.setRange(1, 80)
         self.spin_brush.setValue(8)
@@ -191,6 +256,8 @@ class MainWindow(QMainWindow):
         ]
         for lbl in status_labels:
             lbl.setStyleSheet("font-weight: bold;")
+            # Right-align values so numbers line up and don't shift as they change.
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     
     def _setup_layout(self) -> None:
         """Arrange all widgets in the window layout."""
@@ -217,6 +284,10 @@ class MainWindow(QMainWindow):
         # Status group box
         status_box = QGroupBox("Status")
         status_layout = QFormLayout()
+        # Fixed label column + growing field column keeps the right-aligned values
+        # in a stable column (no horizontal jitter as the numbers update).
+        status_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        status_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         status_layout.addRow("Algorithm:", self.lbl_algorithm)
         status_layout.addRow("Iteration:", self.lbl_iteration)
         status_layout.addRow("State:", self.lbl_status_state)
@@ -236,16 +307,29 @@ class MainWindow(QMainWindow):
         controls_row1.addWidget(self.btn_map_tools)
 
         # Map-editing tools live in a panel that is collapsed by default and shown
-        # only when the "Map Tools" toggle is expanded.
+        # only when the "Map Tools" toggle is expanded. The controls are split over
+        # two rows (drawing tools / map file actions) so the buttons are not cramped.
         self.map_tools_container = QWidget()
-        map_tools_row = QHBoxLayout()
-        map_tools_row.setContentsMargins(0, 0, 0, 0)
-        map_tools_row.addWidget(self.btn_edit)
-        map_tools_row.addWidget(QLabel("Brush:"))
-        map_tools_row.addWidget(self.spin_brush)
-        map_tools_row.addWidget(self.btn_new_map)
-        map_tools_row.addWidget(self.btn_save_map)
-        self.map_tools_container.setLayout(map_tools_row)
+        map_tools_col = QVBoxLayout()
+        map_tools_col.setContentsMargins(0, 0, 0, 0)
+        map_tools_col.setSpacing(4)
+
+        map_tools_edit_row = QHBoxLayout()
+        map_tools_edit_row.setContentsMargins(0, 0, 0, 0)
+        map_tools_edit_row.addWidget(self.btn_edit)
+        map_tools_edit_row.addWidget(QLabel("Brush:"))
+        map_tools_edit_row.addWidget(self.spin_brush)
+        map_tools_edit_row.addStretch(1)
+
+        map_tools_file_row = QHBoxLayout()
+        map_tools_file_row.setContentsMargins(0, 0, 0, 0)
+        map_tools_file_row.addWidget(self.btn_new_map)
+        map_tools_file_row.addWidget(self.btn_save_map)
+        map_tools_file_row.addWidget(self.btn_save_view)
+
+        map_tools_col.addLayout(map_tools_edit_row)
+        map_tools_col.addLayout(map_tools_file_row)
+        self.map_tools_container.setLayout(map_tools_col)
         self.map_tools_container.setVisible(False)
 
         controls_row2 = QHBoxLayout()
@@ -311,6 +395,9 @@ class MainWindow(QMainWindow):
         self.last_found_path: Optional[List[Point]] = None
         self.last_found_algo: Optional[str] = None
         self.optimizing_from_sampling: bool = False
+        # Smoothed display path for optimizer animations: the shown path eases
+        # toward each new iterate so a fast/oscillating optimizer doesn't wobble.
+        self._opt_display_path: List[Tuple[float, float]] = []
 
     def _reset_solver_metrics(self) -> None:
         """Reset runtime metrics for a fresh planning attempt."""
@@ -370,12 +457,12 @@ class MainWindow(QMainWindow):
             self._clear_path_metrics_labels()
             return
 
-        self.lbl_path_length.setText(f"{metrics.length_px:.1f}px")
+        self.lbl_path_length.setText(f"{metrics.length_px:.1f} px")
         self.lbl_min_clearance.setText(
-            "-" if metrics.min_clearance_px is None else f"{metrics.min_clearance_px:.1f}px"
+            "-" if metrics.min_clearance_px is None else f"{metrics.min_clearance_px:.1f} px"
         )
         self.lbl_mean_clearance.setText(
-            "-" if metrics.mean_clearance_px is None else f"{metrics.mean_clearance_px:.1f}px"
+            "-" if metrics.mean_clearance_px is None else f"{metrics.mean_clearance_px:.1f} px"
         )
         self.lbl_smoothness.setText(
             "-" if metrics.smoothness is None else f"{metrics.smoothness:.3f} rad^2"
@@ -399,6 +486,7 @@ class MainWindow(QMainWindow):
         self.btn_edit.toggled.connect(self._on_edit_toggled)
         self.btn_new_map.clicked.connect(self.new_map)
         self.btn_save_map.clicked.connect(self.save_map)
+        self.btn_save_view.clicked.connect(self.save_view)
         self.btn_map_tools.toggled.connect(self._on_map_tools_toggled)
     
     def _populate_algo_combo(self):
@@ -557,6 +645,7 @@ class MainWindow(QMainWindow):
         self._update_status_display(state="Idle", info="Click START then GOAL on a free (white) pixel.")
         self._set_buttons_enabled(False)
         self.btn_save_map.setEnabled(True)
+        self.btn_save_view.setEnabled(True)
         self._reset_solver_metrics()
         self._cancel_pending_build()
         self.planner = None
@@ -585,6 +674,7 @@ class MainWindow(QMainWindow):
         self.running_algo_name = None
         self._reset_solver_metrics()
         self.btn_save_map.setEnabled(True)
+        self.btn_save_view.setEnabled(True)
         if not self.btn_edit.isChecked():
             self.btn_edit.setChecked(True)  # triggers _on_edit_toggled
         else:
@@ -605,6 +695,22 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", "Could not write image.")
             return
         self._update_status_display(info=f"Saved map to {os.path.basename(path)}")
+
+    def save_view(self):
+        """Save a screenshot of the rendered canvas (map + tree + path + markers + legend)."""
+        if self.occ is None:
+            QMessageBox.information(self, "Info", "No map to save.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save view", "", "PNG image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        # grab() captures exactly what is drawn in the canvas (overlays + legend).
+        if not self.canvas.grab().save(path, "PNG"):
+            QMessageBox.critical(self, "Error", "Could not write image.")
+            return
+        self._update_status_display(info=f"Saved view to {os.path.basename(path)}")
 
     def _on_map_tools_toggled(self, expanded: bool):
         """Show or hide the collapsible map-editing tools panel."""
@@ -720,6 +826,17 @@ class MainWindow(QMainWindow):
         else:
             QApplication.restoreOverrideCursor()
             self.btn_edit.setEnabled(True)
+            # Re-enable the playback buttons that entering the preparing state
+            # disabled, so Step/Run stay clickable after an off-thread build
+            # finishes. (For Run, the playback continuation overrides this to the
+            # running state right after; a Step continuation leaves them enabled.)
+            ready = (
+                self.occ is not None
+                and self.canvas.start is not None
+                and self.canvas.goal is not None
+            )
+            self.btn_step.setEnabled(ready)
+            self.btn_run.setEnabled(ready)
 
     def _cancel_pending_build(self):
         """Invalidate any in-flight off-thread build (its result is discarded)."""
@@ -772,6 +889,7 @@ class MainWindow(QMainWindow):
             self.running_algo_name = algo_name
             self._reset_solver_metrics()
             self.optimizing_from_sampling = False
+            self.canvas.legend_optimized = False
             self.btn_pause.setText("Pause")
             self.btn_pause.setEnabled(False)
             continuation()
@@ -844,6 +962,7 @@ class MainWindow(QMainWindow):
 
         self.planner = None  # force a fresh build
         self.optimizing_from_sampling = False
+        self.canvas.legend_optimized = False
 
     def step_once(self):
         # If planner is done, restart it (new seed), then step once it is built.
@@ -884,6 +1003,7 @@ class MainWindow(QMainWindow):
     def _begin_playback(self):
         if self.planner is None:
             return
+        self._opt_display_path = []  # fresh smoothing state for this run
         self.canvas.set_optimizer_animation_profile(live=not isinstance(self.planner, CHOMPPlanner))
         self.is_playing = True
         self._set_running_state()
@@ -950,11 +1070,15 @@ class MainWindow(QMainWindow):
 
         chomp_params = self.params_widgets['CHOMP'].get_params()
 
-        # Keep the originally found path visible while CHOMP optimizes over it.
+        # Keep the originally found path visible as a dashed reference so the run
+        # shows the path's evolution (original sampling path -> optimized path).
         self.canvas.clear_current_tree()
         self.canvas.clear_path()
-        self.canvas.clear_reference_path()
+        self.canvas.clear_final_path()
+        self.canvas.set_reference_path(base_path, color=QColor(Qt.GlobalColor.yellow))
+        self.canvas.legend_optimized = True
         self.canvas.set_optimizer_animation_profile(live=True)
+        self._opt_display_path = []  # fresh smoothing state for this optimization
 
         self.planner = CHOMPPlanner(
             self.occ,
@@ -1017,11 +1141,20 @@ class MainWindow(QMainWindow):
         else:
             self.canvas.fade_highlights(fade_amount=30 if self.is_playing else 60)
         
-        # MAX mode: run many steps per tick for maximum speed, but update display periodically
-        if is_chomp:
-            num_steps = 1
-            display_interval = 1
-            tick_time_budget = None
+        # Optimizers (CHOMP/GPMP): the display is decoupled from the computation, so
+        # batch iterations per tick scaled by the speed slider. At MAX, run a
+        # time-budgeted batch (converges fast); lower speeds show fewer iterations
+        # per frame down to 1/tick for detailed watching. The display is updated
+        # once per tick (after the batch) via _update_optimizer_display.
+        is_optimizer = isinstance(self.planner, (CHOMPPlanner, GPMPPlanner))
+        if is_optimizer:
+            if speed >= 1000:
+                num_steps = 1000                  # cap; tick_time_budget stops it
+                tick_time_budget = 0.015          # ~15 ms of optimizer compute / frame
+            else:
+                num_steps = max(1, speed // 100)  # 1/tick at low speed (full detail)
+                tick_time_budget = None
+            display_interval = num_steps
         elif speed >= 1000:
             if isinstance(self.planner, PSOPlanner):
                 num_steps = 500  # PSO benefits from larger batches
@@ -1045,20 +1178,23 @@ class MainWindow(QMainWindow):
             self._handle_step_result(result)
             
             # In MAX mode, update display periodically for visual feedback
-            if speed >= 1000 and not is_chomp and (i + 1) % display_interval == 0:
+            if speed >= 1000 and not is_optimizer and (i + 1) % display_interval == 0:
                 self.canvas.fade_highlights(fade_amount=120)  # Extra fade during updates
                 self.canvas._update_display()
                 self._update_stopwatch_label()
                 self._update_status_display(state="Running", info=self.planner.get_status())
                 QApplication.processEvents()  # Allow UI to refresh
-            
+
             if self.planner.done:
                 break
 
             # In MAX mode, do not monopolize the UI thread with long batches.
             if tick_time_budget is not None and (time.perf_counter() - tick_start) >= tick_time_budget:
                 break
-        
+
+        # Optimizers update their (smoothed) display once per tick, after the batch.
+        if is_optimizer:
+            self._update_optimizer_display()
         self.canvas._update_display()
         self._check_done()
     
@@ -1073,24 +1209,37 @@ class MainWindow(QMainWindow):
                 self.canvas.draw_edge(edge[0], edge[1], color=edge_color)
         elif result.edge and not is_gpmp and not is_chomp and not is_bitstar:
             self.canvas.draw_edge(result.edge[0], result.edge[1], color=edge_color)
-        elif is_bitstar:
-            if self.planner is not None and hasattr(self.planner, "extract_tree_edges"):
-                self.canvas.set_current_tree_edges(self.planner.extract_tree_edges())
+        elif is_bitstar and self.planner is not None and hasattr(self.planner, "extract_tree_edges"):
+            self.canvas.set_current_tree_edges(self.planner.extract_tree_edges())
         if result.rejected_point:
             self.canvas.add_rejected_highlight(result.rejected_point)
             self.canvas._update_display()
-        if (is_gpmp or is_chomp) and self.planner is not None:
-            display_path = self.planner.extract_display_path()
-            if display_path:
-                style = "optimizer_post" if self.optimizing_from_sampling else "optimizer"
-                self.canvas.set_current_path(display_path, style=style, focus_point=None)
         # For RRT*: always keep the current best path visible
         if self.planner is not None and self.planner.found_path:
             path = self.planner.extract_path()
-            if path:
-                if not self.optimizing_from_sampling and not is_gpmp and not is_chomp:
-                    display_path = self.planner.extract_display_path() if hasattr(self.planner, "extract_display_path") else path
-                    self.canvas.set_current_path(list(display_path), style="default")
+            if path and not self.optimizing_from_sampling and not is_gpmp and not is_chomp:
+                display_path = self.planner.extract_display_path() if hasattr(self.planner, "extract_display_path") else path
+                self.canvas.set_current_path(list(display_path), style="default")
+
+    def _update_optimizer_display(self) -> None:
+        """Ease the displayed optimizer path toward the latest iterate.
+
+        Called once per tick (after a batch of iterations) so the shown path glides
+        smoothly toward the optimization state regardless of how many iterations ran
+        this frame. The finalizing step is intentionally not shown here so that
+        ``_check_done`` can morph from this smoothed path to the converged final.
+        """
+        if self.planner is None or self.planner.done:
+            return
+        display_path = self.planner.extract_display_path()
+        if not display_path:
+            return
+        style = "optimizer_post" if self.optimizing_from_sampling else "optimizer"
+        if len(self._opt_display_path) >= 2:
+            self._opt_display_path = blend_float_paths(self._opt_display_path, display_path, 0.3)
+        else:
+            self._opt_display_path = list(display_path)
+        self.canvas.set_current_path(self._opt_display_path, style=style, focus_point=None)
     
     def _check_done(self):
         if self.planner is None:
@@ -1118,12 +1267,19 @@ class MainWindow(QMainWindow):
         path = self.planner.extract_path()
         if isinstance(self.planner, BITStarPlanner):
             self.canvas.clear_current_tree()
-        self.canvas.clear_path()  # Clear live path
-        self.canvas.clear_reference_path()
         display_path = self.planner.extract_display_path() if hasattr(self.planner, "extract_display_path") else path
         if self.optimizing_from_sampling:
-            self.canvas.draw_path(display_path, permanent=True, color=QColor(255, 105, 180))
+            # Morph the live optimizer path to its final converged shape so the end
+            # of the optimization eases in instead of jumping; keep the original
+            # sampling path visible (as the reference) for the before/after view.
+            self.canvas.set_current_path(display_path, style="optimizer_post", animate=True)
+            # Once the morph finishes, settle to a clean solid line (drop the glow
+            # and the faint iteration trails so the final result reads cleanly).
+            final_display = list(display_path)
+            QTimer.singleShot(180, lambda: self._settle_optimized_path(final_display))
         else:
+            self.canvas.clear_path()  # Clear live path
+            self.canvas.clear_reference_path()
             self.canvas.draw_path(display_path, permanent=True, color=Qt.GlobalColor.yellow)
             self.last_found_path = list(path)
             self.last_found_algo = self.running_algo_name
@@ -1136,3 +1292,11 @@ class MainWindow(QMainWindow):
             self.optimizing_from_sampling = False
         else:
             self._offer_chomp_if_available()
+
+    def _settle_optimized_path(self, final_path: List[Tuple[float, float]]) -> None:
+        """After the end-of-optimization morph, replace the glowing live path and
+        its iteration trails with a clean solid optimized line."""
+        if not self.canvas.legend_optimized or self.is_playing:
+            return  # a new run/reset took over in the meantime; leave it alone
+        self.canvas.clear_path()  # drop current_path, history, previous (glow + trails)
+        self.canvas.draw_path(final_path, permanent=True, color=QColor(255, 105, 180))

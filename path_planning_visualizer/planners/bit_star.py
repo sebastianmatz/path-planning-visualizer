@@ -5,83 +5,13 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QCheckBox,
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ..types import Point, Edge
 from ..geometry import (
     line_collision_free,
     smooth_display_path,
 )
-from .base import BasePlanner, StepResult
+from ..types import Edge, Point
 from ._rgg import rgg_radius
-
-
-class BITStarParamsWidget(QWidget):
-    """Parameters widget for BIT* planner."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_batch_size = QSpinBox()
-        self.spin_batch_size.setRange(50, 2000)
-        self.spin_batch_size.setValue(200)
-        self.spin_batch_size.setToolTip("Samples per batch")
-        
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(100, 50000)
-        self.spin_max_iters.setValue(10000)
-        self.spin_max_iters.setToolTip("Maximum iterations")
-        
-        self.spin_rewire_radius = QDoubleSpinBox()
-        self.spin_rewire_radius.setRange(0.0, 300.0)
-        self.spin_rewire_radius.setSingleStep(5.0)
-        self.spin_rewire_radius.setValue(0.0)
-        self.spin_rewire_radius.setToolTip("Connection / rewiring radius (0 = auto)")
-
-        self.spin_step_size = QDoubleSpinBox()
-        self.spin_step_size.setRange(4.0, 100.0)
-        self.spin_step_size.setSingleStep(2.0)
-        self.spin_step_size.setValue(26.0)
-        self.spin_step_size.setToolTip("Local connection length cap (only used when the cap is enabled)")
-
-        self.check_cap_edges = QCheckBox("Cap edges at step size (visualization)")
-        self.check_cap_edges.setChecked(False)
-        self.check_cap_edges.setToolTip(
-            "Off (default): connect within the full RGG radius (paper-faithful, "
-            "asymptotically optimal). On: cap local connections at the step size "
-            "for a tidier visualization."
-        )
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-
-        layout.addRow("Batch size:", self.spin_batch_size)
-        layout.addRow("Max iterations:", self.spin_max_iters)
-        layout.addRow("Rewire radius:", self.spin_rewire_radius)
-        layout.addRow("Step size:", self.spin_step_size)
-        layout.addRow("", self.check_cap_edges)
-        layout.addRow("Seed:", self.spin_seed)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'batch_size': self.spin_batch_size.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'rewire_radius': self.spin_rewire_radius.value() if self.spin_rewire_radius.value() > 0 else None,
-            'step_size': self.spin_step_size.value(),
-            'cap_edges_to_step': self.check_cap_edges.isChecked(),
-            'seed': self.spin_seed.value(),
-        }
+from .base import BasePlanner, StepResult
 
 
 class BITStarPlanner(BasePlanner):
@@ -174,10 +104,7 @@ class BITStarPlanner(BasePlanner):
         # Semi-axes of the ellipse
         r1 = c_best / 2.0
         r2_sq = c_best**2 - self.c_min**2
-        if r2_sq <= 0:
-            r2 = 1.0
-        else:
-            r2 = np.sqrt(r2_sq) / 2.0
+        r2 = 1.0 if r2_sq <= 0 else np.sqrt(r2_sq) / 2.0
         
         # Sample in unit disk
         theta = self.rng.uniform(0, 2 * np.pi)
@@ -616,12 +543,4 @@ class BITStarPlanner(BasePlanner):
             f"Qv={len(self.Q_V)}, Qe={len(self.Q_E)}, cc={self.edge_collision_checks}, cost: {cost_str}"
         )
     
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return BITStarParamsWidget()
     
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'BITStarPlanner':
-        params = params_widget.get_params()
-        return BITStarPlanner(occ, start, goal, **params)

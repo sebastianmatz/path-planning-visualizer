@@ -4,64 +4,15 @@ from typing import List, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
+from ..geometry import line_collision_free
 from ._trajectory import (
     escape_init,
     fd_acceleration_matrix,
     make_sdf,
-    sdf_query,
+    sdf_query_batch,
     straight_line,
 )
-from ..geometry import line_collision_free
 from .base import BasePlanner, StepResult
-
-
-class ITOMPParamsWidget(QWidget):
-    """Parameters widget for ITOMP planner."""
-
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-
-        self.spin_num_points = QSpinBox()
-        self.spin_num_points.setRange(10, 100)
-        self.spin_num_points.setValue(30)
-        self.spin_num_points.setToolTip("Trajectory waypoints")
-
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(100, 10000)
-        self.spin_max_iters.setValue(1000)
-        self.spin_max_iters.setToolTip("Maximum iterations")
-
-        self.spin_replan_interval = QSpinBox()
-        self.spin_replan_interval.setRange(1, 100)
-        self.spin_replan_interval.setValue(20)
-        self.spin_replan_interval.setToolTip("Iterations between execution-horizon advances")
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed (kept for interface compatibility; optimizer is deterministic)")
-
-        layout.addRow("Waypoints:", self.spin_num_points)
-        layout.addRow("Max iters:", self.spin_max_iters)
-        layout.addRow("Replan interval:", self.spin_replan_interval)
-        layout.addRow("Seed:", self.spin_seed)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'num_points': self.spin_num_points.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'replan_interval': self.spin_replan_interval.value(),
-            'seed': self.spin_seed.value(),
-        }
 
 
 class ITOMPPlanner(BasePlanner):
@@ -123,16 +74,16 @@ class ITOMPPlanner(BasePlanner):
 
     def _static_obstacle_cost(self) -> float:
         """ITOMP static obstacle cost (Eq. 8): sum of max(eps - d, 0) * ||x_dot||."""
+        if self.n_int <= 0:
+            return 0.0
         full = self.trajectory
-        total = 0.0
-        for j in range(self.n_int):
-            d, _ = sdf_query(self.dist_field, self.grad_x, self.grad_y,
-                             full[j + 1, 0], full[j + 1, 1])
-            hinge = max(self.epsilon - d, 0.0)
-            if hinge > 0.0:
-                vel = (full[j + 2] - full[j]) * 0.5
-                total += hinge * float(np.linalg.norm(vel))
-        return total
+        interior = full[1:-1]
+        d, _ = sdf_query_batch(self.dist_field, self.grad_x, self.grad_y,
+                               interior[:, 0], interior[:, 1])
+        hinge = np.maximum(self.epsilon - d, 0.0)
+        vel = (full[2:] - full[:-2]) * 0.5  # central-difference velocity at each interior point
+        speed = np.linalg.norm(vel, axis=1)
+        return float(np.sum(hinge * speed))
 
     def step_once(self) -> StepResult:
         if self.done:
@@ -157,13 +108,13 @@ class ITOMPPlanner(BasePlanner):
             # is active (d < eps) is -||x_dot|| * grad(d), pushing away from obstacles.
             full = self.trajectory
             g = np.zeros((self.n_int, 2), dtype=np.float64)
-            for j in active:
-                d, normal = sdf_query(self.dist_field, self.grad_x, self.grad_y,
-                                      theta[j, 0], theta[j, 1])
-                if d < self.epsilon:
-                    vel = (full[j + 2] - full[j]) * 0.5  # workspace velocity at interior point j
-                    vmag = float(np.linalg.norm(vel))
-                    g[j] = -self.obstacle_weight * vmag * normal
+            pts = theta[idx]
+            d_arr, normals = sdf_query_batch(self.dist_field, self.grad_x, self.grad_y,
+                                             pts[:, 0], pts[:, 1])
+            vel = (full[2:] - full[:-2]) * 0.5  # workspace velocity at each interior point
+            vmag = np.linalg.norm(vel[idx], axis=1)
+            active_hinge = (d_arr < self.epsilon).astype(np.float64)  # 0 where d >= eps
+            g[idx] = -self.obstacle_weight * (vmag * active_hinge)[:, None] * normals
 
             # Smoothness gradient (acceleration energy).
             accel = self.A @ theta + self.c
@@ -209,12 +160,3 @@ class ITOMPPlanner(BasePlanner):
         progress = self.exec_idx / (self.num_points - 1) * 100
         return f"ITOMP: iter {self.iteration}, exec: {progress:.0f}%, {status}"
 
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return ITOMPParamsWidget()
-
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'ITOMPPlanner':
-        params = params_widget.get_params()
-        return ITOMPPlanner(occ, start, goal, **params)

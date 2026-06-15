@@ -5,13 +5,13 @@ from typing import List, Optional
 
 import numpy as np
 
-from .types import Point
 from .geometry import (
     compute_path_length,
     iter_path_pixels,
     resample_path_points,
     segment_points,
 )
+from .types import Point
 
 
 def compute_path_min_clearance(path: List[Point], clearance_field: np.ndarray) -> float:
@@ -67,6 +67,16 @@ def compute_path_smoothness(path: List[Point], spacing: float = 4.0) -> float:
     return float(np.mean(np.square(turn_angles)))
 
 
+@dataclass(frozen=True)
+class PathMetrics:
+    """Summary metrics for a final path."""
+
+    length_px: float
+    min_clearance_px: Optional[float] = None
+    mean_clearance_px: Optional[float] = None
+    smoothness: Optional[float] = None
+
+
 def compute_path_metrics(path: List[Point], clearance_field: Optional[np.ndarray]) -> PathMetrics:
     """Compute the main path-quality metrics used in the UI."""
     length_px = compute_path_length(path)
@@ -79,13 +89,3 @@ def compute_path_metrics(path: List[Point], clearance_field: Optional[np.ndarray
         mean_clearance_px=compute_path_mean_clearance(path, clearance_field),
         smoothness=compute_path_smoothness(path),
     )
-
-
-@dataclass(frozen=True)
-class PathMetrics:
-    """Summary metrics for a final path."""
-
-    length_px: float
-    min_clearance_px: Optional[float] = None
-    mean_clearance_px: Optional[float] = None
-    smoothness: Optional[float] = None

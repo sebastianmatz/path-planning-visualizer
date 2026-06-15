@@ -1,25 +1,19 @@
 from __future__ import annotations
 
+from .apf import APFPlanner
+from .astar import AStarPlanner
 from .base import BasePlanner, StepResult
-from .rrt import RRTParamsWidget, RRTPlanner
-from .rrt_connect import RRTConnectParamsWidget, RRTConnectPlanner
-from .bitrrt import BiTRRTParamsWidget, BiTRRTPlanner
-from .kpiece import KPIECEParamsWidget, KPIECEPlanner
-from .rrt_star import RRTStarParamsWidget, RRTStarPlanner
-from .prm import ClassicPRMPlanner, PRMParamsWidget, PRMPlanner
-from .sbl import SBLParamsWidget, SBLPlanner
-from .fmt_star import FMTStarParamsWidget, FMTStarPlanner
-from .bit_star import BITStarParamsWidget, BITStarPlanner
-from .astar import AStarParamsWidget, AStarPlanner
-from .dijkstra import DijkstraParamsWidget, DijkstraPlanner
-from .apf import APFParamsWidget, APFPlanner
-from .chomp import CHOMPParamsWidget, CHOMPPlanner
-from .stomp import STOMPParamsWidget, STOMPPlanner
-from .trajopt import TrajOptParamsWidget, TrajOptPlanner
-from .itomp import ITOMPParamsWidget, ITOMPPlanner
-from .gpmp import GPMPParamsWidget, GPMPPlanner
-from .pso import PSOParamsWidget, PSOPlanner
-from .genetic import GeneticParamsWidget, GeneticPlanner
+from .bit_star import BITStarPlanner
+from .bitrrt import BiTRRTPlanner
+from .chomp import CHOMPPlanner
+from .dijkstra import DijkstraPlanner
+from .fmt_star import FMTStarPlanner
+from .genetic import GeneticPlanner
+from .gpmp import GPMPPlanner
+from .itomp import ITOMPPlanner
+from .kpiece import KPIECEPlanner
+from .prm import ClassicPRMPlanner, PRMPlanner
+from .pso import PSOPlanner
 from .registry import (
     ALGORITHM_GROUPS,
     ALGORITHM_INFO,
@@ -27,28 +21,34 @@ from .registry import (
     AVAILABLE_PLANNERS,
     SAMPLING_BASED_ALGOS,
 )
+from .rrt import RRTPlanner
+from .rrt_connect import RRTConnectPlanner
+from .rrt_star import RRTStarPlanner
+from .sbl import SBLPlanner
+from .stomp import STOMPPlanner
+from .trajopt import TrajOptPlanner
 
 __all__ = [
     "BasePlanner", "StepResult",
-    "RRTParamsWidget", "RRTPlanner",
-    "RRTConnectParamsWidget", "RRTConnectPlanner",
-    "BiTRRTParamsWidget", "BiTRRTPlanner",
-    "KPIECEParamsWidget", "KPIECEPlanner",
-    "RRTStarParamsWidget", "RRTStarPlanner",
-    "PRMParamsWidget", "PRMPlanner", "ClassicPRMPlanner",
-    "SBLParamsWidget", "SBLPlanner",
-    "FMTStarParamsWidget", "FMTStarPlanner",
-    "BITStarParamsWidget", "BITStarPlanner",
-    "AStarParamsWidget", "AStarPlanner",
-    "DijkstraParamsWidget", "DijkstraPlanner",
-    "APFParamsWidget", "APFPlanner",
-    "CHOMPParamsWidget", "CHOMPPlanner",
-    "STOMPParamsWidget", "STOMPPlanner",
-    "TrajOptParamsWidget", "TrajOptPlanner",
-    "ITOMPParamsWidget", "ITOMPPlanner",
-    "GPMPParamsWidget", "GPMPPlanner",
-    "PSOParamsWidget", "PSOPlanner",
-    "GeneticParamsWidget", "GeneticPlanner",
+    "RRTPlanner",
+    "RRTConnectPlanner",
+    "BiTRRTPlanner",
+    "KPIECEPlanner",
+    "RRTStarPlanner",
+    "PRMPlanner", "ClassicPRMPlanner",
+    "SBLPlanner",
+    "FMTStarPlanner",
+    "BITStarPlanner",
+    "AStarPlanner",
+    "DijkstraPlanner",
+    "APFPlanner",
+    "CHOMPPlanner",
+    "STOMPPlanner",
+    "TrajOptPlanner",
+    "ITOMPPlanner",
+    "GPMPPlanner",
+    "PSOPlanner",
+    "GeneticPlanner",
     "ALGORITHM_GROUPS", "ALGORITHM_INFO", "ANYTIME_ALGOS",
     "AVAILABLE_PLANNERS", "SAMPLING_BASED_ALGOS",
 ]

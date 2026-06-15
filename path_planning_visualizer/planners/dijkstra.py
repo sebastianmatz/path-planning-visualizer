@@ -4,42 +4,7 @@ from typing import Dict, List, Set, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QCheckBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
 from .base import BasePlanner, StepResult
-
-
-class DijkstraParamsWidget(QWidget):
-    """Parameters widget for Dijkstra planner."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_grid_size = QSpinBox()
-        self.spin_grid_size.setRange(1, 20)
-        self.spin_grid_size.setValue(5)
-        self.spin_grid_size.setToolTip("Grid cell size")
-        
-        self.check_diagonal = QCheckBox()
-        self.check_diagonal.setChecked(True)
-        self.check_diagonal.setToolTip("Allow diagonal movement")
-        
-        layout.addRow("Grid size:", self.spin_grid_size)
-        layout.addRow("Diagonal:", self.check_diagonal)
-        
-        self.setLayout(layout)
-    
-    def get_params(self) -> dict:
-        return {
-            'grid_size': self.spin_grid_size.value(),
-            'allow_diagonal': self.check_diagonal.isChecked(),
-        }
 
 
 class DijkstraPlanner(BasePlanner):
@@ -180,12 +145,4 @@ class DijkstraPlanner(BasePlanner):
     def get_status(self) -> str:
         return f"Dijkstra: explored {len(self.closed_set)}, open {len(self.open_set)}"
     
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return DijkstraParamsWidget()
     
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'DijkstraPlanner':
-        params = params_widget.get_params()
-        return DijkstraPlanner(occ, start, goal, **params)

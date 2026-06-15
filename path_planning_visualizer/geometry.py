@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .types import Point, FloatPoint, OccupancyGrid
+from .types import FloatPoint, OccupancyGrid, Point
 
 
 def dist(a: Point, b: Point) -> float:

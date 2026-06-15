@@ -4,9 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional
 
-from PyQt6.QtWidgets import QWidget
-
-from ..types import Point, Edge, OccupancyGrid
+from ..types import Edge, OccupancyGrid, Point
 
 
 @dataclass
@@ -109,33 +107,4 @@ class BasePlanner(ABC):
         """
         pass
     
-    @staticmethod
-    @abstractmethod
-    def get_params_widget() -> QWidget:
-        """Return a widget for configuring this planner's parameters.
-        
-        Returns:
-            QWidget for parameter configuration
-        """
-        pass
     
-    @staticmethod
-    @abstractmethod
-    def create_from_params(
-        occ: OccupancyGrid, 
-        start: Point, 
-        goal: Point, 
-        params_widget: QWidget
-    ) -> 'BasePlanner':
-        """Create a planner instance from the params widget.
-        
-        Args:
-            occ: Occupancy grid
-            start: Start position
-            goal: Goal position
-            params_widget: Widget containing parameter values
-            
-        Returns:
-            New planner instance configured with widget parameters
-        """
-        pass

@@ -5,13 +5,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ..types import Point, Edge
 from ..geometry import (
     clamp_point,
     compute_path_length,
@@ -20,6 +13,7 @@ from ..geometry import (
     linf_dist,
     segment_points,
 )
+from ..types import Edge, Point
 from .base import BasePlanner, StepResult
 
 
@@ -39,63 +33,6 @@ class SBLNode:
     tree_id: int
     parent: Optional[int] = None
     children: Set[int] = field(default_factory=set)
-
-
-class SBLParamsWidget(QWidget):
-    """Parameters widget for the SBL planner."""
-
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-
-        self.spin_maxit = QSpinBox()
-        self.spin_maxit.setRange(100, 200000)
-        self.spin_maxit.setValue(12000)
-        self.spin_maxit.setToolTip("Maximum number of milestone expansion iterations")
-
-        self.spin_rho = QSpinBox()
-        self.spin_rho.setRange(2, 400)
-        self.spin_rho.setValue(45)
-        self.spin_rho.setToolTip("SBL distance threshold rho for local expansion and tree connection")
-
-        self.spin_resolution = QSpinBox()
-        self.spin_resolution.setRange(1, 50)
-        self.spin_resolution.setValue(4)
-        self.spin_resolution.setToolTip("Lazy segment resolution epsilon in pixels")
-
-        self.spin_candidates = QSpinBox()
-        self.spin_candidates.setRange(1, 20)
-        self.spin_candidates.setValue(6)
-        self.spin_candidates.setToolTip("Maximum number of shrinking-neighborhood candidates per expansion")
-
-        self.spin_grid_cells = QSpinBox()
-        self.spin_grid_cells.setRange(2, 50)
-        self.spin_grid_cells.setValue(10)
-        self.spin_grid_cells.setToolTip("Spatial indexing resolution per tree (cells per axis)")
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-
-        layout.addRow("Max iterations:", self.spin_maxit)
-        layout.addRow("Rho:", self.spin_rho)
-        layout.addRow("Lazy resolution:", self.spin_resolution)
-        layout.addRow("Candidates:", self.spin_candidates)
-        layout.addRow("Grid cells:", self.spin_grid_cells)
-        layout.addRow("Seed:", self.spin_seed)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'max_iters': self.spin_maxit.value(),
-            'rho': self.spin_rho.value(),
-            'lazy_resolution': self.spin_resolution.value(),
-            'max_candidates': self.spin_candidates.value(),
-            'grid_cells': self.spin_grid_cells.value(),
-            'seed': self.spin_seed.value(),
-        }
 
 
 class SBLPlanner(BasePlanner):
@@ -601,12 +538,3 @@ class SBLPlanner(BasePlanner):
             f"checks {self.lazy_checks}, transfers {self.transfer_count}"
         )
 
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return SBLParamsWidget()
-
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'SBLPlanner':
-        params = params_widget.get_params()
-        return SBLPlanner(occ, start, goal, **params)

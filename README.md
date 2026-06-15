@@ -3,7 +3,7 @@
 [![CI](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml/badge.svg)](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Status](https://img.shields.io/badge/status-beta%20(0.1.0b9)-orange)
+![Status](https://img.shields.io/badge/status-beta%20(0.1.0b10)-orange)
 
 An interactive desktop application for **exploring, comparing, and tuning path-planning algorithms** for a 2D point robot on occupancy-grid maps. It bundles 20 planners — sampling-based, graph-search, potential-field, trajectory-optimization, and metaheuristic — behind one UI, with step-through visualization, live path metrics, an interactive map editor, and a reproducible headless benchmark.
 
@@ -57,14 +57,16 @@ path-planning-visualizer
 2. Click a free (white) pixel to place the **start**, then another to place the **goal**.
 3. Pick an algorithm from the grouped dropdown and adjust its parameters in the left panel.
 4. **Step** advances the planner incrementally; **Run** plays it continuously; **Reset** clears the run.
+   (Keyboard: Space = Run/Pause, `S` = Step, `R` = Reset, Esc = stop.)
 5. The **Status** panel shows live path metrics, compute times, and the planner's status string.
 6. For sampling-based planners, pause once a path is found and click **CHOMP Optimize** to smooth it.
 
 **Editing maps.** The map tools are collapsed by default behind the **Map Tools** toggle in the left
 panel — click it to reveal them. Toggle **Edit Map** and left-drag to draw obstacles or right-drag to
 erase (the **Brush** spin sets the radius). **New Map** starts from a blank grid; **Save Map** writes
-the current grid to a PNG you can reload later. On large maps the planner is built on a background
-thread, so the window stays responsive and shows a brief *Preparing…* state before it starts.
+the current grid to a PNG you can reload later, and **Save View** exports a screenshot of the rendered
+map — with the tree, path, markers and legend — for figures. On large maps the planner is built on a
+background thread, so the window stays responsive and shows a brief *Preparing…* state before it starts.
 
 ## Algorithms
 
@@ -167,10 +169,10 @@ path_planning_visualizer/      application package
 ├── mapping.py                 occupancy-grid load / save / brush helpers
 ├── resources.py               bundled-asset path resolution
 ├── benchmark.py               headless cross-planner benchmark CLI
-├── planners/                  one module per planner, plus:
+├── planners/                  one module per planner (PyQt6-free), plus:
 │   ├── registry.py            planner registry, groups, and in-app citations
 │   └── _spatial, _rgg, _trajectory   shared helpers (spatial index, RGG radius, optimizer math)
-├── gui/                       ImageCanvas, MainWindow, off-thread PlannerBuilder
+├── gui/                       ImageCanvas, MainWindow, param_panels, off-thread PlannerBuilder
 └── assets/                    bundled example maps (maze.png, maze 2.png, maze 3.png)
 
 tests/                         pytest suite (planner behavior, optimality, GUI integration)

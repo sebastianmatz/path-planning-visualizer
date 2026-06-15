@@ -4,91 +4,15 @@ from typing import List, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
 from ..geometry import (
     clamp_point,
     dist,
     line_collision_free,
     steer,
 )
-from .base import BasePlanner, StepResult
-from ._spatial import GridIndex
 from ._rgg import rgg_radius
-
-
-class RRTStarParamsWidget(QWidget):
-    """Widget for RRT* parameter configuration."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_step = QSpinBox()
-        self.spin_step.setRange(1, 200)
-        self.spin_step.setValue(18)
-        self.spin_step.setToolTip("Distance for each tree expansion step")
-        
-        self.spin_goal_rate = QDoubleSpinBox()
-        self.spin_goal_rate.setRange(0.0, 1.0)
-        self.spin_goal_rate.setSingleStep(0.01)
-        self.spin_goal_rate.setValue(0.10)
-        self.spin_goal_rate.setToolTip("Probability of sampling the goal directly")
-        
-        self.spin_goal_tol = QSpinBox()
-        self.spin_goal_tol.setRange(1, 200)
-        self.spin_goal_tol.setValue(20)
-        self.spin_goal_tol.setToolTip("Distance threshold to consider goal reached")
-        
-        self.spin_search_radius = QSpinBox()
-        self.spin_search_radius.setRange(0, 500)
-        self.spin_search_radius.setValue(0)
-        self.spin_search_radius.setToolTip(
-            "0 = auto: shrinking RGG radius min(gamma*(log n/n)^(1/2), step), "
-            "asymptotically optimal (Karaman & Frazzoli 2011). "
-            ">0 = fixed radius (legacy)."
-        )
-        
-        self.spin_col = QSpinBox()
-        self.spin_col.setRange(10, 500)
-        self.spin_col.setValue(80)
-        self.spin_col.setToolTip("Number of samples for collision checking along edges")
-        
-        self.spin_maxit = QSpinBox()
-        self.spin_maxit.setRange(100, 200000)
-        self.spin_maxit.setValue(25000)
-        self.spin_maxit.setToolTip("Maximum number of iterations")
-        
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(1)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-        
-        layout.addRow("Step size:", self.spin_step)
-        layout.addRow("Goal sample rate:", self.spin_goal_rate)
-        layout.addRow("Goal tolerance:", self.spin_goal_tol)
-        layout.addRow("Search radius (0=auto):", self.spin_search_radius)
-        layout.addRow("Collision samples:", self.spin_col)
-        layout.addRow("Max iterations:", self.spin_maxit)
-        layout.addRow("Seed:", self.spin_seed)
-        
-        self.setLayout(layout)
-    
-    def get_params(self) -> dict:
-        return {
-            'step_size': self.spin_step.value(),
-            'goal_sample_rate': self.spin_goal_rate.value(),
-            'goal_tolerance': self.spin_goal_tol.value(),
-            'search_radius': self.spin_search_radius.value(),
-            'collision_samples': self.spin_col.value(),
-            'max_iters': self.spin_maxit.value(),
-            'seed': self.spin_seed.value(),
-        }
+from ._spatial import GridIndex
+from .base import BasePlanner, StepResult
 
 
 class RRTStarPlanner(BasePlanner):
@@ -201,10 +125,11 @@ class RRTStarPlanner(BasePlanner):
         
         for i in near_indices:
             potential_cost = self.cost[i] + dist(self.nodes[i], q_new)
-            if potential_cost < best_cost:
-                if line_collision_free(self.nodes[i], q_new, self.occ, samples=self.collision_samples):
-                    best_parent = i
-                    best_cost = potential_cost
+            if potential_cost < best_cost and line_collision_free(
+                self.nodes[i], q_new, self.occ, samples=self.collision_samples
+            ):
+                best_parent = i
+                best_cost = potential_cost
         
         # Add new node with best parent
         new_idx = self._add_node(q_new, best_parent, best_cost)
@@ -228,17 +153,18 @@ class RRTStarPlanner(BasePlanner):
             if i in ancestors:
                 continue  # Don't rewire ancestors (would create cycle)
             potential_cost = best_cost + dist(q_new, self.nodes[i])
-            if potential_cost < self.cost[i]:
-                if line_collision_free(q_new, self.nodes[i], self.occ, samples=self.collision_samples):
-                    self._set_parent(i, new_idx)
-                    self._update_costs(i, potential_cost)
+            if potential_cost < self.cost[i] and line_collision_free(
+                q_new, self.nodes[i], self.occ, samples=self.collision_samples
+            ):
+                self._set_parent(i, new_idx)
+                self._update_costs(i, potential_cost)
         
         # Track if path was improved this step
         path_improved = False
         
         # Check if goal reached
         goal_dist = dist(q_new, self.goal)
-        if goal_dist <= self.goal_tolerance:
+        if goal_dist <= self.goal_tolerance:  # noqa: SIM102 - nested kept for readability
             if line_collision_free(q_new, self.goal, self.occ, samples=self.collision_samples):
                 goal_cost = best_cost + goal_dist
                 if goal_cost < self.best_goal_cost:
@@ -306,12 +232,4 @@ class RRTStarPlanner(BasePlanner):
             radius_str = f", r {self.search_radius:.0f} (fixed)"
         return f"RRT*: iter {self.iteration}/{self.max_iters}, nodes {len(self.nodes)}{radius_str}{cost_str}"
     
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return RRTStarParamsWidget()
     
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'RRTStarPlanner':
-        params = params_widget.get_params()
-        return RRTStarPlanner(occ, start, goal, **params)

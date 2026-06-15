@@ -12,14 +12,13 @@ import time
 import cv2
 import numpy as np
 import pytest
-
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
-from path_planning_visualizer.geometry import line_collision_free, make_distance_field
-from path_planning_visualizer.mapping import image_to_occupancy, occupancy_to_image
-from path_planning_visualizer.gui.main_window import MainWindow
 import path_planning_visualizer.gui.main_window as mw
+from path_planning_visualizer.geometry import line_collision_free, make_distance_field
+from path_planning_visualizer.gui.main_window import MainWindow
+from path_planning_visualizer.mapping import image_to_occupancy, occupancy_to_image
 
 
 @pytest.fixture(scope="module")
@@ -79,12 +78,46 @@ def test_end_to_end_plan_finds_collision_free_path(qapp):
         assert len(path) >= 2
         assert path[0] == (5, 30)
         assert path[-1] == (55, 30)
-        for a, b in zip(path, path[1:]):
+        for a, b in zip(path, path[1:], strict=False):
             assert line_collision_free(a, b, occ)
 
         # The GUI's own metrics path should produce a positive length.
         metrics = win._get_path_metrics(path)
         assert metrics.length_px > 0
+    finally:
+        win.close()
+
+
+def test_step_button_stays_enabled_after_async_build(qapp):
+    # Regression: the first Step triggers an off-thread build, which entered the
+    # "preparing" state and disabled Step/Run; leaving that state must re-enable
+    # them, otherwise the Step button is dead after a single click.
+    win = MainWindow()
+    try:
+        occ = np.zeros((60, 60), dtype=bool)
+        _set_map(win, occ)
+        _select_algo(win, "RRT")
+        win.canvas.start = (5, 5)
+        win.canvas.goal = (55, 55)
+        win._on_point_picked("goal", (55, 55))  # enables the playback buttons
+        assert win.btn_step.isEnabled()
+
+        # First click: drives the async build path.
+        win.btn_step.click()
+        assert _spin_until(
+            qapp,
+            lambda: win.planner is not None
+            and not (win._builder is not None and win._builder.isRunning()),
+        )
+        assert win.btn_step.isEnabled(), "Step button must stay clickable after the build"
+        assert win.btn_run.isEnabled()
+        first_iter = win.planner.iteration
+
+        # Second click must actually step again (button was live).
+        win.btn_step.click()
+        qapp.processEvents()
+        assert win.planner.iteration > first_iter
+        assert win.btn_step.isEnabled()
     finally:
         win.close()
 

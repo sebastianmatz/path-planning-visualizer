@@ -130,3 +130,24 @@ def sdf_query(dist_field: np.ndarray, grad_x: np.ndarray, grad_y: np.ndarray,
     if norm > 1e-9:
         g = g / norm
     return d, g
+
+
+def sdf_query_batch(dist_field: np.ndarray, grad_x: np.ndarray, grad_y: np.ndarray,
+                    xs: np.ndarray, ys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorized :func:`sdf_query` over arrays of points.
+
+    Identical nearest-pixel semantics: returns ``(d, g)`` with ``d`` of shape
+    ``(n,)`` and unit clearance gradients ``g`` of shape ``(n, 2)`` (rows with a
+    ~zero gradient are left un-normalized, exactly like the scalar version).
+    Coordinates are clamped to the grid (lower bound 0, so ``int`` truncation and
+    ``astype`` floor agree).
+    """
+    h, w = dist_field.shape
+    ix = np.clip(np.asarray(xs, dtype=np.float64), 0, w - 1).astype(np.intp)
+    iy = np.clip(np.asarray(ys, dtype=np.float64), 0, h - 1).astype(np.intp)
+    d = dist_field[iy, ix].astype(np.float64)
+    g = np.stack((grad_x[iy, ix], grad_y[iy, ix]), axis=1).astype(np.float64)
+    norms = np.linalg.norm(g, axis=1)
+    mask = norms > 1e-9
+    g[mask] /= norms[mask, None]
+    return d, g

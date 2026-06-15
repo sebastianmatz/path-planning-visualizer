@@ -4,66 +4,14 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
+from ..geometry import line_collision_free
 from ._trajectory import (
     escape_init,
     make_sdf,
-    sdf_query,
+    sdf_query_batch,
     straight_line,
 )
-from ..geometry import line_collision_free
 from .base import BasePlanner, StepResult
-
-
-class TrajOptParamsWidget(QWidget):
-    """Parameters widget for TrajOpt planner."""
-
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-
-        self.spin_num_points = QSpinBox()
-        self.spin_num_points.setRange(10, 200)
-        self.spin_num_points.setValue(50)
-        self.spin_num_points.setToolTip("Number of waypoints")
-
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(10, 20000)
-        self.spin_max_iters.setValue(1000)
-        self.spin_max_iters.setToolTip("Maximum iterations")
-
-        self.spin_trust_region = QDoubleSpinBox()
-        self.spin_trust_region.setRange(1.0, 100.0)
-        self.spin_trust_region.setSingleStep(5.0)
-        self.spin_trust_region.setValue(20.0)
-        self.spin_trust_region.setToolTip("Initial trust-region box size")
-
-        self.spin_collision_weight = QDoubleSpinBox()
-        self.spin_collision_weight.setRange(1.0, 1000.0)
-        self.spin_collision_weight.setSingleStep(10.0)
-        self.spin_collision_weight.setValue(100.0)
-        self.spin_collision_weight.setToolTip("Initial collision penalty coefficient")
-
-        layout.addRow("Waypoints:", self.spin_num_points)
-        layout.addRow("Max iterations:", self.spin_max_iters)
-        layout.addRow("Trust region:", self.spin_trust_region)
-        layout.addRow("Collision weight:", self.spin_collision_weight)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'num_points': self.spin_num_points.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'trust_region': self.spin_trust_region.value(),
-            'collision_weight': self.spin_collision_weight.value(),
-        }
 
 
 class TrajOptPlanner(BasePlanner):
@@ -148,14 +96,10 @@ class TrajOptPlanner(BasePlanner):
             self.best_valid_trajectory = self.trajectory.copy()
 
     def _distances_and_normals(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        d = np.empty(self.n_int, dtype=np.float64)
-        normals = np.empty((self.n_int, 2), dtype=np.float64)
-        for j in range(self.n_int):
-            dj, gj = sdf_query(self.dist_field, self.grad_x, self.grad_y,
-                               theta[j, 0], theta[j, 1])
-            d[j] = dj
-            normals[j] = gj
-        return d, normals
+        # Batched nearest-pixel SDF lookup over the interior waypoints (identical to
+        # the per-point sdf_query it replaces).
+        return sdf_query_batch(self.dist_field, self.grad_x, self.grad_y,
+                               theta[:, 0], theta[:, 1])
 
     def _smoothness(self, theta: np.ndarray) -> Tuple[float, np.ndarray]:
         disp = self.A @ theta + self.c  # consecutive displacements (Eq. 5)
@@ -270,12 +214,3 @@ class TrajOptPlanner(BasePlanner):
         return (f"TrajOpt: iter {self.iteration}, mu {self.mu:.0f}, trust {self.trust_size:.2f}, "
                 f"viol {self.collision_cost:.2f}, {status}")
 
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return TrajOptParamsWidget()
-
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'TrajOptPlanner':
-        params = params_widget.get_params()
-        return TrajOptPlanner(occ, start, goal, **params)

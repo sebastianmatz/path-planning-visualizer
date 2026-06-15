@@ -5,56 +5,12 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ..types import Point, Edge
 from ..geometry import (
     line_collision_free,
 )
-from .base import BasePlanner, StepResult
+from ..types import Edge, Point
 from ._rgg import rgg_radius
-
-
-class FMTStarParamsWidget(QWidget):
-    """Parameters widget for FMT* planner."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_num_samples = QSpinBox()
-        self.spin_num_samples.setRange(50, 5000)
-        self.spin_num_samples.setValue(400)
-        self.spin_num_samples.setToolTip("Number of random samples (higher = more robust, slower)")
-        
-        self.spin_radius = QDoubleSpinBox()
-        self.spin_radius.setRange(0.0, 300.0)  # 0 = auto
-        self.spin_radius.setSingleStep(10.0)
-        self.spin_radius.setValue(0.0)  # Auto by default
-        self.spin_radius.setToolTip("Connection radius (0 = auto-compute FMT* radius for the 2D free space)")
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-        
-        layout.addRow("Num samples:", self.spin_num_samples)
-        layout.addRow("Radius (0=auto):", self.spin_radius)
-        layout.addRow("Seed:", self.spin_seed)
-        
-        self.setLayout(layout)
-    
-    def get_params(self) -> dict:
-        return {
-            'num_samples': self.spin_num_samples.value(),
-            'radius': self.spin_radius.value() if self.spin_radius.value() > 0 else None,
-            'seed': self.spin_seed.value(),
-        }
+from .base import BasePlanner, StepResult
 
 
 class FMTStarPlanner(BasePlanner):
@@ -232,12 +188,4 @@ class FMTStarPlanner(BasePlanner):
             f"unvisited {len(self.V_unvisited)}, cc {self.collision_checks}, {status}"
         )
     
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return FMTStarParamsWidget()
     
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'FMTStarPlanner':
-        params = params_widget.get_params()
-        return FMTStarPlanner(occ, start, goal, **params)

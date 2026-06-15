@@ -2,8 +2,8 @@
 
 Runs a chosen set of planners over a few built-in maps and several random seeds
 and reports success rate, path length, clearance, compute time and collision
-checks.  It is headless (no Qt) and uses only the standard library plus the
-package itself, so it can run in CI or from a plain shell::
+checks.  It is genuinely headless: importing the package no longer pulls in PyQt6
+(the planners are Qt-free), so it can run in CI or from a plain shell::
 
     python -m path_planning_visualizer.benchmark
     python -m path_planning_visualizer.benchmark --planners "A*,RRT*,BIT*" --seeds 5

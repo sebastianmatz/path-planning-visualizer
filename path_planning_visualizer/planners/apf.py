@@ -4,87 +4,10 @@ from typing import List, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QCheckBox,
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
 from ..geometry import (
     make_distance_field,
 )
 from .base import BasePlanner, StepResult
-
-
-class APFParamsWidget(QWidget):
-    """Parameters widget for APF planner."""
-
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-
-        self.spin_step_size = QDoubleSpinBox()
-        self.spin_step_size.setRange(0.5, 20.0)
-        self.spin_step_size.setSingleStep(0.5)
-        self.spin_step_size.setValue(5.0)
-        self.spin_step_size.setToolTip("Maximum speed V_max (per-step displacement cap; Khatib Eq. 16-17)")
-
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(100, 50000)
-        self.spin_max_iters.setValue(5000)
-        self.spin_max_iters.setToolTip("Maximum iterations")
-
-        self.spin_goal_gain = QDoubleSpinBox()
-        self.spin_goal_gain.setRange(0.01, 100.0)
-        self.spin_goal_gain.setSingleStep(0.1)
-        self.spin_goal_gain.setValue(1.0)
-        self.spin_goal_gain.setToolTip("Attractive stiffness k in F_att = -k(x - x_goal) (Khatib Eq. 12)")
-
-        self.spin_obstacle_gain = QDoubleSpinBox()
-        self.spin_obstacle_gain.setRange(1.0, 10000.0)
-        self.spin_obstacle_gain.setSingleStep(100.0)
-        self.spin_obstacle_gain.setValue(1000.0)
-        self.spin_obstacle_gain.setToolTip("Repulsive gain eta in the FIRAS force (Khatib Eq. 20)")
-
-        self.spin_obstacle_dist = QSpinBox()
-        self.spin_obstacle_dist.setRange(5, 100)
-        self.spin_obstacle_dist.setValue(30)
-        self.spin_obstacle_dist.setToolTip("Obstacle influence limit rho_0 (FIRAS); no repulsion beyond it")
-
-        self.chk_escape = QCheckBox("Enable local-minimum escape (non-paper)")
-        self.chk_escape.setChecked(False)
-        self.chk_escape.setToolTip(
-            "Off (default): pure APF; the robot stalls at local minima as Khatib documents. "
-            "On: add a stochastic kick to try to escape (a heuristic not in the paper)."
-        )
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed for the optional escape perturbations")
-
-        layout.addRow("Max speed (V_max):", self.spin_step_size)
-        layout.addRow("Max iterations:", self.spin_max_iters)
-        layout.addRow("Attractive gain (k):", self.spin_goal_gain)
-        layout.addRow("Repulsive gain (eta):", self.spin_obstacle_gain)
-        layout.addRow("Influence dist (rho_0):", self.spin_obstacle_dist)
-        layout.addRow("", self.chk_escape)
-        layout.addRow("Seed:", self.spin_seed)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'step_size': self.spin_step_size.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'goal_gain': self.spin_goal_gain.value(),
-            'obstacle_gain': self.spin_obstacle_gain.value(),
-            'obstacle_dist': self.spin_obstacle_dist.value(),
-            'enable_escape': self.chk_escape.isChecked(),
-            'seed': self.spin_seed.value(),
-        }
 
 
 class APFPlanner(BasePlanner):
@@ -202,10 +125,7 @@ class APFPlanner(BasePlanner):
                 return self._finish_no_path()
 
         # Velocity saturation: step along the force, capped at V_max (Eqs. 15-17).
-        if force_norm > self.v_max:
-            velocity = force * (self.v_max / force_norm)
-        else:
-            velocity = force
+        velocity = force * (self.v_max / force_norm) if force_norm > self.v_max else force
         new_pos = self.pos + velocity
 
         # Clamp to bounds.
@@ -260,12 +180,3 @@ class APFPlanner(BasePlanner):
             status = "descending"
         return f"APF: iter {self.iteration}, dist: {dist:.0f}, {status}"
 
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return APFParamsWidget()
-
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'APFPlanner':
-        params = params_widget.get_params()
-        return APFPlanner(occ, start, goal, **params)

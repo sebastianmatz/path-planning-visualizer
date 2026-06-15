@@ -4,72 +4,11 @@ from typing import List, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QCheckBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ..types import Point
 from ..geometry import (
     make_distance_field,
 )
+from ..types import Point
 from .base import BasePlanner, StepResult
-
-
-class PSOParamsWidget(QWidget):
-    """Parameters widget for PSO planner."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_num_particles = QSpinBox()
-        self.spin_num_particles.setRange(10, 200)
-        self.spin_num_particles.setValue(30)
-        self.spin_num_particles.setToolTip("Number of particles")
-        
-        self.spin_num_points = QSpinBox()
-        self.spin_num_points.setRange(5, 100)
-        self.spin_num_points.setValue(30)
-        self.spin_num_points.setToolTip("Waypoints per path")
-        
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(50, 5000)
-        self.spin_max_iters.setValue(1200)
-        self.spin_max_iters.setToolTip("Maximum iterations")
-
-        self.chk_safeguards = QCheckBox("Enable safeguards (non-1995)")
-        self.chk_safeguards.setChecked(False)
-        self.chk_safeguards.setToolTip(
-            "Off = exact Kennedy & Eberhart (1995) update: v += 2*r1*(pbest-x) + 2*r2*(gbest-x), "
-            "Vmax clamp, full momentum (w=1.0).\n"
-            "On = non-1995 robustness: adaptive inertia/social gain, diversity injection, "
-            "random immigrants, and swarm restart for cluttered maps."
-        )
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-
-        layout.addRow("Particles:", self.spin_num_particles)
-        layout.addRow("Waypoints:", self.spin_num_points)
-        layout.addRow("Max iters:", self.spin_max_iters)
-        layout.addRow(self.chk_safeguards)
-        layout.addRow("Seed:", self.spin_seed)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'num_particles': self.spin_num_particles.value(),
-            'num_points': self.spin_num_points.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'enable_safeguards': self.chk_safeguards.isChecked(),
-            'seed': self.spin_seed.value(),
-        }
 
 
 class PSOPlanner(BasePlanner):
@@ -204,10 +143,7 @@ class PSOPlanner(BasePlanner):
         return pts
 
     def _segment_collision_free(self, p1: np.ndarray, p2: np.ndarray) -> bool:
-        for x, y in self._segment_grid_points(p1, p2):
-            if self.occ[y, x]:
-                return False
-        return True
+        return all(not self.occ[y, x] for x, y in self._segment_grid_points(p1, p2))
 
     def _segment_cost_and_collision(self, p1: np.ndarray, p2: np.ndarray, samples: int) -> Tuple[float, bool]:
         """Compute segment clearance/collision cost in a single sampling pass."""
@@ -560,12 +496,4 @@ class PSOPlanner(BasePlanner):
             f"valid_particles: {self.valid_particle_count}/{self.num_particles}, {status}"
         )
     
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return PSOParamsWidget()
     
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'PSOPlanner':
-        params = params_widget.get_params()
-        return PSOPlanner(occ, start, goal, **params)

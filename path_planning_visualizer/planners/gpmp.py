@@ -4,53 +4,9 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ._trajectory import make_sdf, sdf_query, straight_line, escape_init
 from ..geometry import line_collision_free
+from ._trajectory import escape_init, make_sdf, sdf_query_batch, straight_line
 from .base import BasePlanner, StepResult
-
-
-class GPMPParamsWidget(QWidget):
-    """Parameters widget for GPMP planner."""
-
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-
-        self.spin_num_points = QSpinBox()
-        self.spin_num_points.setRange(10, 100)
-        self.spin_num_points.setValue(25)
-        self.spin_num_points.setToolTip("Number of GP support states")
-
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(50, 10000)
-        self.spin_max_iters.setValue(200)
-        self.spin_max_iters.setToolTip("Maximum Gauss-Newton iterations")
-
-        self.spin_sigma = QDoubleSpinBox()
-        self.spin_sigma.setRange(0.1, 50.0)
-        self.spin_sigma.setSingleStep(0.5)
-        self.spin_sigma.setValue(6.0)
-        self.spin_sigma.setToolTip("GP process-noise scale. Higher = softer prior.")
-
-        layout.addRow("Support states:", self.spin_num_points)
-        layout.addRow("Max iters:", self.spin_max_iters)
-        layout.addRow("Prior sigma:", self.spin_sigma)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'num_points': self.spin_num_points.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'sigma': self.spin_sigma.value(),
-        }
 
 
 def _phi(dt: float) -> np.ndarray:
@@ -77,25 +33,25 @@ def _q(dt: float, qc: float) -> np.ndarray:
 
 
 class GPMPPlanner(BasePlanner):
-    """GPMP - Gaussian Process Motion Planning (GPMP2 style, Mukadam et al. 2016).
+    """GPMP - Gaussian Process Motion Planning (Mukadam, Yan & Boots 2016).
 
     The trajectory is a set of GP support states ``[x, y, vx, vy]`` drawn from a
-    constant-velocity LTI Gaussian-process prior.  Planning is MAP inference on a
-    factor graph:
+    constant-velocity LTI Gaussian-process prior:
 
-    * **GP prior factors** connect consecutive states through the LTI model
+    * **GP prior** connects consecutive states through the LTI model
       ``e_i = theta_{i+1} - Phi theta_i`` weighted by the process-noise
       information ``Q^{-1}`` (a block-tridiagonal prior precision);
-    * **obstacle factors** penalize states *and* GP-interpolated intermediate
+    * **obstacle cost** penalizes states *and* GP-interpolated intermediate
       states whose signed distance falls below a safety margin, using the SDF
-      gradient as the Jacobian;
-    * optimization is **Gauss-Newton with Levenberg-Marquardt damping**: each
-      iteration linearizes all factors, solves the (dense here, sparse in
-      general) normal equations, and accepts the step if the objective drops.
+      gradient;
+    * optimization is the paper's **covariant gradient update**
+      ``xi <- xi - (1/eta) K grad U`` (Eq. 24): the cost-functional gradient
+      (GP-prior + obstacle terms) preconditioned by the GP covariance
+      ``K = (B^T Q^-1 B)^-1``, with a per-step position-step cap.
     """
 
     name = "GPMP"
-    description = "Gaussian Process Motion Planning with an LTI GP prior and Gauss-Newton MAP inference (Mukadam et al. 2016)"
+    description = "Gaussian Process Motion Planning: an LTI GP prior with GP interpolation, optimized by the covariant gradient update (Mukadam, Yan & Boots 2016)"
 
     def __init__(self, occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                  num_points: int = 25, max_iters: int = 200, sigma: float = 6.0,
@@ -168,15 +124,38 @@ class GPMPPlanner(BasePlanner):
         return states
 
     # ------------------------------------------------------------------- cost
-    def _obstacle_residual(self, pos: np.ndarray) -> Tuple[float, np.ndarray]:
-        """Whitened obstacle residual and d(residual)/d(position)."""
-        d, normal = sdf_query(self.dist_field, self.grad_x, self.grad_y, pos[0], pos[1])
-        if d >= self.epsilon:
-            return 0.0, np.zeros(2)
+    def _residuals_batch(self, pos_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Whitened obstacle residuals and d(residual)/d(position) for many points.
+
+        Vectorized form of the per-point residual: ``r = w*(eps - d)`` and
+        ``dr/dpos = -w*normal`` where ``d < eps`` (signed distance), else ``0``.
+        """
+        d, normal = sdf_query_batch(self.dist_field, self.grad_x, self.grad_y,
+                                    pos_xy[:, 0], pos_xy[:, 1])
         w = np.sqrt(self.obstacle_weight)
-        r = w * (self.epsilon - d)
-        # d r / d pos = w * d(eps - d)/d pos = -w * grad(d) = -w * normal
-        return r, -w * normal
+        active = d < self.epsilon
+        r = np.where(active, w * (self.epsilon - d), 0.0)
+        drdp = np.where(active[:, None], -w * normal, 0.0)
+        return r, drdp
+
+    def _obstacle_residuals(self, states: np.ndarray):
+        """Residuals (r, dr/dpos) at the support states and the GP-interpolated states.
+
+        Returns ``(r_sup, drdp_sup, r_int, drdp_int)`` indexed so that ``r_sup[i-1]``
+        is the residual at support state ``i`` and ``r_int[i, k]`` at the ``k``-th
+        interpolated state on segment ``i``. The SDF is queried in two batched calls.
+        """
+        n = self.num_points
+        nk = len(self.interp_taus)
+        r_sup, drdp_sup = self._residuals_batch(states[1:-1, :2])
+
+        interp_pos = np.empty((n - 1, nk, 2), dtype=np.float64)
+        for i in range(n - 1):
+            for k in range(nk):
+                inter = self.lambdas[k] @ states[i] + self.psis[k] @ states[i + 1]
+                interp_pos[i, k] = inter[:2]
+        r_int, drdp_int = self._residuals_batch(interp_pos.reshape(-1, 2))
+        return r_sup, drdp_sup, r_int.reshape(n - 1, nk), drdp_int.reshape(n - 1, nk, 2)
 
     def _total_cost(self, states: np.ndarray) -> float:
         prior = 0.0
@@ -184,15 +163,8 @@ class GPMPPlanner(BasePlanner):
             e = states[i + 1] - self.Phi @ states[i]
             prior += 0.5 * float(e @ self.Q_inv @ e)
 
-        obs = 0.0
-        for i in range(1, self.num_points - 1):
-            r, _ = self._obstacle_residual(states[i, :2])
-            obs += 0.5 * r * r
-        for i in range(self.num_points - 1):
-            for k in range(len(self.interp_taus)):
-                inter = self.lambdas[k] @ states[i] + self.psis[k] @ states[i + 1]
-                r, _ = self._obstacle_residual(inter[:2])
-                obs += 0.5 * r * r
+        r_sup, _, r_int, _ = self._obstacle_residuals(states)
+        obs = 0.5 * float(np.sum(r_sup * r_sup)) + 0.5 * float(np.sum(r_int * r_int))
 
         self.prior_cost = prior
         self.obs_cost = obs
@@ -243,25 +215,27 @@ class GPMPPlanner(BasePlanner):
             e = states[i + 1] - self.Phi @ states[i]
             add_factor([(i, -self.Phi), (i + 1, I4)], e, self.Q_inv)
 
+        # Obstacle residuals (support + GP-interpolated) from one batched SDF pass.
+        r_sup, drdp_sup, r_int, drdp_int = self._obstacle_residuals(states)
+
         # Obstacle gradient grad F_obs at the support states (scalar hinge residual).
         w1 = np.array([[1.0]])
         for i in range(1, self.num_points - 1):
-            r, drdp = self._obstacle_residual(states[i, :2])
+            r = r_sup[i - 1]
             if r == 0.0:
                 continue
             J = np.zeros((1, 4))
-            J[0, :2] = drdp
+            J[0, :2] = drdp_sup[i - 1]
             add_factor([(i, J)], np.array([r]), w1)
 
         # ... and at the GP-interpolated states (Eq. 32-36).
         for i in range(self.num_points - 1):
             for k in range(len(self.interp_taus)):
-                inter = self.lambdas[k] @ states[i] + self.psis[k] @ states[i + 1]
-                r, drdp = self._obstacle_residual(inter[:2])
+                r = r_int[i, k]
                 if r == 0.0:
                     continue
                 Jp = np.zeros((1, 4))
-                Jp[0, :2] = drdp
+                Jp[0, :2] = drdp_int[i, k]
                 add_factor([(i, Jp @ self.lambdas[k]), (i + 1, Jp @ self.psis[k])], np.array([r]), w1)
 
         return g
@@ -301,11 +275,10 @@ class GPMPPlanner(BasePlanner):
             self.best_valid_trajectory = self.states[:, :2].copy()
 
         # Convergence: negligible change in cost or a vanishing step.
-        if abs(cost0 - self.total_cost) < 1e-4 or pos_norm < 1e-3:
-            if self.found_path:
-                self.converged = True
-                self._finalize()
-                self.done = True
+        if (abs(cost0 - self.total_cost) < 1e-4 or pos_norm < 1e-3) and self.found_path:
+            self.converged = True
+            self._finalize()
+            self.done = True
 
         return StepResult(path_improved=self.found_path)
 
@@ -337,12 +310,3 @@ class GPMPPlanner(BasePlanner):
         return (f"GPMP: iter {self.iteration}, prior {self.prior_cost:.1f}, "
                 f"obs {self.obs_cost:.1f}, {status}")
 
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return GPMPParamsWidget()
-
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'GPMPPlanner':
-        params = params_widget.get_params()
-        return GPMPPlanner(occ, start, goal, **params)

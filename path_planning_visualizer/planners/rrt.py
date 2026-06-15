@@ -4,14 +4,6 @@ from typing import List, Optional, Set, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ..types import Point, FloatPoint, OccupancyGrid
 from ..geometry import (
     integrate_holonomic_state,
     line_collision_free,
@@ -19,78 +11,9 @@ from ..geometry import (
     select_holonomic_input,
     smooth_display_path,
 )
-from .base import BasePlanner, StepResult
+from ..types import FloatPoint, OccupancyGrid, Point
 from ._spatial import GridIndex
-
-
-class RRTParamsWidget(QWidget):
-    """Widget for RRT parameterization."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QFormLayout()
-
-        self.spin_delta_t = QDoubleSpinBox()
-        self.spin_delta_t.setRange(0.5, 200.0)
-        self.spin_delta_t.setSingleStep(0.5)
-        self.spin_delta_t.setValue(18.0)
-        self.spin_delta_t.setToolTip(
-            "Fixed integration interval Delta t for the holonomic NEW_STATE step"
-        )
-
-        self.spin_goal_radius = QDoubleSpinBox()
-        self.spin_goal_radius.setRange(1.0, 200.0)
-        self.spin_goal_radius.setSingleStep(1.0)
-        self.spin_goal_radius.setValue(20.0)
-        self.spin_goal_radius.setToolTip(
-            "Goal-region radius for the single-query adaptation of the paper's tree generator"
-        )
-
-        self.spin_goal_bias = QDoubleSpinBox()
-        self.spin_goal_bias.setRange(0.0, 1.0)
-        self.spin_goal_bias.setSingleStep(0.01)
-        self.spin_goal_bias.setDecimals(3)
-        self.spin_goal_bias.setValue(0.05)
-        self.spin_goal_bias.setToolTip(
-            "OMPL-style probability of sampling the exact goal state; 0.05 is the typical default"
-        )
-
-        self.spin_col = QSpinBox()
-        self.spin_col.setRange(10, 500)
-        self.spin_col.setValue(80)
-        self.spin_col.setToolTip("Raster samples used to validate each accepted edge on the occupancy grid")
-
-        self.spin_max_vertices = QSpinBox()
-        self.spin_max_vertices.setRange(2, 200000)
-        self.spin_max_vertices.setValue(25000)
-        self.spin_max_vertices.setToolTip(
-            "Vertex budget K from GENERATE_RRT(x_init, K, Delta t), including the root"
-        )
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(1)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-
-        layout.addRow("Delta t:", self.spin_delta_t)
-        layout.addRow("Goal region radius:", self.spin_goal_radius)
-        layout.addRow("Goal bias:", self.spin_goal_bias)
-        layout.addRow("Collision samples:", self.spin_col)
-        layout.addRow("Vertex budget K:", self.spin_max_vertices)
-        layout.addRow("Seed:", self.spin_seed)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        """Get all parameter values as a dictionary."""
-        return {
-            'delta_t': self.spin_delta_t.value(),
-            'goal_region_radius': self.spin_goal_radius.value(),
-            'goal_bias': self.spin_goal_bias.value(),
-            'collision_samples': self.spin_col.value(),
-            'max_vertices': self.spin_max_vertices.value(),
-            'seed': self.spin_seed.value(),
-        }
+from .base import BasePlanner, StepResult
 
 
 class RRTPlanner(BasePlanner):
@@ -160,7 +83,13 @@ class RRTPlanner(BasePlanner):
 
     def _goal_reached(self, state: FloatPoint) -> bool:
         goal_state = (float(self.goal[0]), float(self.goal[1]))
-        return float(np.hypot(state[0] - goal_state[0], state[1] - goal_state[1])) <= self.goal_region_radius
+        if float(np.hypot(state[0] - goal_state[0], state[1] - goal_state[1])) > self.goal_region_radius:
+            return False
+        # Being within the goal region is not enough: the vertex must also have a
+        # collision-free straight line to the actual goal, otherwise a vertex on
+        # the far side of a thin wall would be accepted and the reported path
+        # would appear to pass through the obstacle.
+        return line_collision_free(round_point(state), self.goal, self.occ, samples=self.collision_samples)
 
     def _attempt_extension(
         self,
@@ -230,6 +159,10 @@ class RRTPlanner(BasePlanner):
             path.append(self.nodes[i])
             i = self.parent[i]
         path.reverse()
+        # The accepting vertex was verified to have a collision-free line to the
+        # goal (see _goal_reached), so finish the path at the actual goal.
+        if path and path[-1] != self.goal:
+            path.append(self.goal)
         return path
 
     def extract_display_path(self) -> List[Tuple[float, float]]:
@@ -247,16 +180,3 @@ class RRTPlanner(BasePlanner):
             f"goal bias {self.goal_bias:.2f}"
         )
 
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return RRTParamsWidget()
-
-    @staticmethod
-    def create_from_params(
-        occ: np.ndarray,
-        start: Tuple[int, int],
-        goal: Tuple[int, int],
-        params_widget: QWidget
-    ) -> 'RRTPlanner':
-        params = params_widget.get_params()
-        return RRTPlanner(occ, start, goal, **params)

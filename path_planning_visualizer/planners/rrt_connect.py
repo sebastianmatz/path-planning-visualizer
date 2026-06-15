@@ -4,63 +4,14 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
 from ..geometry import (
     clamp_point,
     dist,
     line_collision_free,
     steer,
 )
-from .base import BasePlanner, StepResult
 from ._spatial import GridIndex
-
-
-class RRTConnectParamsWidget(QWidget):
-    """Widget for RRT-Connect parameter configuration."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_step = QSpinBox()
-        self.spin_step.setRange(1, 200)
-        self.spin_step.setValue(18)
-        self.spin_step.setToolTip("Distance for each tree expansion step")
-        
-        self.spin_col = QSpinBox()
-        self.spin_col.setRange(10, 500)
-        self.spin_col.setValue(80)
-        self.spin_col.setToolTip("Number of samples for collision checking along edges")
-        
-        self.spin_maxit = QSpinBox()
-        self.spin_maxit.setRange(100, 200000)
-        self.spin_maxit.setValue(25000)
-        self.spin_maxit.setToolTip("Maximum number of iterations")
-        
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(1)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-        
-        layout.addRow("Step size:", self.spin_step)
-        layout.addRow("Collision samples:", self.spin_col)
-        layout.addRow("Max iterations:", self.spin_maxit)
-        layout.addRow("Seed:", self.spin_seed)
-        
-        self.setLayout(layout)
-    
-    def get_params(self) -> dict:
-        return {
-            'step_size': self.spin_step.value(),
-            'collision_samples': self.spin_col.value(),
-            'max_iters': self.spin_maxit.value(),
-            'seed': self.spin_seed.value(),
-        }
+from .base import BasePlanner, StepResult
 
 
 class RRTConnectPlanner(BasePlanner):
@@ -245,12 +196,4 @@ class RRTConnectPlanner(BasePlanner):
         total_nodes = len(self.nodes_a) + len(self.nodes_b)
         return f"RRT-Connect: iter {self.iteration}/{self.max_iters}, nodes {total_nodes} (A:{len(self.nodes_a)}, B:{len(self.nodes_b)})"
     
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return RRTConnectParamsWidget()
     
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'RRTConnectPlanner':
-        params = params_widget.get_params()
-        return RRTConnectPlanner(occ, start, goal, **params)

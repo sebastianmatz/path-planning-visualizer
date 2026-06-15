@@ -4,69 +4,11 @@ from typing import List, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
 from ..geometry import (
     line_collision_free,
     make_distance_field,
 )
 from .base import BasePlanner, StepResult
-
-
-class GeneticParamsWidget(QWidget):
-    """Parameters widget for Genetic Algorithm planner."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_pop_size = QSpinBox()
-        self.spin_pop_size.setRange(10, 200)
-        self.spin_pop_size.setValue(80)
-        self.spin_pop_size.setToolTip("Population size")
-        
-        self.spin_num_points = QSpinBox()
-        self.spin_num_points.setRange(5, 100)
-        self.spin_num_points.setValue(35)
-        self.spin_num_points.setToolTip("Waypoints per path")
-        
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(50, 5000)
-        self.spin_max_iters.setValue(2000)
-        self.spin_max_iters.setToolTip("Maximum generations")
-        
-        self.spin_mutation_rate = QDoubleSpinBox()
-        self.spin_mutation_rate.setRange(0.01, 0.5)
-        self.spin_mutation_rate.setSingleStep(0.05)
-        self.spin_mutation_rate.setValue(0.2)
-        self.spin_mutation_rate.setToolTip("Mutation rate")
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-        
-        layout.addRow("Population:", self.spin_pop_size)
-        layout.addRow("Waypoints:", self.spin_num_points)
-        layout.addRow("Generations:", self.spin_max_iters)
-        layout.addRow("Mutation rate:", self.spin_mutation_rate)
-        layout.addRow("Seed:", self.spin_seed)
-        
-        self.setLayout(layout)
-    
-    def get_params(self) -> dict:
-        return {
-            'pop_size': self.spin_pop_size.value(),
-            'num_points': self.spin_num_points.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'mutation_rate': self.spin_mutation_rate.value(),
-            'seed': self.spin_seed.value(),
-        }
 
 
 class GeneticPlanner(BasePlanner):
@@ -443,12 +385,4 @@ class GeneticPlanner(BasePlanner):
             f"valid: {self.valid_individuals}/{self.pop_size}, mut: {self.mutation_rate:.2f}, {status}"
         )
     
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return GeneticParamsWidget()
     
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'GeneticPlanner':
-        params = params_widget.get_params()
-        return GeneticPlanner(occ, start, goal, **params)

@@ -2,6 +2,117 @@
 
 This file tracks release notes for published versions of the project.
 
+## [Unreleased]
+
+## [0.1.0b10] - 2026-06-16
+
+### Changed
+
+- **Light UI polish.** The left-panel sections (Algorithm / Parameters / Animation
+  Speed / Status) now render as bordered "cards" with bold titles via an app
+  stylesheet; the primary **Run** action has a green accent (with hover/pressed/
+  disabled states); and the canvas shows a small **color legend** as a horizontal
+  strip in the margin *below* the map (off the map, not obstructing it). The legend
+  uses the exact map colors on a dark chip (so the bright-yellow path is legible)
+  and gains an **"Optimized"** row only when an optimized (CHOMP) path is present.
+  Other widgets keep their native styling.
+- **Status panel** values are right-aligned in a stable column (consistent unit
+  spacing), so the numbers no longer shift — or make the panel jitter — as they
+  update during a run/optimization.
+- **Optimizer animations (CHOMP/GPMP) are no longer gated to 1 iteration per frame.**
+  They were artificially capped at ~1 iteration/8 ms tick (~1.2 s for a CHOMP
+  optimization even though it computes in ~0.2 s). The run loop now batches
+  iterations per frame **scaled by the speed slider** — at MAX it runs a
+  time-budgeted batch (CHOMP Optimize ~0.4 s, ~2-3× faster) and updates the
+  smoothed display once per frame; dragging the slider down shows it
+  iteration-by-iteration. The **algorithm is untouched** (same iterations, same
+  result — the finalized path is byte-identical to the un-batched run); only the
+  display cadence changed.
+- **CHOMP Optimize now shows the path's evolution smoothly.** The original sampling
+  path stays visible (solid) while/after CHOMP optimizes, alongside the optimized
+  path. The displayed optimizer path is **eased toward each iterate** (exponential
+  smoothing, reusing `blend_float_paths`) so a fast, near-convergence-oscillating
+  optimizer *glides* instead of wobbling — measured per-frame motion dropped ~4×
+  (mean ≈5 px → ≈1 px) with the oscillation removed (late-frame jumps >3 px: 47/48 →
+  0/47). The final frame now **morphs into the converged path** instead of snapping
+  (the previous "ease to final" was a no-op because the finalizing step pre-snapped
+  the canvas; that step is now skipped so the tween has something to morph from),
+  then **settles to a clean solid line** (the live glow and iteration trails are
+  cleared) so the finished result reads cleanly.
+- **Reworked the canvas to render the visualization as vectors at display
+  resolution.** Previously the whole scene (map + tree + path + markers) was drawn
+  at the occupancy-grid resolution and bitmap-upscaled, so lines were blurry and
+  marker/line sizes scaled with the map (e.g. huge node "blobs" on small maps).
+  `ImageCanvas` now paints in a `paintEvent`: the base map is scaled on draw
+  (crisp/nearest when enlarging, smooth when shrinking) and tree edges, paths,
+  highlights and start/goal markers are drawn in image coordinates under a scale
+  transform with **cosmetic (screen-space) pen widths** and fixed-radius dots — so
+  the visualization is sharp and consistently sized at any map resolution, and
+  redrawing no longer rebuilds + rescales a full pixmap each step. The public
+  canvas API (`draw_edge`, `draw_path`, `set_current_path`, `set_current_tree_edges`,
+  markers, fades, clears) is unchanged.
+- **Decoupled the algorithm layer from PyQt6.** All per-planner parameter widgets
+  moved into a new GUI module `path_planning_visualizer/gui/param_panels.py`
+  (with a `PARAM_PANELS` registry); the planner modules and `base.py` no longer
+  import PyQt6, and the GUI/entry-point symbols (`MainWindow`, `ImageCanvas`,
+  `main`) are now imported lazily in the package `__init__`. As a result
+  `import path_planning_visualizer` and the headless benchmark run **without
+  PyQt6 loaded** (verified by `tests/test_headless_import.py`). The dead
+  `create_from_params` hook was removed from every planner.
+- The trajectory optimizers' obstacle-term SDF lookups are vectorized: `TrajOpt`,
+  `ITOMP`, and `GPMP` now query the signed distance field in batched calls (new
+  `_trajectory.sdf_query_batch`) instead of per-waypoint Python loops (STOMP was
+  already vectorized). Results are identical to the old loops (≤ ~1e-12); GPMP, in
+  which the SDF lookup was ~⅔ of the run time, is markedly faster.
+- Lint ruleset expanded to `F, I, B, SIM` with a configured line length; import
+  order normalized. Naming (`N`) and line-length (`E501`) are intentionally not
+  enabled (they would fight the deliberate paper math notation / docstrings).
+- **The in-app algorithm descriptions now use proper math notation.** ASCII math in
+  the registry descriptions (`x_dot`, `||u|| <= 1`, `xi <- xi - (1/lambda) A^-1 g`,
+  `log(I)*score/(S*N*C)`, …) was rewritten with Unicode symbols and HTML
+  sub/superscripts (ẋ, ‖u‖ ≤ 1, ξ ← ξ − (1/λ)A⁻¹g, …), rendered in the existing
+  RichText info label. Wording, meaning and citations are unchanged.
+
+### Fixed
+
+- **RRT could report a path "through a wall."** Its goal-region rule accepted *any*
+  tree vertex within the goal radius, with **no line-of-sight check** — so a vertex
+  on the far side of a thin wall counted as reaching the goal (and the returned path
+  did not even include the actual goal). `_goal_reached` now additionally requires a
+  collision-free straight line from the vertex to the goal, and `extract_path`
+  finishes the path at the goal via that verified segment. RRT now declares success
+  only when a real collision-free connection exists, consistent with the other
+  goal-region planners (RRT*, KPIECE, SBL…).
+- **The Step button stopped working after one click.** Entering the off-thread
+  "preparing" state (which the first Step, and any restart-after-done, triggers)
+  disabled Step/Run, but leaving that state only restored the cursor — so Step was
+  left permanently greyed out and further clicks did nothing. `_set_preparing_state`
+  now re-enables Step/Run when a map and start/goal exist (the Run continuation still
+  overrides to the running state). Guarded by a GUI regression test.
+- **Stepping/running on a large tree could freeze the UI.** The canvas re-stroked
+  *every* accumulated tree edge on *every* repaint (≈131 ms at ~4 200 edges, growing
+  with the tree); combined with the 50 ms highlight-fade timer, repaints could not
+  keep up and the event loop stalled. Accumulated tree edges are now baked once into
+  a persistent display-resolution layer that `paintEvent` blits in O(1), and the
+  transient activity highlights are capped to a bounded recent window — full repaint
+  dropped to ~10 ms regardless of tree size, with the tree rendered identically.
+- `GPMP` class docstring/`description` corrected to describe the covariant gradient
+  update actually used (the b9 rework), not the old GPMP2 Gauss-Newton form.
+
+### Added
+
+- **Save View** (in the Map Tools panel): exports a screenshot of the rendered
+  canvas — the map *with* the tree, path, start/goal markers and legend — as a PNG,
+  distinct from **Save Map** (which writes only the bare occupancy grid). The Map
+  Tools controls now wrap onto two rows (drawing tools / map file actions) so the
+  buttons are no longer cramped.
+- **Keyboard shortcuts:** Space = Run/Pause, `S` = Step, `R` = Reset, Esc = stop;
+  shown in the button tooltips. Playback buttons no longer take keyboard focus so
+  Space can't double-trigger a focused button.
+- Unit tests for `metrics`, the `benchmark` harness, the `ImageCanvas` widget, and
+  the headless-import guarantee (`tests/test_metrics.py`, `test_benchmark.py`,
+  `test_canvas.py`, `test_headless_import.py`).
+
 ## [0.1.0b9] - 2026-06-14
 
 ### Changed — paper-fidelity audit

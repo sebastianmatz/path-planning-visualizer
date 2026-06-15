@@ -5,14 +5,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ..types import Point, Edge
 from ..geometry import (
     clamp_point,
     dist,
@@ -20,6 +12,7 @@ from ..geometry import (
     segment_points,
     steer,
 )
+from ..types import Edge, Point
 from .base import BasePlanner, StepResult
 
 
@@ -46,118 +39,6 @@ class KPIECECell:
     importance: float = 0.0
     border: bool = True
     neighbor_count: int = 0
-
-
-class KPIECEParamsWidget(QWidget):
-    """Widget for KPIECE parameter configuration."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QFormLayout()
-
-        self.spin_range = QDoubleSpinBox()
-        self.spin_range.setRange(1.0, 500.0)
-        self.spin_range.setSingleStep(1.0)
-        self.spin_range.setValue(18.0)
-        self.spin_range.setToolTip(
-            "Maximum local expansion radius used when sampling around the selected motion"
-        )
-
-        self.spin_goal_bias = QDoubleSpinBox()
-        self.spin_goal_bias.setRange(0.0, 1.0)
-        self.spin_goal_bias.setSingleStep(0.01)
-        self.spin_goal_bias.setDecimals(3)
-        self.spin_goal_bias.setValue(0.02)
-        self.spin_goal_bias.setToolTip(
-            "Optional goal-directed sampling probability. Small nonzero values often help in this geometric 2D adaptation."
-        )
-
-        self.spin_goal_tol = QSpinBox()
-        self.spin_goal_tol.setRange(1, 200)
-        self.spin_goal_tol.setValue(24)
-        self.spin_goal_tol.setToolTip(
-            "Distance threshold for snapping a newly added state to the goal"
-        )
-
-        self.spin_border_fraction = QDoubleSpinBox()
-        self.spin_border_fraction.setRange(0.0, 1.0)
-        self.spin_border_fraction.setSingleStep(0.01)
-        self.spin_border_fraction.setDecimals(3)
-        self.spin_border_fraction.setValue(0.80)
-        self.spin_border_fraction.setToolTip(
-            "Probability of expanding from a border / exterior cell rather than an interior cell"
-        )
-
-        self.spin_progress_alpha = QDoubleSpinBox()
-        self.spin_progress_alpha.setRange(0.001, 2.0)
-        self.spin_progress_alpha.setSingleStep(0.01)
-        self.spin_progress_alpha.setDecimals(3)
-        self.spin_progress_alpha.setValue(0.10)
-        self.spin_progress_alpha.setToolTip(
-            "Positive progress offset alpha used in P = alpha + beta * (coverage increase / simulated distance)"
-        )
-
-        self.spin_progress_beta = QDoubleSpinBox()
-        self.spin_progress_beta.setRange(0.0, 5.0)
-        self.spin_progress_beta.setSingleStep(0.05)
-        self.spin_progress_beta.setDecimals(3)
-        self.spin_progress_beta.setValue(0.90)
-        self.spin_progress_beta.setToolTip(
-            "Progress scaling beta used in the paper-style score penalty"
-        )
-
-        self.spin_min_valid = QDoubleSpinBox()
-        self.spin_min_valid.setRange(0.01, 1.0)
-        self.spin_min_valid.setSingleStep(0.01)
-        self.spin_min_valid.setDecimals(3)
-        self.spin_min_valid.setValue(0.20)
-        self.spin_min_valid.setToolTip(
-            "Minimum valid fraction required to keep a partial edge when collision stops a motion"
-        )
-
-        self.spin_cell_size = QSpinBox()
-        self.spin_cell_size.setRange(2, 200)
-        self.spin_cell_size.setValue(28)
-        self.spin_cell_size.setToolTip(
-            "Projected grid cell size in pixels for the single-level KPIECE discretization"
-        )
-
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(100, 200000)
-        self.spin_max_iters.setValue(25000)
-        self.spin_max_iters.setToolTip("Maximum number of planning iterations")
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(1)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-
-        layout.addRow("Range:", self.spin_range)
-        layout.addRow("Goal bias:", self.spin_goal_bias)
-        layout.addRow("Goal tolerance:", self.spin_goal_tol)
-        layout.addRow("Border fraction:", self.spin_border_fraction)
-        layout.addRow("Progress alpha:", self.spin_progress_alpha)
-        layout.addRow("Progress beta:", self.spin_progress_beta)
-        layout.addRow("Min valid fraction:", self.spin_min_valid)
-        layout.addRow("Cell size:", self.spin_cell_size)
-        layout.addRow("Max iterations:", self.spin_max_iters)
-        layout.addRow("Seed:", self.spin_seed)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'range': self.spin_range.value(),
-            'goal_bias': self.spin_goal_bias.value(),
-            'goal_tolerance': self.spin_goal_tol.value(),
-            'border_fraction': self.spin_border_fraction.value(),
-            'progress_alpha': self.spin_progress_alpha.value(),
-            'progress_beta': self.spin_progress_beta.value(),
-            'min_valid_path_fraction': self.spin_min_valid.value(),
-            'cell_size': self.spin_cell_size.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'seed': self.spin_seed.value(),
-        }
 
 
 class KPIECEPlanner(BasePlanner):
@@ -500,13 +381,3 @@ class KPIECEPlanner(BasePlanner):
             f"cells {len(self.cells)} (border {self.border_cell_count}), {status}"
         )
 
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return KPIECEParamsWidget()
-
-    @staticmethod
-    def create_from_params(
-        occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int], params_widget: QWidget
-    ) -> 'KPIECEPlanner':
-        params = params_widget.get_params()
-        return KPIECEPlanner(occ, start, goal, **params)

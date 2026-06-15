@@ -5,14 +5,6 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
-from ..types import Point
 from ..geometry import (
     _resample_to_targets,
     bilinear_sample_scalar,
@@ -22,75 +14,8 @@ from ..geometry import (
     make_distance_field,
     smooth_float_polyline,
 )
+from ..types import Point
 from .base import BasePlanner, StepResult
-
-
-class CHOMPParamsWidget(QWidget):
-    """Parameter widget for CHOMP planner."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_num_points = QSpinBox()
-        self.spin_num_points.setRange(10, 500)
-        self.spin_num_points.setValue(50)
-        self.spin_num_points.setToolTip("Number of waypoints in trajectory")
-        
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(10, 50000)
-        self.spin_max_iters.setValue(1000)
-        self.spin_max_iters.setToolTip("Maximum optimization iterations")
-        
-        self.spin_learning_rate = QDoubleSpinBox()
-        self.spin_learning_rate.setRange(0.001, 10.0)
-        self.spin_learning_rate.setSingleStep(0.1)
-        self.spin_learning_rate.setValue(0.3)
-        self.spin_learning_rate.setToolTip("Base step size (1/lambda) for the covariant CHOMP update; lower damps obstacle-term overshoot")
-        
-        self.spin_smoothness_weight = QDoubleSpinBox()
-        self.spin_smoothness_weight.setRange(0.0, 100.0)
-        self.spin_smoothness_weight.setSingleStep(0.1)
-        self.spin_smoothness_weight.setValue(1.0)
-        self.spin_smoothness_weight.setToolTip("Weight for the CHOMP smoothness prior")
-        
-        self.spin_obstacle_weight = QDoubleSpinBox()
-        self.spin_obstacle_weight.setRange(0.0, 1000.0)
-        self.spin_obstacle_weight.setSingleStep(1.0)
-        self.spin_obstacle_weight.setValue(100.0)
-        self.spin_obstacle_weight.setToolTip("Weight for the obstacle functional")
-        
-        self.spin_obstacle_epsilon = QSpinBox()
-        self.spin_obstacle_epsilon.setRange(1, 100)
-        self.spin_obstacle_epsilon.setValue(20)
-        self.spin_obstacle_epsilon.setToolTip("Distance field epsilon (obstacle influence range)")
-
-        self.spin_path_length_weight = QDoubleSpinBox()
-        self.spin_path_length_weight.setRange(0.0, 10.0)
-        self.spin_path_length_weight.setSingleStep(0.05)
-        self.spin_path_length_weight.setValue(0.0)
-        self.spin_path_length_weight.setToolTip("Optional extra arc-length penalty beyond standard CHOMP")
-        
-        layout.addRow("Waypoints:", self.spin_num_points)
-        layout.addRow("Max iterations:", self.spin_max_iters)
-        layout.addRow("Learning rate:", self.spin_learning_rate)
-        layout.addRow("Smoothness weight:", self.spin_smoothness_weight)
-        layout.addRow("Obstacle weight:", self.spin_obstacle_weight)
-        layout.addRow("Obstacle epsilon:", self.spin_obstacle_epsilon)
-        layout.addRow("Path length weight:", self.spin_path_length_weight)
-        
-        self.setLayout(layout)
-    
-    def get_params(self) -> dict:
-        return {
-            'num_points': self.spin_num_points.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'learning_rate': self.spin_learning_rate.value(),
-            'smoothness_weight': self.spin_smoothness_weight.value(),
-            'obstacle_weight': self.spin_obstacle_weight.value(),
-            'obstacle_epsilon': self.spin_obstacle_epsilon.value(),
-            'path_length_weight': self.spin_path_length_weight.value(),
-        }
 
 
 class CHOMPPlanner(BasePlanner):
@@ -608,12 +533,4 @@ class CHOMPPlanner(BasePlanner):
         obs_str = f"obs: {self.obs_cost:.1f}"
         return f"CHOMP: iter {self.iteration}/{self.max_iters}, {smooth_str}, {obs_str}, {status}"
     
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return CHOMPParamsWidget()
     
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'CHOMPPlanner':
-        params = params_widget.get_params()
-        return CHOMPPlanner(occ, start, goal, **params)

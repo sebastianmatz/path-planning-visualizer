@@ -4,83 +4,9 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from PyQt6.QtWidgets import (
-    QDoubleSpinBox,
-    QFormLayout,
-    QSpinBox,
-    QWidget,
-)
-
 from ..geometry import line_collision_free
-from ._trajectory import straight_line, escape_init, fd_acceleration_matrix, signed_distance_field
+from ._trajectory import escape_init, fd_acceleration_matrix, signed_distance_field, straight_line
 from .base import BasePlanner, StepResult
-
-
-class STOMPParamsWidget(QWidget):
-    """Parameters widget for STOMP planner."""
-
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-
-        self.spin_num_points = QSpinBox()
-        self.spin_num_points.setRange(10, 200)
-        self.spin_num_points.setValue(50)
-        self.spin_num_points.setToolTip("Number of waypoints in trajectory")
-
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(10, 20000)
-        self.spin_max_iters.setValue(500)
-        self.spin_max_iters.setToolTip("Maximum optimization iterations")
-
-        self.spin_num_rollouts = QSpinBox()
-        self.spin_num_rollouts.setRange(5, 100)
-        self.spin_num_rollouts.setValue(20)
-        self.spin_num_rollouts.setToolTip("Number K of noisy trajectory rollouts per iteration")
-
-        self.spin_noise_std = QDoubleSpinBox()
-        self.spin_noise_std.setRange(0.1, 50.0)
-        self.spin_noise_std.setSingleStep(1.0)
-        self.spin_noise_std.setValue(10.0)
-        self.spin_noise_std.setToolTip("Magnitude of the exploration noise (the only open STOMP parameter)")
-
-        self.spin_epsilon = QDoubleSpinBox()
-        self.spin_epsilon.setRange(0.0, 100.0)
-        self.spin_epsilon.setSingleStep(1.0)
-        self.spin_epsilon.setValue(10.0)
-        self.spin_epsilon.setToolTip("Obstacle clearance margin epsilon in the cost max(eps - d, 0) (Eq. 13)")
-
-        self.spin_h = QDoubleSpinBox()
-        self.spin_h.setRange(1.0, 100.0)
-        self.spin_h.setSingleStep(1.0)
-        self.spin_h.setValue(10.0)
-        self.spin_h.setToolTip("Cost sensitivity h in the probability exponent (Eq. 11; paper uses 10)")
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-
-        layout.addRow("Waypoints:", self.spin_num_points)
-        layout.addRow("Max iterations:", self.spin_max_iters)
-        layout.addRow("Num rollouts (K):", self.spin_num_rollouts)
-        layout.addRow("Noise std:", self.spin_noise_std)
-        layout.addRow("Clearance margin (eps):", self.spin_epsilon)
-        layout.addRow("Cost sensitivity (h):", self.spin_h)
-        layout.addRow("Seed:", self.spin_seed)
-
-        self.setLayout(layout)
-
-    def get_params(self) -> dict:
-        return {
-            'num_points': self.spin_num_points.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'num_rollouts': self.spin_num_rollouts.value(),
-            'noise_std': self.spin_noise_std.value(),
-            'epsilon': self.spin_epsilon.value(),
-            'h': self.spin_h.value(),
-            'seed': self.spin_seed.value(),
-        }
 
 
 class STOMPPlanner(BasePlanner):
@@ -301,12 +227,3 @@ class STOMPPlanner(BasePlanner):
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
         return f"STOMP: iter {self.iteration}/{self.max_iters}, obs: {self.obs_cost:.1f}, ctrl: {self.smooth_cost:.1f}, {status}"
 
-    @staticmethod
-    def get_params_widget() -> QWidget:
-        return STOMPParamsWidget()
-
-    @staticmethod
-    def create_from_params(occ: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
-                          params_widget: QWidget) -> 'STOMPPlanner':
-        params = params_widget.get_params()
-        return STOMPPlanner(occ, start, goal, **params)

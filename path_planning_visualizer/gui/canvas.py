@@ -3,13 +3,12 @@ from __future__ import annotations
 import time
 from typing import Callable, List, Optional, Tuple, Union
 
-
-from PyQt6.QtCore import Qt, QTimer, QPointF
-from PyQt6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
+from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 
-from ..types import Point, Edge
 from ..geometry import blend_float_paths, resample_float_path_fixed_count
+from ..types import Edge, Point
 
 
 class ImageCanvas(QLabel):
@@ -32,20 +31,27 @@ class ImageCanvas(QLabel):
         highlights: Temporary highlights for visualization
         current_path: Current best path for live display
     """
-    
+
+    # Cap on the transient glow highlights drawn per frame; older ones have faded
+    # and their edges are already in the permanent tree layer (keeps paint O(1)).
+    _MAX_HIGHLIGHTS = 240
+
     def __init__(self) -> None:
         super().__init__()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         
-        # Image state
+        # Image state. The scene is drawn vectorially in paintEvent: the base map
+        # is scaled on draw and all overlays (tree, path, markers) are painted in
+        # image coordinates under a scale transform with *cosmetic* (screen-space)
+        # pen widths, so the visualization stays crisp at any map resolution.
         self.base_pixmap: Optional[QPixmap] = None
-        self.overlay: Optional[QPixmap] = None
         self.scale: float = 1.0
         self.offset_x: int = 0
         self.offset_y: int = 0
-        self._cached_disp_size: Optional[Tuple[int, int]] = None
+        self.disp_w: int = 0
+        self.disp_h: int = 0
         
         # Point selection state
         self.start: Optional[Point] = None
@@ -64,7 +70,20 @@ class ImageCanvas(QLabel):
         self.highlights: List[Tuple[int, int, int]] = []  # (x, y, alpha)
         self.rejected_highlights: List[Tuple[int, int, int]] = []  # (x, y, alpha)
         self.edge_highlights: List[Tuple[int, int, int, int, int]] = []  # (x1, y1, x2, y2, alpha)
-        self.current_tree_edges: List[Edge] = []
+        self.current_tree_edges: List[Edge] = []        # replaced each step (rewiring planners)
+        self._appended_edges: List[Edge] = []           # accumulated incrementally (draw_edge)
+        self._appended_edge_color: QColor = QColor(0, 0, 255, 130)
+        # Accumulated tree edges are baked into a persistent display-resolution
+        # layer so paintEvent blits it in O(1) instead of re-stroking every edge
+        # (which is O(edges) and freezes the UI once the tree gets large).
+        self._tree_layer: Optional[QPixmap] = None
+        self._tree_layer_size: Tuple[int, int] = (0, 0)
+        self._tree_layer_count: int = 0
+        self._tree_layer_color: QColor = QColor(self._appended_edge_color)
+        self._final_path: List[Tuple[float, float]] = []         # permanent found path (draw_path)
+        self._final_path_color: QColor = QColor(Qt.GlobalColor.yellow)
+        self.legend_optimized: bool = False                      # show the "Optimized" legend row
+        self.legend_optimized_color: QColor = QColor(255, 105, 180)
         self.current_path: List[Tuple[float, float]] = []
         self.previous_path: List[Tuple[float, float]] = []
         self.reference_path: List[Tuple[float, float]] = []
@@ -81,12 +100,85 @@ class ImageCanvas(QLabel):
         self.path_animation_timer.timeout.connect(self._advance_path_animation)
         self.path_history: List[Tuple[List[Tuple[float, float]], str, int]] = []
 
-    def _make_pen(self, color: Union[Qt.GlobalColor, QColor], width: int) -> QPen:
-        """Create a pen with rounded joins for cleaner path rendering."""
+    def _make_pen(self, color: Union[Qt.GlobalColor, QColor], width: float) -> QPen:
+        """Create a cosmetic pen with rounded joins.
+
+        Cosmetic means ``width`` is in *device* (screen) pixels regardless of the
+        painter's scale transform, so line thickness is constant across map sizes.
+        """
         pen = QPen(color, width)
+        pen.setCosmetic(True)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         return pen
+
+    def _recompute_geometry(self) -> None:
+        """Update scale/offset/display size from the current widget and map size."""
+        if self.base_pixmap is None:
+            return
+        w, h = max(1, self.width()), max(1, self.height())
+        bw, bh = self.base_pixmap.width(), self.base_pixmap.height()
+        s = min(w / bw, h / bh)
+        self.scale = s
+        self.disp_w, self.disp_h = int(bw * s), int(bh * s)
+        self.offset_x = (w - self.disp_w) // 2
+        self.offset_y = (h - self.disp_h) // 2
+
+    def _ensure_tree_layer(self) -> Optional[QPixmap]:
+        """Return the display-resolution pixmap holding all accumulated tree edges.
+
+        Edges are baked once (incrementally, only the newly appended ones) onto a
+        persistent layer drawn with the same scale transform + cosmetic 1-px pen as
+        before, so the tree looks identical while ``paintEvent`` can blit it in O(1)
+        instead of re-stroking every edge each repaint.
+        """
+        if self.base_pixmap is None or self.disp_w <= 0 or self.disp_h <= 0:
+            return None
+        size = (self.disp_w, self.disp_h)
+        n = len(self._appended_edges)
+
+        rebuild = (
+            self._tree_layer is None
+            or self._tree_layer_size != size
+            or self._tree_layer_count > n                       # edges were cleared/reset
+            or self._tree_layer_color != self._appended_edge_color  # recolor all edges
+        )
+        if rebuild:
+            layer = QPixmap(size[0], size[1])
+            layer.fill(Qt.GlobalColor.transparent)
+            self._tree_layer = layer
+            self._tree_layer_size = size
+            self._tree_layer_color = QColor(self._appended_edge_color)
+            self._tree_layer_count = 0
+        elif self._tree_layer_count == n:
+            return self._tree_layer  # already up to date
+
+        if n > self._tree_layer_count:
+            painter = QPainter(self._tree_layer)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.scale(self.scale, self.scale)
+            painter.setPen(self._make_pen(self._appended_edge_color, 1.0))
+            for a, b in self._appended_edges[self._tree_layer_count:]:
+                painter.drawLine(QPointF(float(a[0]), float(a[1])), QPointF(float(b[0]), float(b[1])))
+            painter.end()
+            self._tree_layer_count = n
+
+        return self._tree_layer
+
+    def _dot(self, painter: QPainter, x: float, y: float, screen_r: float, color: QColor) -> None:
+        """Filled circle of a fixed *screen* radius, drawn under the scale transform."""
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(color))
+        r = screen_r / self.scale if self.scale > 0 else screen_r
+        painter.drawEllipse(QPointF(float(x), float(y)), r, r)
+
+    def _ring(self, painter: QPainter, x: float, y: float, screen_r: float,
+              color: Union[Qt.GlobalColor, QColor], screen_w: float) -> None:
+        """Hollow circle of a fixed *screen* radius (start/goal markers)."""
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(self._make_pen(color, screen_w))
+        r = screen_r / self.scale if self.scale > 0 else screen_r
+        painter.drawEllipse(QPointF(float(x), float(y)), r, r)
 
     def _draw_polyline(
         self,
@@ -111,15 +203,16 @@ class ImageCanvas(QLabel):
     def _draw_live_path(self, painter: QPainter) -> None:
         """Draw the current live path with an algorithm-specific visual style."""
         if len(self.reference_path) >= 2:
+            # Solid, full-width: used to keep the original found path visible (and
+            # looking unchanged) while an optimizer evolves over it.
             self._draw_polyline(
                 painter,
                 self.reference_path,
                 self.reference_path_color,
-                2,
-                pen_style=Qt.PenStyle.DashLine,
+                3,
             )
 
-        render_path = self.current_path
+        render_path = self.animated_path if len(self.animated_path) >= 2 else self.current_path
         if len(render_path) < 2:
             return
 
@@ -136,7 +229,7 @@ class ImageCanvas(QLabel):
             main_glow = QColor(255, 95, 185, 78)
             main_core = QColor(255, 246, 250, 245)
         else:
-            self._draw_polyline(painter, render_path, Qt.GlobalColor.yellow, 4)
+            self._draw_polyline(painter, render_path, Qt.GlobalColor.yellow, 3)
             return
 
         # Recent full trajectories remain visible briefly as contour lines.
@@ -169,129 +262,198 @@ class ImageCanvas(QLabel):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setPen(self._make_pen(connector_color, 1))
             painter.setBrush(QBrush(QColor(connector_color.red(), connector_color.green(), connector_color.blue(), 95)))
-            for (ax, ay), (bx, by) in zip(prev_samples[1:-1], curr_samples[1:-1]):
+            dot_r = 1.6 / self.scale if self.scale > 0 else 1.6
+            for (ax, ay), (bx, by) in zip(prev_samples[1:-1], curr_samples[1:-1], strict=False):
                 painter.drawLine(QPointF(float(ax), float(ay)), QPointF(float(bx), float(by)))
-                painter.drawEllipse(QPointF(float(bx), float(by)), 1.6, 1.6)
+                painter.drawEllipse(QPointF(float(bx), float(by)), dot_r, dot_r)
 
         # Current full trajectory
         self._draw_polyline(painter, render_path, main_glow, 8)
         self._draw_polyline(painter, render_path, main_core, 3)
     
+    def _clear_overlays(self) -> None:
+        """Reset all transient visualization state (edges, paths, highlights)."""
+        self.path_animation_timer.stop()
+        self.legend_optimized = False
+        self.highlights = []
+        self.rejected_highlights = []
+        self.edge_highlights = []
+        self.current_tree_edges = []
+        self._appended_edges = []
+        self._tree_layer = None
+        self._tree_layer_count = 0
+        self._final_path = []
+        self.current_path = []
+        self.previous_path = []
+        self.reference_path = []
+        self.current_path_style = "default"
+        self.current_path_focus = None
+        self.animated_path = []
+        self.path_animation_from = []
+        self.path_animation_to = []
+        self.path_history = []
+
     def set_image(self, qpix: QPixmap):
         self.base_pixmap = qpix
-        self.overlay = QPixmap(qpix.size())
-        self.overlay.fill(Qt.GlobalColor.transparent)
-        self.path_animation_timer.stop()
         self.start = None
         self.goal = None
         self.pick_mode = "start"
-        self.highlights = []
-        self.rejected_highlights = []
-        self.edge_highlights = []
-        self.current_tree_edges = []
-        self.current_path = []
-        self.previous_path = []
-        self.reference_path = []
-        self.current_path_style = "default"
-        self.current_path_focus = None
-        self.animated_path = []
-        self.path_animation_from = []
-        self.path_animation_to = []
-        self.path_history = []
-        self._cached_disp_size = None  # Recompute on new image
-        self._update_display()
-    
+        self._clear_overlays()
+        self._recompute_geometry()
+        self.update()
+
     def reset_overlay(self):
         if self.base_pixmap is None:
             return
-        self.overlay = QPixmap(self.base_pixmap.size())
-        self.overlay.fill(Qt.GlobalColor.transparent)
-        self.path_animation_timer.stop()
-        self.highlights = []
-        self.rejected_highlights = []
-        self.edge_highlights = []
-        self.current_tree_edges = []
-        self.current_path = []
-        self.previous_path = []
-        self.reference_path = []
-        self.current_path_style = "default"
-        self.current_path_focus = None
-        self.animated_path = []
-        self.path_animation_from = []
-        self.path_animation_to = []
-        self.path_history = []
-        self._update_display()
+        self._clear_overlays()  # keeps start/goal (unlike set_image)
+        self.update()
     
     def _update_display(self):
-        if self.base_pixmap is None:
-            self.setText("Load an image first.")
-            return
-        
-        w, h = self.width(), self.height()
-        bw, bh = self.base_pixmap.width(), self.base_pixmap.height()
-        
-        s = min(w / bw, h / bh)
-        self.scale = s
-        disp_w, disp_h = int(bw * s), int(bh * s)
-        
-        # Cache display size - only recompute on resize, not during animation
-        if self._cached_disp_size is None:
-            self._cached_disp_size = (disp_w, disp_h)
-        else:
-            # Use cached size to prevent jitter during animation
-            disp_w, disp_h = self._cached_disp_size
-        
-        self.offset_x = (w - disp_w) // 2
-        self.offset_y = (h - disp_h) // 2
-        
-        composed = QPixmap(bw, bh)
-        composed.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(composed)
-        painter.drawPixmap(0, 0, self.base_pixmap)
+        """Schedule a repaint (drawing happens in paintEvent)."""
+        self.update()
 
-        # Draw live tree edges for planners with rewiring/history-sensitive trees.
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0xEC, 0xEC, 0xEC))
+
+        if self.base_pixmap is None:
+            painter.setPen(QColor(120, 120, 120))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Load an image first.")
+            painter.end()
+            return
+
+        self._recompute_geometry()
+        s = self.scale
+
+        # Base map, scaled on draw. Crisp (nearest) when enlarging an occupancy
+        # grid so walls stay sharp; smooth only when shrinking a large image.
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, s < 1.0)
+        painter.drawPixmap(
+            QRectF(self.offset_x, self.offset_y, self.disp_w, self.disp_h),
+            self.base_pixmap,
+            QRectF(self.base_pixmap.rect()),
+        )
+
+        # Accumulated tree edges: blitted from a persistent display-resolution layer
+        # (device space, before the scale transform) so this stays O(1) regardless of
+        # how large the tree grows.
+        tree_layer = self._ensure_tree_layer()
+        if tree_layer is not None and self._appended_edges:
+            painter.drawPixmap(self.offset_x, self.offset_y, tree_layer)
+
+        # Overlays are drawn in image coordinates under a scale transform; cosmetic
+        # pens and screen-radius dots keep their size constant across map sizes.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.save()
+        painter.translate(self.offset_x, self.offset_y)
+        painter.scale(s, s)
+
+        # Tree edges replaced each step (rewiring planners) are drawn live.
         if self.current_tree_edges:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setPen(self._make_pen(QColor(0, 0, 255, 100), 1))
+            painter.setPen(self._make_pen(QColor(0, 0, 255, 130), 1.0))
             for a, b in self.current_tree_edges:
                 painter.drawLine(QPointF(float(a[0]), float(a[1])), QPointF(float(b[0]), float(b[1])))
 
-        painter.drawPixmap(0, 0, self.overlay)
-
-        # Draw current optimizer/path estimate on top of the tree.
+        # Permanent / found path, then the live path estimate on top.
+        if len(self._final_path) >= 2:
+            self._draw_polyline(painter, self._final_path, self._final_path_color, 3)
         self._draw_live_path(painter)
-        
-        # Draw edge highlights
+
+        # Bounded recent-activity glow: highlights/edge-highlights are short-lived
+        # fade effects whose edges already live permanently in the tree layer, so a
+        # fast run that appends them quicker than they fade must not let these loops
+        # grow O(edges) (that is what froze the UI). Keep only the freshest few.
+        if len(self.edge_highlights) > self._MAX_HIGHLIGHTS:
+            self.edge_highlights = self.edge_highlights[-self._MAX_HIGHLIGHTS:]
+        if len(self.highlights) > self._MAX_HIGHLIGHTS:
+            self.highlights = self.highlights[-self._MAX_HIGHLIGHTS:]
+        if len(self.rejected_highlights) > self._MAX_HIGHLIGHTS:
+            self.rejected_highlights = self.rejected_highlights[-self._MAX_HIGHLIGHTS:]
+
+        # Edge highlights (fading), then rejected and node dots (fixed screen size).
         for (x1, y1, x2, y2, alpha) in self.edge_highlights:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setPen(self._make_pen(QColor(0, 255, 255, alpha), 2))
             painter.drawLine(QPointF(float(x1), float(y1)), QPointF(float(x2), float(y2)))
-        
-        # Draw rejected highlights
         for (x, y, alpha) in self.rejected_highlights:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor(255, 165, 0, alpha)))
-            painter.drawEllipse(QPointF(x, y), 4, 4)
-        
-        # Draw node highlights
+            self._dot(painter, x, y, 2.5, QColor(255, 165, 0, alpha))
         for (x, y, alpha) in self.highlights:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor(255, 50, 50, alpha)))
-            painter.drawEllipse(QPointF(x, y), 5, 5)
-        
+            self._dot(painter, x, y, 2.5, QColor(255, 50, 50, alpha))
+
+        # Start / goal markers always on top.
+        if self.start is not None:
+            self._ring(painter, self.start[0], self.start[1], 7.0, Qt.GlobalColor.green, 2.5)
+        if self.goal is not None:
+            self._ring(painter, self.goal[0], self.goal[1], 7.0, Qt.GlobalColor.red, 2.5)
+
+        painter.restore()
+        self._draw_legend(painter)  # device-space overlay, on top of everything
         painter.end()
-        self.setPixmap(composed.scaled(disp_w, disp_h, Qt.AspectRatioMode.KeepAspectRatio, 
-                                       Qt.TransformationMode.SmoothTransformation))
-    
+
+    def _draw_legend(self, painter: QPainter) -> None:
+        """Horizontal color key, placed in the margin *below* the map so it does not
+        obstruct it (falls back to the widget's bottom edge if there is no margin).
+        Swatches use the exact map colors on a dark chip so all of them are legible.
+        """
+        items = [
+            ("dot", QColor(Qt.GlobalColor.green), "Start"),
+            ("dot", QColor(Qt.GlobalColor.red), "Goal"),
+            ("line", QColor(0, 0, 255), "Tree"),
+            ("line", QColor(Qt.GlobalColor.yellow), "Path"),
+        ]
+        if self.legend_optimized:  # only once an optimized (CHOMP) path exists
+            items.append(("line", self.legend_optimized_color, "Optimized"))
+
+        font = QFont()
+        font.setPointSize(8)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        sw, gap, item_gap, pad, h = 16, 5, 16, 8, 22
+        widths = [sw + gap + fm.horizontalAdvance(label) for _, _, label in items]
+        w = pad * 2 + sum(widths) + item_gap * (len(items) - 1)
+
+        ww, wh = self.width(), self.height()
+        x = self.offset_x + (self.disp_w - w) / 2.0     # centered under the map
+        x = max(4.0, min(x, ww - w - 4.0))
+        y = self.offset_y + self.disp_h + 6.0           # just below the map
+        if y + h > wh - 4:                              # no bottom margin -> bottom edge
+            y = wh - h - 4.0
+
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(QColor(90, 90, 90), 1))
+        painter.setBrush(QBrush(QColor(45, 45, 45, 215)))
+        painter.drawRoundedRect(QRectF(x, y, w, h), 6, 6)
+
+        cx = x + pad
+        cy = y + h / 2.0
+        for (kind, color, label), iw in zip(items, widths, strict=True):
+            if kind == "dot":
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(color))
+                painter.drawEllipse(QPointF(cx + sw / 2.0, cy), 4, 4)
+            else:
+                pen = QPen(color, 3)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(pen)
+                painter.drawLine(QPointF(cx, cy), QPointF(cx + sw, cy))
+            painter.setPen(QColor(235, 235, 235))
+            painter.drawText(
+                QRectF(cx + sw + gap, y, iw - sw - gap + 2, h),
+                int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                label,
+            )
+            cx += iw + item_gap
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Recompute display size on resize
-        self._cached_disp_size = None
-        self._update_display()
+        self._recompute_geometry()
+        self.update()
     
     def _canvas_to_image(self, x: float, y: float) -> Optional[Point]:
         """Map a canvas-widget coordinate to an image (occupancy) pixel."""
-        if self.base_pixmap is None or self.scale <= 0:
+        if self.base_pixmap is None:
+            return None
+        self._recompute_geometry()  # ensure scale/offset are current for clicks
+        if self.scale <= 0:
             return None
         ix = (x - self.offset_x) / self.scale
         iy = (y - self.offset_y) / self.scale
@@ -358,36 +520,26 @@ class ImageCanvas(QLabel):
             self.on_paint(p, erase)
 
     def update_base_image(self, qpix: QPixmap) -> None:
-        """Swap the base map image in place, keeping start/goal and the overlay.
+        """Swap the base map image in place, keeping start/goal and the overlays.
 
         Used by the map editor so painting a stroke does not wipe the markers or
         the current visualization (unlike ``set_image``).
         """
         self.base_pixmap = qpix
-        self._update_display()
+        self._recompute_geometry()
+        self.update()
 
     def _draw_marker(self, p, kind):
-        if self.overlay is None:
-            return
-        painter = QPainter(self.overlay)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        color = Qt.GlobalColor.green if kind == "start" else Qt.GlobalColor.red
-        painter.setPen(self._make_pen(color, 4))
-        painter.drawEllipse(QPointF(p[0], p[1]), 6, 6)
-        painter.end()
-        self._update_display()
-    
+        # Markers are rendered from self.start / self.goal in paintEvent; this just
+        # requests a repaint (kept for API compatibility with the main window).
+        self.update()
+
     def draw_edge(self, a, b, color=Qt.GlobalColor.blue):
-        if self.overlay is None:
-            return
-        painter = QPainter(self.overlay)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(self._make_pen(color, 1))
-        painter.drawLine(QPointF(float(a[0]), float(a[1])), QPointF(float(b[0]), float(b[1])))
-        painter.end()
+        self._appended_edges.append((a, b))
+        self._appended_edge_color = QColor(color)
         self.highlights.append((b[0], b[1], 255))
         self.edge_highlights.append((a[0], a[1], b[0], b[1], 255))
-        self._update_display()
+        self.update()
 
     def highlight_edge(self, a: Point, b: Point, color: Optional[QColor] = None):
         self.highlights.append((b[0], b[1], 255))
@@ -465,6 +617,7 @@ class ImageCanvas(QLabel):
         path: List[Tuple[float, float]],
         style: str = "default",
         focus_point: Optional[Tuple[float, float]] = None,
+        animate: bool = False,
     ) -> None:
         next_path = list(path)
         current_draw_path = self.animated_path if len(self.animated_path) >= 2 else self.current_path
@@ -484,12 +637,20 @@ class ImageCanvas(QLabel):
         else:
             self.current_path_focus = (float(focus_point[0]), float(focus_point[1]))
 
-        # Optimizer paths are shown as discrete full-trajectory iterations rather
-        # than morphing continuously between them.
-        self.path_animation_timer.stop()
-        self.path_animation_from = []
-        self.path_animation_to = []
-        self.animated_path = list(next_path)
+        # Optimizer iterations are shown as discrete frames; only an explicit
+        # animate=True (e.g. the final converged frame) morphs smoothly to the new
+        # path, so the optimization doesn't visibly "jump" at the end.
+        if animate and len(current_draw_path) >= 2 and len(next_path) >= 2:
+            self.path_animation_from = list(current_draw_path)
+            self.path_animation_to = list(next_path)
+            self.animated_path = list(current_draw_path)
+            self.path_animation_start_time = time.perf_counter()
+            self.path_animation_timer.start()
+        else:
+            self.path_animation_timer.stop()
+            self.path_animation_from = []
+            self.path_animation_to = []
+            self.animated_path = list(next_path)
         self._update_display()
 
     def set_optimizer_animation_profile(self, live: bool) -> None:
@@ -500,17 +661,18 @@ class ImageCanvas(QLabel):
             self.path_animation_duration_s = 0.16
     
     def draw_path(self, path, permanent=False, color=Qt.GlobalColor.yellow):
-        """Draw path. If permanent=True, draw to overlay. Otherwise set as current_path for live display."""
+        """Draw a path. ``permanent=True`` keeps it as the final/found path;
+        otherwise it is shown as the live ``current_path``."""
         if len(path) < 2:
             return
         if permanent:
-            # Draw permanently to overlay (for final path)
-            if self.overlay is None:
-                return
-            painter = QPainter(self.overlay)
-            self._draw_polyline(painter, list(path), color, 4)
-            painter.end()
+            self._final_path = list(path)
+            self._final_path_color = QColor(color)
+            self.update()
         else:
             self.set_current_path(list(path), style="default")
-            return
-        self._update_display()
+
+    def clear_final_path(self) -> None:
+        """Drop the permanent/found path (e.g. before showing it as a reference)."""
+        self._final_path = []
+        self.update()

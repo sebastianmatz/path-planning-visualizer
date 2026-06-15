@@ -49,6 +49,6 @@ def test_path_cost_equals_finalized_goal_distance():
 
     gs = p.grid_size
     total = 0.0
-    for (ax, ay), (bx, by) in zip(p.path_grid, p.path_grid[1:]):
+    for (ax, ay), (bx, by) in zip(p.path_grid, p.path_grid[1:], strict=False):
         total += gs * math.hypot(ax - bx, ay - by)
     assert abs(total - p.dist[p.goal_grid]) < 1e-6

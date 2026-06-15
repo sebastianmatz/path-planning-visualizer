@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 
 import pytest
-
 from PyQt6.QtWidgets import QApplication
 
 import path_planning_visualizer.app as app_mod
