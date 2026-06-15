@@ -10,7 +10,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # required to create/update the Release and upload the asset
+  contents: write      # create/update the Release and upload the asset
+  id-token: write      # OIDC token for keyless build-provenance signing
+  attestations: write  # write the build-provenance attestation
 
 jobs:
   build-windows:
@@ -31,6 +33,11 @@ jobs:
 
       - name: Build executable
         run: pyinstaller --noconfirm --clean packaging/PathPlanningVisualizer.spec
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/PathPlanningVisualizer.exe
 
       - name: Upload build artifact (download from this run)
         uses: actions/upload-artifact@v4

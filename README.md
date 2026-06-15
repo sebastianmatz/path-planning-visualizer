@@ -33,6 +33,15 @@ double-click it. It is a single self-contained file; on first launch Windows Sma
 about an unknown publisher (the build is unsigned) — choose *More info → Run anyway*. To run on
 macOS/Linux, or to develop, use the source install below.
 
+Each release executable is built by GitHub Actions and carries a [build-provenance
+attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds),
+so you can cryptographically verify it was produced from this repository's source by the official
+workflow (requires the [GitHub CLI](https://cli.github.com/)):
+
+```bash
+gh attestation verify PathPlanningVisualizer.exe --repo sebastianmatz/path-planning-visualizer
+```
+
 ### From source
 
 Requirements: **Python 3.11+** and a desktop environment capable of running PyQt6.
