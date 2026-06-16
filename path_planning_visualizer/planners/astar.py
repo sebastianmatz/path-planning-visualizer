@@ -4,6 +4,7 @@ from typing import Dict, List, Set, Tuple
 
 import numpy as np
 
+from ..types import Edge
 from .base import BasePlanner, StepResult
 
 
@@ -120,27 +121,29 @@ class AStarPlanner(BasePlanner):
         
         self.closed_set.add(current)
         
-        edge = None
+        edges: List[Edge] = []
         for neighbor, cost in self._get_neighbors(current):
             if neighbor in self.closed_set:
                 continue
-            
+
             tentative_g = self.g_score.get(current, float('inf')) + cost
-            
+
             if tentative_g < self.g_score.get(neighbor, float('inf')):
                 self.came_from[neighbor] = current
                 self.g_score[neighbor] = tentative_g
                 self.f_score[neighbor] = tentative_g + self._heuristic(neighbor)
                 heapq.heappush(self.open_set, (self.f_score[neighbor], neighbor))
-                
-                # Create edge for visualization
+
+                # Every neighbor relaxed this expansion is a "new bit" of the search,
+                # highlighted as the active frontier (the tree itself is drawn from
+                # came_from; these are for the fading highlight only).
                 p1 = (current[0] * self.grid_size + self.grid_size // 2,
                       current[1] * self.grid_size + self.grid_size // 2)
                 p2 = (neighbor[0] * self.grid_size + self.grid_size // 2,
                       neighbor[1] * self.grid_size + self.grid_size // 2)
-                edge = (p1, p2)
-        
-        return StepResult(edge=edge)
+                edges.append((p1, p2))
+
+        return StepResult(edges=edges or None)
     
     def extract_path(self) -> List[Tuple[int, int]]:
         if not self.path_grid:
@@ -156,7 +159,22 @@ class AStarPlanner(BasePlanner):
             if not deduped or deduped[-1] != p:
                 deduped.append(p)
         return deduped
-    
+
+    def extract_tree_edges(self) -> List[Edge]:
+        """Current search tree (``came_from``) as parent->node edges in pixel coords.
+
+        A* relaxes nodes that are still in the open set, so a node's parent can change
+        before it is expanded. Redrawing the tree from ``came_from`` each step (rather
+        than accumulating one relaxation edge per pop) keeps the displayed search tree
+        faithful: it shows the actual current best-known tree with no superseded edges.
+        """
+        gs, half = self.grid_size, self.grid_size // 2
+
+        def center(c: Tuple[int, int]) -> Tuple[int, int]:
+            return (c[0] * gs + half, c[1] * gs + half)
+
+        return [(center(par), center(node)) for node, par in self.came_from.items()]
+
     def get_status(self) -> str:
         return f"A*: explored {len(self.closed_set)}, open {len(self.open_set)}"
     

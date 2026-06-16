@@ -183,25 +183,50 @@ def bilinear_sample_scalar_batch(
 
 
 def segment_points(a: Point, b: Point, samples: Optional[int] = None) -> List[Point]:
-    """Return rasterized sample points along a segment.
+    """Return every integer cell the segment ``a``->``b`` passes through.
 
-    The default sampling is adaptive to segment length so collision checks do not
-    become looser on long segments.
+    Uses an exact grid (voxel) traversal, so no cell is skipped. This matters at
+    obstacle corners: fixed-rate sampling (the old ``max(dx, dy)`` scheme) can round
+    *around* the corner cell of a diagonal edge and report a colliding edge as clear.
+    The traversal walks cell boundary to cell boundary and never misses a touched
+    cell. ``samples`` is accepted for backward compatibility but ignored — the
+    traversal is already complete and exact regardless of segment length.
     """
-    dx = abs(int(b[0]) - int(a[0]))
-    dy = abs(int(b[1]) - int(a[1]))
-    adaptive_samples = max(dx, dy)
-    total_samples = max(1, adaptive_samples, samples or 0)
+    x0, y0 = int(round(a[0])), int(round(a[1]))
+    x1, y1 = int(round(b[0])), int(round(b[1]))
+    cells: List[Point] = [(x0, y0)]
+    dx, dy = x1 - x0, y1 - y0
+    if dx == 0 and dy == 0:
+        return cells
 
-    pts: List[Point] = []
-    for i in range(total_samples + 1):
-        t = i / total_samples
-        x = int(round(a[0] + t * (b[0] - a[0])))
-        y = int(round(a[1] + t * (b[1] - a[1])))
-        p = (x, y)
-        if not pts or pts[-1] != p:
-            pts.append(p)
-    return pts
+    step_x = 1 if dx > 0 else -1
+    step_y = 1 if dy > 0 else -1
+    adx, ady = abs(dx), abs(dy)
+    # Parametric distance (t in [0, 1]) to the next cell boundary, and across one
+    # full cell, on each axis. Cells are centered on integers, so the first boundary
+    # is half a cell away.
+    t_max_x = (0.5 / adx) if adx else float("inf")
+    t_max_y = (0.5 / ady) if ady else float("inf")
+    t_delta_x = (1.0 / adx) if adx else float("inf")
+    t_delta_y = (1.0 / ady) if ady else float("inf")
+
+    x, y = x0, y0
+    guard = adx + ady + 2  # upper bound on the number of steps
+    while (x != x1 or y != y1) and guard > 0:
+        guard -= 1
+        if t_max_x < t_max_y:
+            x += step_x
+            t_max_x += t_delta_x
+        elif t_max_y < t_max_x:
+            y += step_y
+            t_max_y += t_delta_y
+        else:  # exact diagonal crossing through a lattice corner: advance both
+            x += step_x
+            y += step_y
+            t_max_x += t_delta_x
+            t_max_y += t_delta_y
+        cells.append((x, y))
+    return cells
 
 
 def line_collision_free(

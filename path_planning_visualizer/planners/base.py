@@ -18,10 +18,13 @@ class StepResult:
         done: Whether planning is complete
         found_path: Whether a valid path was found
         path_improved: Whether path quality improved this step (for anytime algorithms)
+        node_marker: A roadmap milestone placed this step, drawn as a persistent dot
+            (e.g. PRM sampling), as opposed to an edge
     """
     edge: Optional[Edge] = None
     edges: Optional[List[Edge]] = None
     rejected_point: Optional[Point] = None
+    node_marker: Optional[Point] = None
     done: bool = False
     found_path: bool = False
     path_improved: bool = False

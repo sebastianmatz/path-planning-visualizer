@@ -354,12 +354,20 @@ class GeneticPlanner(BasePlanner):
         # Check if best path is valid
         self._check_best_path()
         
-        # Visualization
+        # Visualization: show one segment of the current best individual as the
+        # search explores, but only if it is collision-free — an unconverged candidate
+        # can cross obstacles, and drawing such a segment would look like a path
+        # through a wall (mirrors PSO's guarded segment visualization).
         idx = self.iteration % (self.num_points - 1)
-        p1 = (int(self.best_individual[idx, 0]), int(self.best_individual[idx, 1]))
-        p2 = (int(self.best_individual[idx + 1, 0]), int(self.best_individual[idx + 1, 1]))
-        
-        return StepResult(edge=(p1, p2))
+        a = self.best_individual[idx]
+        b = self.best_individual[idx + 1]
+        p1 = (int(a[0]), int(a[1]))
+        p2 = (int(b[0]), int(b[1]))
+        if self._is_segment_free(a, b):
+            return StepResult(edge=(p1, p2))
+        return StepResult(
+            rejected_point=(int(round((p1[0] + p2[0]) * 0.5)), int(round((p1[1] + p2[1]) * 0.5)))
+        )
     
     def _check_best_path(self):
         """Check if best path is collision-free."""

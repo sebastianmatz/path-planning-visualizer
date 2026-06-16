@@ -64,6 +64,9 @@ class PRMPlanner(BasePlanner):
         self.search_parent: Dict[int, int] = {}
         self.search_g: Dict[int, float] = {}
         self.current_path: List[int] = []
+        # Snapshot of the roadmap's union-find forest taken once learning finishes,
+        # so a re-query (drag start/goal) can restore it after stripping query nodes.
+        self._roadmap_uf_snapshot: List[int] = []
 
     def _build_sample_pool(self) -> List[Point]:
         """Pre-sample unique free roadmap nodes, excluding query configurations.
@@ -175,15 +178,28 @@ class PRMPlanner(BasePlanner):
         x, y = self.sample_pool[self.sample_idx]
         self._add_node((x, y))
         self.sample_idx += 1
-        return StepResult(edge=((x - 2, y - 2), (x + 2, y + 2)))  # Small marker
+        return StepResult(node_marker=(x, y))  # roadmap milestone, drawn as a dot
     
     def _connecting_step(self) -> StepResult:
-        """Connect roadmap nodes to nearby roadmap neighbors."""
+        """Connect a roadmap node to nearby neighbours.
+
+        PRM (Kavraki et al. 1996) builds the roadmap *incrementally*: each node is
+        connected only to nodes already added (earlier indices), skipping pairs already
+        in the same connected component -> a cycle-free forest grown organically. sPRM
+        (Karaman & Frazzoli 2011) is *batch*: connect each node to all neighbours within
+        range, keeping cycles. Restricting the forest variant to earlier nodes both
+        matches Kavraki's construction and avoids the first-processed node grabbing all
+        k neighbours at once (the mega-hub artifact of an all-pairs pass).
+        """
         if self.connect_idx >= self.roadmap_size:
+            self._roadmap_uf_snapshot = list(self._uf_parent)  # forest state for re-queries
             self.phase = "query_start"
             return StepResult()
 
-        candidate_indices = [idx for idx in range(self.roadmap_size) if idx != self.connect_idx]
+        if self.remove_cycles:
+            candidate_indices = list(range(self.connect_idx))  # incremental: already-placed nodes
+        else:
+            candidate_indices = [idx for idx in range(self.roadmap_size) if idx != self.connect_idx]
         edges = self._connect_node(self.connect_idx, candidate_indices)
         self.connect_idx += 1
         return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if len(edges) > 1 else None)
@@ -272,7 +288,95 @@ class PRMPlanner(BasePlanner):
         if not self.current_path:
             return []
         return [self.nodes[i] for i in self.current_path]
-    
+
+    def can_requery(self) -> bool:
+        """True once the roadmap is learned, so new start/goal can reuse it."""
+        return self.roadmap_size > 0 and bool(self._roadmap_uf_snapshot)
+
+    def graph_edges(self) -> List[Edge]:
+        """Current roadmap + query-connection edges as deduplicated point pairs."""
+        return self._edges_as_points(include_query=True)
+
+    def roadmap_edges(self) -> List[Edge]:
+        """The learned roadmap edges only — excludes the transient start/goal query
+        connections, so the displayed roadmap stays fixed across re-queries (only the
+        path changes) rather than appearing to sprout new edges at each drop point."""
+        return self._edges_as_points(include_query=False)
+
+    def _edges_as_points(self, include_query: bool) -> List[Edge]:
+        seen: Set[Tuple[int, int]] = set()
+        out: List[Edge] = []
+        for i, neighbours in self.edges.items():
+            if not include_query and i >= self.roadmap_size:
+                continue
+            for j, _ in neighbours:
+                if not include_query and j >= self.roadmap_size:
+                    continue
+                key = (i, j) if i < j else (j, i)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((self.nodes[i], self.nodes[j]))
+        return out
+
+    def requery(self, new_start: Point, new_goal: Point) -> bool:
+        """Re-solve for new start/goal on the already-learned roadmap (no re-sampling).
+
+        Reuses ``nodes[:roadmap_size]`` and their edges; only the start/goal attachment
+        and the graph search are redone — this is what makes a roadmap method's
+        learned structure worth keeping. Returns True if a path was found.
+        """
+        if not self.can_requery():
+            return False
+
+        # Drop the previous query nodes (always trailing, index >= roadmap_size) and
+        # any roadmap back-edges pointing at them; restore the forest's union-find.
+        del self.nodes[self.roadmap_size:]
+        for i in list(self.edges.keys()):
+            if i >= self.roadmap_size:
+                del self.edges[i]
+            else:
+                self.edges[i] = [(n, d) for (n, d) in self.edges[i] if n < self.roadmap_size]
+        self._uf_parent = list(self._roadmap_uf_snapshot)
+
+        self.start = new_start
+        self.goal = new_goal
+        self.current_path = []
+        self.found_path = False
+        self.start_idx = self._add_node(new_start)
+        self._connect_node(self.start_idx, list(range(self.roadmap_size)))
+        self.goal_idx = self._add_node(new_goal)
+        self._connect_node(self.goal_idx, list(range(self.goal_idx)))  # roadmap + start
+
+        # A* over the roadmap graph (synchronous; fast relative to learning).
+        open_heap: List[Tuple[float, float, int]] = [(self._heuristic(self.start_idx), 0.0, self.start_idx)]
+        g_score: Dict[int, float] = {self.start_idx: 0.0}
+        parent: Dict[int, int] = {}
+        closed: Set[int] = set()
+        while open_heap:
+            _, g_cost, current = heapq.heappop(open_heap)
+            if current == self.goal_idx:
+                path = [current]
+                while current in parent:
+                    current = parent[current]
+                    path.append(current)
+                path.reverse()
+                self.current_path = path
+                self.found_path = True
+                return True
+            if current in closed:
+                continue
+            closed.add(current)
+            for neighbor, cost in self.edges[current]:
+                if neighbor in closed:
+                    continue
+                tentative = g_cost + cost
+                if tentative < g_score.get(neighbor, float('inf')):
+                    g_score[neighbor] = tentative
+                    parent[neighbor] = current
+                    heapq.heappush(open_heap, (tentative + self._heuristic(neighbor), tentative, neighbor))
+        return False
+
     def get_status(self) -> str:
         total_edges = sum(len(e) for e in self.edges.values()) // 2
         return (

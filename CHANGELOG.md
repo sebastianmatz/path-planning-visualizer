@@ -4,6 +4,93 @@ This file tracks release notes for published versions of the project.
 
 ## [Unreleased]
 
+## [0.1.0b11] - 2026-06-16
+
+### Added
+
+- **Roadmap re-query by dragging start/goal (PRM/sPRM).** Once a roadmap planner
+  finishes, the start and goal markers become draggable; dropping one re-solves on the
+  **same learned roadmap** — only the start/goal attachment and graph search are redone,
+  no re-sampling — so the path updates near-instantly. This showcases what makes a
+  roadmap method worth its build cost (cheap repeated queries). The path updates **live
+  while dragging**, and invalid drops (onto an obstacle) snap back. Once re-query mode
+  is active the canvas shows the **fixed roadmap only** (the path itself shows the
+  start/goal attachment), so the roadmap visibly stays put instead of appearing to
+  sprout new edges at each drop point. New `PRMPlanner.requery`/`roadmap_edges`; canvas
+  marker-drag interaction.
+
+- **The active search frontier is highlighted for the rewiring/search planners.**
+  RRT\*, BIT\*, A\*, Dijkstra and SBL redraw their whole tree each frame; the edges
+  added/relaxed *this step* are now shown as a brief fading highlight (cyan edges + node
+  dots) over the settled tree, so it is visible where the search is progressing right
+  now. A\*/Dijkstra report every neighbour relaxed per expansion (not just the last) so
+  the frontier reads clearly.
+
+- **Windows executable + automated release builds.** A single-file `.exe` is produced
+  with PyInstaller (bundling the example mazes and package metadata, so the in-app
+  version is correct); on each pushed version tag a GitHub Actions workflow builds it on
+  a Windows runner and attaches it to the GitHub Release, with a Sigstore/SLSA
+  **build-provenance attestation**. The README documents the download (and the
+  SmartScreen note) plus `gh attestation verify`. (`packaging/`,
+  `.github/workflows/release.yml`.)
+
+### Changed
+
+- **PRM now builds its roadmap incrementally, matching Kavraki et al. (1996).** The
+  forest variant previously connected each node to its k-nearest among *all* samples in
+  one batch pass, so whichever node was processed first grabbed all k neighbours at once
+  (degree-15 "mega-hub" stars). It now connects each node only to nodes *already placed*
+  — Kavraki's incremental learning phase — still skipping same-component pairs. The
+  result is the same cycle-free forest (verified 0 cycles) but balanced and organically
+  grown (max degree 15 → 8), a faithful depiction of the algorithm. sPRM keeps its batch
+  all-pairs connection per Karaman & Frazzoli (2011).
+
+### Fixed
+
+- **CHOMP optimization is fast again (~5× speedup, back under a second).** Its
+  per-iteration best-valid/collision check converted every waypoint to a pixel with
+  scalar `np.clip(np.rint(...))`, whose numpy per-call overhead dominated the profile
+  (~0.9 s of pure clip machinery; the scalar `np.clip`/`np.rint` calls, not the
+  collision sampling). Replaced with plain Python round/clamp — behaviour-identical
+  (same rounding, same clamp, same optimized path), just fast. Measured ~3.4 s → ~0.7 s
+  on a 50-point / 270-iteration optimize.
+- **Collision checking no longer skips obstacle corners (could yield paths through
+  walls).** The segment rasterization used fixed-rate `max(dx, dy)` sampling, which on
+  a diagonal edge could round *around* the corner cell of an obstacle and report a
+  colliding edge as clear. BIT\* — the one planner that relied on the coarse default
+  (others pass a dense `samples=`) — returned paths that clipped wall corners, *on the
+  real bundled maze*, and `test_optimality`'s collision check used the same coarse
+  default so it could not catch it. `geometry.segment_points` is now an exact grid
+  (voxel) traversal that visits every touched cell and never skips a corner; the
+  `samples` argument is kept for compatibility but ignored. Benefits every collision
+  check and clearance metric. Added `tests/test_geometry.py`.
+- **A\*, Dijkstra and SBL now display their actual tree.** A\*/Dijkstra relax nodes
+  still in the open set (a node's parent can change before expansion), so drawing one
+  relaxation edge per pop left the displayed search tree incomplete and partly stale;
+  they now expose `extract_tree_edges()` (from `came_from`) and the canvas redraws the
+  whole tree once per frame (throttled like the optimizers — rebuilding it every step
+  is O(tree) and would make these fast planners O(n²)). SBL is lazy and attempts
+  cross-tree bridges (some in
+  collision); it now redraws its authoritative, collision-free milestone tree rather
+  than accumulating attempt edges (no more through-wall/stale edges in the display).
+- **PRM/sPRM sampled milestones are drawn as dots, not edges.** Each sample was drawn
+  as a tiny diagonal "marker edge" (not a real edge; some clipped walls). Milestones
+  are now drawn as persistent node dots via a new `StepResult.node_marker` channel; the
+  roadmap edges (already accurate) are unchanged.
+- **Genetic no longer draws candidate segments through obstacles.** It visualized one
+  segment of its current best individual unconditionally, so an unconverged candidate
+  could show a segment crossing a wall; it now guards each drawn segment with a
+  collision check (as PSO already did).
+- **RRT\* now displays its actual tree — rewiring is shown correctly.** RRT\* rewires
+  (a node's parent changes when a cheaper connection is found), but the GUI was
+  *appending* each new edge and never redrawing, so rewired-away edges lingered on
+  screen while the new rewired edges were never shown. Measured on a typical run,
+  ~half the displayed tree was wrong (183 stale + 182 missing edges out of 362). The
+  canvas now redraws RRT\*'s tree from its authoritative parent structure each step
+  (new `RRTStarPlanner.extract_tree_edges`, routed through the same whole-tree redraw
+  BIT\* already used); the displayed tree now matches the real tree exactly. Guarded
+  by a GUI regression test.
+
 ## [0.1.0b10] - 2026-06-16
 
 ### Changed

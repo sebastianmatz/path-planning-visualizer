@@ -10,6 +10,7 @@ from ..geometry import (
     line_collision_free,
     steer,
 )
+from ..types import Edge
 from ._rgg import rgg_radius
 from ._spatial import GridIndex
 from .base import BasePlanner, StepResult
@@ -223,7 +224,20 @@ class RRTStarPlanner(BasePlanner):
             i = self.parent[i]
         path.reverse()
         return path
-    
+
+    def extract_tree_edges(self) -> List[Edge]:
+        """Return the current tree as parent->child edges.
+
+        RRT* rewires (a node's parent can change), so the displayed tree must be
+        redrawn from the authoritative ``parent`` structure each step rather than
+        accumulated incrementally, otherwise rewired-away edges would linger.
+        """
+        return [
+            (self.nodes[par], self.nodes[i])
+            for i, par in enumerate(self.parent)
+            if par != -1
+        ]
+
     def get_status(self) -> str:
         cost_str = f", path cost: {self.best_goal_cost:.1f}" if self.found_path else ""
         if self.adaptive_radius:

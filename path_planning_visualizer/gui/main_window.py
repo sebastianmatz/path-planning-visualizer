@@ -39,6 +39,7 @@ from ..planners.base import BasePlanner, StepResult
 from ..planners.bit_star import BITStarPlanner
 from ..planners.chomp import CHOMPPlanner
 from ..planners.gpmp import GPMPPlanner
+from ..planners.prm import PRMPlanner
 from ..planners.pso import PSOPlanner
 from ..planners.registry import (
     ALGORITHM_GROUPS,
@@ -145,6 +146,9 @@ class MainWindow(QMainWindow):
         self.canvas.setMinimumSize(800, 600)
         self.canvas.on_point_picked = self._on_point_picked
         self.canvas.is_point_valid = self._is_point_on_free_space
+        self.canvas.on_marker_dragged = self._on_marker_dragged
+        self.canvas.on_marker_dragging = self._on_marker_dragging
+        self._last_requery_t = 0.0  # throttle live re-queries while dragging
     
     def _setup_algorithm_controls(self) -> None:
         """Initialize algorithm selection and parameters."""
@@ -541,6 +545,7 @@ class MainWindow(QMainWindow):
     
     def _on_algo_changed(self, name: str):
         """Switch parameter widget when algorithm changes."""
+        self.canvas.drag_markers_enabled = False  # leave roadmap re-query mode
         # Extract actual algo name (without formatting)
         actual_name = name.strip()
         if actual_name.startswith('---'):
@@ -721,6 +726,7 @@ class MainWindow(QMainWindow):
         """Enter/leave map-editing mode."""
         self.canvas.edit_mode = checked
         if checked:
+            self.canvas.drag_markers_enabled = False  # editing overrides re-query drag
             if not self.btn_map_tools.isChecked():
                 self.btn_map_tools.setChecked(True)  # reveal the tools panel
             self.pause()
@@ -937,6 +943,7 @@ class MainWindow(QMainWindow):
         The actual (possibly off-thread) planner construction is done by the
         caller via ``_build_planner_async(..., force_new=True)``.
         """
+        self.canvas.drag_markers_enabled = False  # leave roadmap re-query mode
         start = self.canvas.start
         goal = self.canvas.goal
 
@@ -975,10 +982,12 @@ class MainWindow(QMainWindow):
     def _do_one_step(self):
         if self.planner is None:
             return
+        self.canvas.drag_markers_enabled = False  # stepping resumes; re-enabled when done
         step_start = time.perf_counter()
         result = self.planner.step_once()
         self._record_solver_time(time.perf_counter() - step_start)
         self._handle_step_result(result)
+        self._refresh_dynamic_tree()  # single step: redraw the dynamic tree once
         self._check_done()
         if not self.planner.done:
             self._update_status_display(state="Stepping", info=self.planner.get_status())
@@ -1014,6 +1023,7 @@ class MainWindow(QMainWindow):
         self.timer.start(interval_ms)
     
     def _set_running_state(self):
+        self.canvas.drag_markers_enabled = False  # a run is starting; leave re-query mode
         # For anytime algorithms, allow Re-Run while running
         if self._is_anytime_algorithm():
             self.btn_run.setText("Re-Run")
@@ -1180,6 +1190,7 @@ class MainWindow(QMainWindow):
             # In MAX mode, update display periodically for visual feedback
             if speed >= 1000 and not is_optimizer and (i + 1) % display_interval == 0:
                 self.canvas.fade_highlights(fade_amount=120)  # Extra fade during updates
+                self._refresh_dynamic_tree()
                 self.canvas._update_display()
                 self._update_stopwatch_label()
                 self._update_status_display(state="Running", info=self.planner.get_status())
@@ -1192,32 +1203,65 @@ class MainWindow(QMainWindow):
             if tick_time_budget is not None and (time.perf_counter() - tick_start) >= tick_time_budget:
                 break
 
-        # Optimizers update their (smoothed) display once per tick, after the batch.
+        # Optimizers and dynamic-tree planners refresh their display once per tick,
+        # after the batch (not per step).
         if is_optimizer:
             self._update_optimizer_display()
+        else:
+            self._refresh_dynamic_tree()  # no-op for accumulating planners
         self.canvas._update_display()
         self._check_done()
     
+    def _is_dynamic_tree(self, planner) -> bool:
+        """A rewiring/search planner (RRT*, BIT*, A*, Dijkstra, SBL) whose tree changes
+        in place, so it must be redrawn whole from its authoritative structure."""
+        return (
+            planner is not None
+            and not isinstance(planner, (GPMPPlanner, CHOMPPlanner))
+            and hasattr(planner, "extract_tree_edges")
+        )
+
+    def _refresh_dynamic_tree(self) -> None:
+        """Redraw a dynamic-tree planner's whole tree from extract_tree_edges().
+
+        Called once per tick (and once per single Step), NOT per step: rewired/search
+        edges can't be appended incrementally, but rebuilding the whole edge list every
+        step is O(tree) and would make a fast planner like A*/Dijkstra O(n^2).
+        """
+        if self._is_dynamic_tree(self.planner):
+            self.canvas.set_current_tree_edges(self.planner.extract_tree_edges())
+
     def _handle_step_result(self, result: StepResult):
         edge_color = QColor(160, 32, 240) if self.optimizing_from_sampling else Qt.GlobalColor.blue
-        is_gpmp = isinstance(self.planner, GPMPPlanner)
-        is_chomp = isinstance(self.planner, CHOMPPlanner)
-        is_bitstar = isinstance(self.planner, BITStarPlanner)
-        # Handle multiple edges (for batch algorithms like FMT*)
-        if result.edges and not is_gpmp and not is_chomp and not is_bitstar:
-            for edge in result.edges:
-                self.canvas.draw_edge(edge[0], edge[1], color=edge_color)
-        elif result.edge and not is_gpmp and not is_chomp and not is_bitstar:
-            self.canvas.draw_edge(result.edge[0], result.edge[1], color=edge_color)
-        elif is_bitstar and self.planner is not None and hasattr(self.planner, "extract_tree_edges"):
-            self.canvas.set_current_tree_edges(self.planner.extract_tree_edges())
+        is_optimizer = isinstance(self.planner, (GPMPPlanner, CHOMPPlanner))
+        # Accumulating planners (RRT, RRT-Connect, FMT*, KPIECE, …) add their edges
+        # incrementally here (O(1)/step, baked into the tree layer). Dynamic-tree
+        # planners (RRT*, BIT*, A*, Dijkstra, SBL) have the whole tree redrawn once per
+        # tick by _refresh_dynamic_tree; here we only *highlight* the new edge(s) this
+        # step so the active frontier (where the search is progressing right now) shows
+        # as a brief fading highlight over the static tree.
+        if not is_optimizer:
+            if self._is_dynamic_tree(self.planner):
+                if result.edges:
+                    for edge in result.edges:
+                        self.canvas.highlight_edge(edge[0], edge[1])
+                elif result.edge:
+                    self.canvas.highlight_edge(result.edge[0], result.edge[1])
+            else:
+                if result.edges:
+                    for edge in result.edges:
+                        self.canvas.draw_edge(edge[0], edge[1], color=edge_color)
+                elif result.edge:
+                    self.canvas.draw_edge(result.edge[0], result.edge[1], color=edge_color)
+        if result.node_marker:
+            self.canvas.add_node_marker(result.node_marker)
         if result.rejected_point:
             self.canvas.add_rejected_highlight(result.rejected_point)
             self.canvas._update_display()
         # For RRT*: always keep the current best path visible
         if self.planner is not None and self.planner.found_path:
             path = self.planner.extract_path()
-            if path and not self.optimizing_from_sampling and not is_gpmp and not is_chomp:
+            if path and not self.optimizing_from_sampling and not is_optimizer:
                 display_path = self.planner.extract_display_path() if hasattr(self.planner, "extract_display_path") else path
                 self.canvas.set_current_path(list(display_path), style="default")
 
@@ -1262,6 +1306,9 @@ class MainWindow(QMainWindow):
             self._update_status_display(state="No Path", info=self.planner.get_status())
             self.btn_pause.setEnabled(False)
             self.btn_pause.setText("Pause")
+            # A roadmap planner that found no path can still be re-queried by dragging
+            # start/goal (the roadmap exists; a different query may connect).
+            self._update_requery_mode()
             return
         
         path = self.planner.extract_path()
@@ -1293,6 +1340,8 @@ class MainWindow(QMainWindow):
         else:
             self._offer_chomp_if_available()
 
+        self._update_requery_mode()  # roadmap planners: enable drag-to-re-query
+
     def _settle_optimized_path(self, final_path: List[Tuple[float, float]]) -> None:
         """After the end-of-optimization morph, replace the glowing live path and
         its iteration trails with a clean solid optimized line."""
@@ -1300,3 +1349,83 @@ class MainWindow(QMainWindow):
             return  # a new run/reset took over in the meantime; leave it alone
         self.canvas.clear_path()  # drop current_path, history, previous (glow + trails)
         self.canvas.draw_path(final_path, permanent=True, color=QColor(255, 105, 180))
+
+    def _update_requery_mode(self) -> None:
+        """Enable drag-to-re-query once a roadmap planner has finished with a path,
+        so dragging start/goal re-solves on the same learned roadmap."""
+        planner = self.planner
+        enabled = bool(
+            isinstance(planner, PRMPlanner) and planner.done and planner.can_requery()
+        )
+        self.canvas.drag_markers_enabled = enabled
+        if enabled:
+            # Show the fixed roadmap only (drop the transient query connections drawn
+            # during the build) so it's clear the roadmap is reused and only the path
+            # changes when dragging.
+            self.canvas.set_appended_edges(planner.roadmap_edges())
+            state = "Found" if planner.found_path else "No Path"
+            self._update_status_display(
+                state=state, info="Drag the start or goal marker to re-query the roadmap."
+            )
+
+    def _requery_active(self) -> bool:
+        # Eligibility depends on the roadmap existing, NOT on whether the last query
+        # succeeded — otherwise a failed re-query (dragged to a spot with no path)
+        # would permanently block re-querying, so dragging back to a solvable spot
+        # could never recompute.
+        p = self.planner
+        return bool(isinstance(p, PRMPlanner) and p.done and p.can_requery())
+
+    def _draw_requery_path(self) -> List[Point]:
+        """Draw the current re-queried path (yellow); return the raw path."""
+        self.canvas.clear_path()
+        self.canvas.clear_final_path()
+        if not self.planner.found_path:
+            return []
+        path = self.planner.extract_path()
+        display = (
+            self.planner.extract_display_path()
+            if hasattr(self.planner, "extract_display_path")
+            else path
+        )
+        self.canvas.draw_path(display, permanent=True, color=Qt.GlobalColor.yellow)
+        return path
+
+    def _on_marker_dragging(self, which: str, point: Tuple[int, int]) -> None:
+        """Live path update while a marker is dragged: re-query + redraw only the path
+        (the roadmap is unchanged, so its layer is left alone), throttled for big maps."""
+        if not self._requery_active():
+            return
+        now = time.perf_counter()
+        if now - self._last_requery_t < 0.02:  # cap live re-queries (~50/s)
+            return
+        self._last_requery_t = now
+        if not self._is_point_on_free_space(point):
+            # Over an obstacle: no valid query here, so show no path (it will
+            # recompute as soon as the marker is dragged back onto free space).
+            self.canvas.clear_path()
+            self.canvas.clear_final_path()
+            return
+        self.planner.requery(self.canvas.start, self.canvas.goal)
+        self._draw_requery_path()
+
+    def _on_marker_dragged(self, which: str, point: Tuple[int, int]) -> None:
+        """Finish a marker drag: solve the final drop and do the full refresh."""
+        if not self._requery_active():
+            return
+        if self._is_point_on_free_space(point):
+            self.planner.requery(self.canvas.start, self.canvas.goal)
+        else:
+            # Invalid drop: keep the last valid solution; snap markers back to it.
+            self.canvas.start = self.planner.start
+            self.canvas.goal = self.planner.goal
+        # Show the fixed roadmap only; the path itself shows the start/goal attachment.
+        self.canvas.set_appended_edges(self.planner.roadmap_edges())
+        path = self._draw_requery_path()
+        if path:
+            self.last_found_path = list(path)
+            self._set_path_metrics_labels(self._get_path_metrics(path))
+            self._update_status_display(state="Found", info=self.planner.get_status())
+        else:
+            self._set_path_metrics_labels(None)
+            self._update_status_display(state="No Path", info="No roadmap path between these points.")

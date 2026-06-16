@@ -61,14 +61,21 @@ class ImageCanvas(QLabel):
         # Map-editing state
         self.edit_mode: bool = False
 
+        # Drag-to-re-query state (roadmap planners: drag start/goal after completion)
+        self.drag_markers_enabled: bool = False
+        self._dragging: Optional[str] = None  # 'start' or 'goal' while dragging
+
         # Callbacks
         self.on_point_picked: Optional[Callable[[str, Point], None]] = None
         self.is_point_valid: Optional[Callable[[Point], bool]] = None
         self.on_paint: Optional[Callable[[Point, bool], None]] = None  # (point, is_erase)
+        self.on_marker_dragged: Optional[Callable[[str, Point], None]] = None  # (which, new_point) on release
+        self.on_marker_dragging: Optional[Callable[[str, Point], None]] = None  # (which, point) live, per move
         
         # Visualization state
         self.highlights: List[Tuple[int, int, int]] = []  # (x, y, alpha)
         self.rejected_highlights: List[Tuple[int, int, int]] = []  # (x, y, alpha)
+        self.node_markers: List[Point] = []  # persistent roadmap milestones (PRM), drawn as dots
         self.edge_highlights: List[Tuple[int, int, int, int, int]] = []  # (x1, y1, x2, y2, alpha)
         self.current_tree_edges: List[Edge] = []        # replaced each step (rewiring planners)
         self._appended_edges: List[Edge] = []           # accumulated incrementally (draw_edge)
@@ -278,6 +285,7 @@ class ImageCanvas(QLabel):
         self.highlights = []
         self.rejected_highlights = []
         self.edge_highlights = []
+        self.node_markers = []
         self.current_tree_edges = []
         self._appended_edges = []
         self._tree_layer = None
@@ -353,6 +361,11 @@ class ImageCanvas(QLabel):
             painter.setPen(self._make_pen(QColor(0, 0, 255, 130), 1.0))
             for a, b in self.current_tree_edges:
                 painter.drawLine(QPointF(float(a[0]), float(a[1])), QPointF(float(b[0]), float(b[1])))
+
+        # Roadmap milestones (e.g. PRM samples): persistent dots, drawn under the
+        # tree/path so connections render on top of their endpoints.
+        for (x, y) in self.node_markers:
+            self._dot(painter, x, y, 2.0, QColor(70, 110, 200, 200))
 
         # Permanent / found path, then the live path estimate on top.
         if len(self._final_path) >= 2:
@@ -483,6 +496,13 @@ class ImageCanvas(QLabel):
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
+        # Drag-to-re-query: if enabled (roadmap planner finished), grab a marker.
+        if self.drag_markers_enabled:
+            which = self._marker_at(event.position().x(), event.position().y())
+            if which is not None:
+                self._dragging = which
+                return
+
         p = self._canvas_to_image(event.position().x(), event.position().y())
         if p is None:
             return
@@ -505,6 +525,18 @@ class ImageCanvas(QLabel):
             self._draw_marker(p, "goal")
 
     def mouseMoveEvent(self, event):
+        # Dragging a start/goal marker (roadmap re-query): follow the cursor live.
+        if self._dragging is not None and self.base_pixmap is not None:
+            p = self._clamp_to_image(event.position().x(), event.position().y())
+            if self._dragging == "start":
+                self.start = p
+            else:
+                self.goal = p
+            self.update()
+            if self.on_marker_dragging is not None:
+                self.on_marker_dragging(self._dragging, p)  # live path update
+            return
+
         # Drag-painting while editing: left held = draw, right held = erase.
         if not self.edit_mode or self.on_paint is None or self.base_pixmap is None:
             return
@@ -519,6 +551,41 @@ class ImageCanvas(QLabel):
         if p is not None:
             self.on_paint(p, erase)
 
+    def mouseReleaseEvent(self, event):
+        # Finish a marker drag: hand the dropped position to the re-query callback.
+        if self._dragging is None:
+            return
+        which = self._dragging
+        self._dragging = None
+        point = self.start if which == "start" else self.goal
+        if self.on_marker_dragged is not None and point is not None:
+            self.on_marker_dragged(which, point)
+
+    def _image_to_canvas(self, p: Point) -> Tuple[float, float]:
+        return (self.offset_x + p[0] * self.scale, self.offset_y + p[1] * self.scale)
+
+    def _marker_at(self, sx: float, sy: float) -> Optional[str]:
+        """Return 'start'/'goal' if a screen point is within grab range of a marker."""
+        self._recompute_geometry()
+        grab = 12.0
+        for which, pt in (("start", self.start), ("goal", self.goal)):
+            if pt is None:
+                continue
+            cx, cy = self._image_to_canvas(pt)
+            if (sx - cx) ** 2 + (sy - cy) ** 2 <= grab * grab:
+                return which
+        return None
+
+    def _clamp_to_image(self, x: float, y: float) -> Point:
+        """Map a screen point to an image pixel, clamped to the map bounds."""
+        self._recompute_geometry()
+        s = self.scale if self.scale > 0 else 1.0
+        ix = int((x - self.offset_x) / s)
+        iy = int((y - self.offset_y) / s)
+        ix = max(0, min(ix, self.base_pixmap.width() - 1))
+        iy = max(0, min(iy, self.base_pixmap.height() - 1))
+        return (ix, iy)
+
     def update_base_image(self, qpix: QPixmap) -> None:
         """Swap the base map image in place, keeping start/goal and the overlays.
 
@@ -532,6 +599,19 @@ class ImageCanvas(QLabel):
     def _draw_marker(self, p, kind):
         # Markers are rendered from self.start / self.goal in paintEvent; this just
         # requests a repaint (kept for API compatibility with the main window).
+        self.update()
+
+    def set_appended_edges(self, edges: List[Edge], color: Optional[QColor] = None):
+        """Replace the accumulated tree/roadmap edges wholesale and rebuild the layer.
+
+        Used to redraw a roadmap after a re-query (drag start/goal): the stale previous
+        query connections are dropped and the current graph is re-baked once.
+        """
+        self._appended_edges = list(edges)
+        if color is not None:
+            self._appended_edge_color = QColor(color)
+        self._tree_layer = None
+        self._tree_layer_count = 0
         self.update()
 
     def draw_edge(self, a, b, color=Qt.GlobalColor.blue):
@@ -588,6 +668,11 @@ class ImageCanvas(QLabel):
     
     def add_rejected_highlight(self, point):
         self.rejected_highlights.append((point[0], point[1], 255))
+
+    def add_node_marker(self, point: Point):
+        """Record a persistent roadmap milestone (drawn as a small dot)."""
+        self.node_markers.append((int(point[0]), int(point[1])))
+        self.update()
     
     def fade_highlights(self, fade_amount=25):
         self.highlights = [(x, y, a - fade_amount) for x, y, a in self.highlights if a - fade_amount > 0]

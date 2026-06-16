@@ -3,7 +3,7 @@
 [![CI](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml/badge.svg)](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Status](https://img.shields.io/badge/status-beta%20(0.1.0b10)-orange)
+![Status](https://img.shields.io/badge/status-beta%20(0.1.0b11)-orange)
 [![Download](https://img.shields.io/github/v/release/sebastianmatz/path-planning-visualizer?include_prereleases&label=download%20(Windows))](https://github.com/sebastianmatz/path-planning-visualizer/releases/latest)
 
 An interactive desktop application for **exploring, comparing, and tuning path-planning algorithms** for a 2D point robot on occupancy-grid maps. It bundles 20 planners — sampling-based, graph-search, potential-field, trajectory-optimization, and metaheuristic — behind one UI, with step-through visualization, live path metrics, an interactive map editor, and a reproducible headless benchmark.
@@ -78,6 +78,9 @@ path-planning-visualizer
    (Keyboard: Space = Run/Pause, `S` = Step, `R` = Reset, Esc = stop.)
 5. The **Status** panel shows live path metrics, compute times, and the planner's status string.
 6. For sampling-based planners, pause once a path is found and click **CHOMP Optimize** to smooth it.
+7. For roadmap planners (**PRM**/**sPRM**), once a path is found you can **drag the start or goal
+   marker** to re-query the *same* roadmap instantly (no re-sampling) — showing why a roadmap is worth
+   building once and querying many times.
 
 **Editing maps.** The map tools are collapsed by default behind the **Map Tools** toggle in the left
 panel — click it to reveal them. Toggle **Edit Map** and left-drag to draw obstacles or right-drag to

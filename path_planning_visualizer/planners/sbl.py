@@ -525,6 +525,22 @@ class SBLPlanner(BasePlanner):
     def extract_path(self) -> List[Tuple[int, int]]:
         return list(self.solution_path)
 
+    def extract_tree_edges(self) -> List[Edge]:
+        """Both milestone trees as parent->child edges, redrawn whole each step.
+
+        Each milestone is placed reachably from its parent, so these tree edges are
+        collision-free. SBL also *attempts* cross-tree bridge connections (lazy, and
+        sometimes in collision); those are transient and must not be accumulated as if
+        they were tree edges. Drawing the authoritative parent structure each step
+        keeps the shown tree faithful (no stale or through-wall attempt edges); a
+        successful bridge appears as part of the solution path instead.
+        """
+        return [
+            (self.nodes[n.parent].point, n.point)
+            for n in self.nodes
+            if n.parent not in (None, -1)
+        ]
+
     def get_status(self) -> str:
         if self.found_path:
             return (

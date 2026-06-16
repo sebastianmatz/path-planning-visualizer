@@ -231,9 +231,16 @@ class CHOMPPlanner(BasePlanner):
         return True
 
     def _trajectory_point_to_pixel(self, point: np.ndarray) -> Point:
-        """Convert a floating-point waypoint to the nearest valid pixel."""
-        x = int(np.clip(np.rint(point[0]), 0, self.w - 1))
-        y = int(np.clip(np.rint(point[1]), 0, self.h - 1))
+        """Convert a floating-point waypoint to the nearest valid pixel.
+
+        Uses plain Python round/clamp rather than ``np.rint``/``np.clip`` on scalars:
+        this is called per waypoint in every per-iteration collision check, and numpy
+        scalar ops carry large per-call overhead (they dominated the CHOMP profile).
+        """
+        x = int(round(float(point[0])))
+        y = int(round(float(point[1])))
+        x = 0 if x < 0 else (self.w - 1 if x >= self.w else x)
+        y = 0 if y < 0 else (self.h - 1 if y >= self.h else y)
         return (x, y)
 
     def _rounded_trajectory_point(self, index: int) -> Point:

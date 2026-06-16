@@ -4,6 +4,7 @@ from typing import Dict, List, Set, Tuple
 
 import numpy as np
 
+from ..types import Edge
 from .base import BasePlanner, StepResult
 
 
@@ -107,25 +108,27 @@ class DijkstraPlanner(BasePlanner):
         
         self.closed_set.add(current)
         
-        edge = None
+        edges: List[Edge] = []
         for neighbor, cost in self._get_neighbors(current):
             if neighbor in self.closed_set:
                 continue
-            
+
             new_dist = current_dist + cost
-            
+
             if new_dist < self.dist.get(neighbor, float('inf')):
                 self.came_from[neighbor] = current
                 self.dist[neighbor] = new_dist
                 heapq.heappush(self.open_set, (new_dist, neighbor))
-                
+
+                # Highlight every neighbor relaxed this expansion as the active
+                # frontier (the tree is drawn from came_from; these fade).
                 p1 = (current[0] * self.grid_size + self.grid_size // 2,
                       current[1] * self.grid_size + self.grid_size // 2)
                 p2 = (neighbor[0] * self.grid_size + self.grid_size // 2,
                       neighbor[1] * self.grid_size + self.grid_size // 2)
-                edge = (p1, p2)
-        
-        return StepResult(edge=edge)
+                edges.append((p1, p2))
+
+        return StepResult(edges=edges or None)
     
     def extract_path(self) -> List[Tuple[int, int]]:
         if not self.path_grid:
@@ -141,7 +144,22 @@ class DijkstraPlanner(BasePlanner):
             if not deduped or deduped[-1] != p:
                 deduped.append(p)
         return deduped
-    
+
+    def extract_tree_edges(self) -> List[Edge]:
+        """Current search tree (``came_from``) as parent->node edges in pixel coords.
+
+        Redrawn whole from ``came_from`` each step (rather than accumulating one
+        relaxation edge per pop), so the displayed search tree faithfully reflects the
+        current best-known parent of every reached node.
+        """
+        gs, half = self.grid_size, self.grid_size // 2
+
+        def center(c: Tuple[int, int]) -> Tuple[int, int]:
+            return (c[0] * gs + half, c[1] * gs + half)
+
+        return [(center(par), center(node)) for node, par in self.came_from.items()]
+
+
     def get_status(self) -> str:
         return f"Dijkstra: explored {len(self.closed_set)}, open {len(self.open_set)}"
     
