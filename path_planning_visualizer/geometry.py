@@ -236,15 +236,17 @@ def line_collision_free(
     samples: Optional[int] = None
 ) -> bool:
     """Check if line segment from a to b is collision-free.
-    
-    Uses adaptive rasterization to cover long segments robustly.
-    
+
+    Delegates to ``segment_points``' exact grid (voxel) traversal, which visits every
+    cell the segment touches (no cell is skipped), regardless of segment length.
+
     Args:
         a: Start point of line segment
         b: End point of line segment
         occ: Occupancy grid (True = obstacle)
-        samples: Number of points to check along the line
-        
+        samples: Accepted for backward compatibility but ignored — the voxel traversal
+            is already exact, so no sample count is needed
+
     Returns:
         True if the entire line is collision-free
     """
