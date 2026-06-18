@@ -98,11 +98,20 @@ class GridIndex:
 
     @staticmethod
     def _ring(qcx: int, qcy: int, k: int):
-        """Yield cell coords at Chebyshev distance exactly ``k`` from (qcx, qcy)."""
+        """Yield cell coords at Chebyshev distance exactly ``k`` from (qcx, qcy).
+
+        Generates the ring's ~8k perimeter cells directly in O(k); the previous
+        version scanned the full (2k+1)^2 box with an abs/max filter (O(k^2) per
+        ring), which made nearest-neighbour queries on large/sparse maps explode to
+        ~O(K^3) (hundreds of millions of abs/max calls). The cell *set* is identical,
+        and nearest()'s result is order-independent (min distance, ties by index).
+        """
         if k == 0:
             yield (qcx, qcy)
             return
-        for dx in range(-k, k + 1):
-            for dy in range(-k, k + 1):
-                if max(abs(dx), abs(dy)) == k:
-                    yield (qcx + dx, qcy + dy)
+        for dx in range(-k, k + 1):  # bottom + top rows (full width, includes corners)
+            yield (qcx + dx, qcy - k)
+            yield (qcx + dx, qcy + k)
+        for dy in range(-k + 1, k):  # left + right columns (corners already emitted)
+            yield (qcx - k, qcy + dy)
+            yield (qcx + k, qcy + dy)

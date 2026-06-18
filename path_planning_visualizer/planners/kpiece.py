@@ -18,7 +18,14 @@ from .base import BasePlanner, StepResult
 
 @dataclass
 class KPIECEMotion:
-    """Single motion/node in a KPIECE exploration tree."""
+    """A single motion (tree edge) in the KPIECE exploration tree.
+
+    A "motion" here is a straight, Range-bounded extension from ``start`` to ``end``
+    -- the geometric 2D-point-robot stand-in for the paper's forward-propagated,
+    control-driven motion (see the class docstring's adaptation notes). ``cell_coord``
+    is the projection cell the motion is filed under (no motion crosses a cell
+    boundary; see ``_split_segment_by_cells``).
+    """
 
     start: Point
     end: Point
@@ -28,7 +35,20 @@ class KPIECEMotion:
 
 @dataclass
 class KPIECECell:
-    """Single projected grid cell used by KPIECE."""
+    """One cell of the projection grid, carrying the SK09 importance bookkeeping.
+
+    The field names map directly onto the importance equation
+    ``Importance(p) = log(I) * score / (S * N * C)`` (SK09 p. 6):
+
+    - ``creation_iteration`` -> I: the iteration the cell was instantiated.
+    - ``score``              -> the exploration-progress weight (init 1, shrunk by the
+      progress penalty when the cell stops making progress).
+    - ``selections``         -> S: how many times the cell has been selected (init 1).
+    - ``neighbor_count``     -> N: instantiated same-level axis-neighbours.
+    - ``coverage``           -> C: sum of motion "durations" (here lengths) in the cell.
+    - ``border``             -> exterior flag: True iff ``neighbor_count < 2n = 4``
+      (SK09 p. 4, the "< 2n" interior/exterior rule for n = 2).
+    """
 
     coord: Tuple[int, int]
     motion_indices: List[int] = field(default_factory=list)
@@ -42,7 +62,47 @@ class KPIECECell:
 
 
 class KPIECEPlanner(BasePlanner):
-    """KPIECE - projection-guided tree planner with border-cell exploration."""
+    """KPIECE - Kinodynamic Planning by Interior-Exterior Cell Exploration.
+
+    Faithful single-level *geometric* adaptation of Sucan & Kavraki (2009, WAFR 2008;
+    cite ``SK09``) to a 2D holonomic point robot. The defining idea is a *projection
+    grid* over the workspace whose cells carry an **importance** score; each iteration
+    the planner selects the most important cell (biased toward the *exterior* of the
+    explored region, where growth is still possible), grows a motion from it, and
+    penalizes cells that stop making progress -- so exploration keeps pushing into
+    unexplored space instead of churning in already-covered regions.
+
+    Paper correspondence (Section 3, Algorithms 1-2; equations p. 6):
+
+    - Importance ``log(I) * score / (S * N * C)`` -- ``_compute_importance``.
+    - Exterior (border) cell iff ``< 2n = 4`` instantiated axis-neighbours
+      (n = 2) -- ``KPIECECell.border`` / ``_recompute_cells``.
+    - Cell selection: deterministic highest-importance pick with a fixed exterior
+      bias of 70-80% -- ``_select_cell`` (Alg. 1 line 5).
+    - Motion picked from the cell by a half-normal law (recent motions preferred),
+      then a state uniformly along it -- ``_select_motion_index`` /
+      ``_select_state_on_motion`` (Alg. 1 lines 6-7).
+    - AddMotion splits an extension at cell boundaries so no motion straddles two
+      cells -- ``_split_segment_by_cells`` / ``_add_motion_chain`` (Alg. 2 line 20).
+    - Progress penalty ``P = alpha + beta * (deltaC / simulated_time)``; if ``P < 1``
+      the selected cell's ``score`` is multiplied by ``P`` -- ``_apply_progress_penalty``
+      (Alg. 1 lines 16-17).
+
+    Adaptations (stated for fidelity):
+
+    - **Single-level grid (k = 1)** instead of the paper's multilevel grids
+      ``L_1..L_k``; coverage is the sum of motion lengths in that one level.
+    - **Geometric, not kinodynamic:** there is no forward-propagation ``f`` / physics.
+      A "motion" is a straight Range-bounded extension whose collision-free prefix is
+      kept (``min_valid_path_fraction``); "simulated time" in the progress term is the
+      traveled *distance* -- the 2D point-robot analogue. Controls ``u in U`` (Alg. 1
+      line 8) do not apply.
+    - A **score-underflow reset** uniformly lifts all scores when the best drops below
+      machine epsilon, keeping the importance ordering numerically stable on long runs.
+    - An optional small ``goal_bias`` (off in the paper) aids single-query 2D use.
+
+    See ``literature/fidelity/kpiece.md`` and ``tests/test_kpiece_fidelity.py``.
+    """
 
     name = "KPIECE"
     description = "Projection-grid planner with state sampling along motions, border-cell preference, and progress-based score penalties"
@@ -94,21 +154,40 @@ class KPIECEPlanner(BasePlanner):
             self.done = True
 
     def _project(self, point: Point) -> Tuple[int, int]:
+        """Projection from a workspace pixel to its grid-cell coordinate (the map ``p``).
+
+        KPIECE explores a low-dimensional *projection* of the state space; for a 2D
+        point robot the natural projection is the identity-into-a-coarse-grid, i.e.
+        integer-divide the pixel by ``cell_size``.
+        """
         return (int(point[0] // self.cell_size), int(point[1] // self.cell_size))
 
     @staticmethod
     def _neighbor_coords(coord: Tuple[int, int]) -> List[Tuple[int, int]]:
+        """The four axis (non-diagonal) neighbours used for the ``< 2n`` exterior test."""
         cx, cy = coord
         return [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)]
 
     def _compute_importance(self, cell: KPIECECell) -> None:
-        creation_term = float(np.log(max(2, cell.creation_iteration)))
-        neighbor_term = float(max(1, cell.neighbor_count))
-        coverage_term = max(1.0, cell.coverage)
-        selection_term = float(max(1, cell.selections))
+        """Importance ``log(I) * score / (S * N * C)`` (SK09 p. 6).
+
+        Each factor is clamped -- ``log(max(2, I))`` and ``max(1, .)`` on every
+        denominator term -- so the importance stays finite and strictly positive even
+        for a brand-new cell with no neighbours and unit coverage (where N, C, S = 1).
+        """
+        creation_term = float(np.log(max(2, cell.creation_iteration)))   # log(I)
+        neighbor_term = float(max(1, cell.neighbor_count))               # N
+        coverage_term = max(1.0, cell.coverage)                          # C
+        selection_term = float(max(1, cell.selections))                  # S
         cell.importance = creation_term * cell.score / (selection_term * neighbor_term * coverage_term)
 
     def _recompute_cells(self, coords: Set[Tuple[int, int]]) -> None:
+        """Refresh neighbour count, exterior/border flag, and importance for ``coords``.
+
+        A cell is *exterior* (border) when it has fewer than ``2n = 4`` instantiated
+        axis-neighbours (SK09 p. 4, the "< 2n" rule for n = 2). ``border_cell_count``
+        is kept in sync on every flip so ``_select_cell`` can bias toward the exterior.
+        """
         for coord in coords:
             cell = self.cells.get(coord)
             if cell is None:
@@ -131,11 +210,17 @@ class KPIECEPlanner(BasePlanner):
         cell = self.cells.get(coord)
         affected_coords: Set[Tuple[int, int]] = {coord}
         if cell is None:
+            # New cell: stamp its creation iteration I and refresh the border status of
+            # itself and its neighbours (a fresh neighbour can flip an adjacent cell from
+            # exterior to interior).
             cell = KPIECECell(coord=coord, creation_iteration=max(1, self.iteration))
             self.cells[coord] = cell
             self.border_cell_count += 1
             affected_coords.update(self._neighbor_coords(coord))
 
+        # Coverage C is the sum of motion "durations" in the cell. The root seed counts
+        # as one unit; every real motion contributes its length (the geometric analogue
+        # of the paper's motion duration).
         coverage_delta = 1.0 if parent is None else max(1e-6, dist(start, end))
         cell.coverage += coverage_delta
         cell.motion_indices.append(motion_idx)
@@ -150,11 +235,23 @@ class KPIECEPlanner(BasePlanner):
         return motion_idx, coverage_delta
 
     def _select_cell(self) -> KPIECECell:
+        """Select the cell to expand from (Alg. 1 line 5): top importance, exterior-biased.
+
+        First flip a biased coin: with probability ``border_fraction`` (the paper's
+        fixed 70-80% exterior bias) restrict the candidate pool to exterior cells,
+        otherwise to interior cells. Then pick *deterministically* the highest-importance
+        cell in the pool (ties broken by older creation, fewer selections, more motions).
+
+        Score-underflow reset: importance is proportional to ``score``, which the
+        progress penalty repeatedly shrinks; if the chosen cell's score has decayed
+        below machine epsilon, lift every cell's score uniformly and re-rank. This
+        preserves the *relative* importance ordering while keeping the arithmetic away
+        from denormals on long runs (an adaptation, not in the paper).
+        """
         all_cells = [cell for cell in self.cells.values() if cell.motion_indices]
         border_cells = [cell for cell in all_cells if cell.border]
         interior_cells = [cell for cell in all_cells if not cell.border]
 
-        # Paper Alg. 1 line 5: a fixed bias toward exterior (border) cells (70-80%).
         if border_cells and (not interior_cells or self.rng.random() < self.border_fraction):
             pool = border_cells
         else:
@@ -182,11 +279,21 @@ class KPIECEPlanner(BasePlanner):
                     len(cell.motion_indices),
                 ),
             )
+        # Selecting the cell costs it one "selection" S, lowering its future
+        # importance so attention rotates to other cells.
         chosen.selections += 1
         self._compute_importance(chosen)
         return chosen
 
     def _select_motion_index(self, cell: KPIECECell) -> int:
+        """Pick a motion in the cell by a half-normal law over recency (Alg. 1 line 6).
+
+        ``motion_indices`` is append-ordered, so index ``-1`` is the most recent motion.
+        A folded-Gaussian (half-normal) offset from the newest end biases selection
+        toward recently added motions -- the paper's preference for growing from the
+        latest frontier -- while still occasionally reaching back to older motions. The
+        spread ``sigma`` grows with the number of motions so larger cells stay reachable.
+        """
         if len(cell.motion_indices) == 1:
             return cell.motion_indices[0]
 
@@ -195,6 +302,12 @@ class KPIECEPlanner(BasePlanner):
         return cell.motion_indices[-1 - offset]
 
     def _select_state_on_motion(self, motion_idx: int) -> Point:
+        """Pick a state uniformly along the chosen motion (Alg. 1 line 7).
+
+        Geometric adaptation: the paper samples a state along a forward-propagated
+        trajectory; for a straight 2D motion this is a uniform interpolation
+        ``start + t*(end - start)``, ``t ~ U[0, 1]``.
+        """
         motion = self.motions[motion_idx]
         if motion.start == motion.end:
             return motion.end
@@ -204,6 +317,13 @@ class KPIECEPlanner(BasePlanner):
         return clamp_point((x, y), self.w, self.h)
 
     def _sample_target(self, from_pt: Point) -> Point:
+        """Sample an extension target within the ``Range`` disk around ``from_pt``.
+
+        With probability ``goal_bias`` aim straight at the goal (a single-query 2D aid,
+        off in the paper); otherwise sample uniformly in the disk of radius
+        ``max_distance`` (``Range``) and clamp the result back inside it, so no single
+        motion is longer than ``Range``.
+        """
         if self.rng.random() < self.goal_bias:
             target = self.goal
         else:
@@ -222,6 +342,14 @@ class KPIECEPlanner(BasePlanner):
     def _split_segment_by_cells(
         self, start: Point, end: Point
     ) -> List[Tuple[Point, Point, Tuple[int, int]]]:
+        """Split an extension at projection-cell boundaries (AddMotion, Alg. 2 line 20).
+
+        The paper requires that a stored motion lie within a single cell so that
+        coverage and cell membership are well defined. We walk the rasterized segment
+        and cut it wherever it crosses into a new cell, returning ``(seg_start,
+        seg_end, cell)`` pieces -- each piece becomes one ``KPIECEMotion`` filed under
+        its own cell.
+        """
         points = segment_points(start, end)
         if len(points) < 2:
             return []
@@ -241,6 +369,16 @@ class KPIECEPlanner(BasePlanner):
         return segments
 
     def _partial_extension(self, from_pt: Point, target: Point) -> Tuple[Optional[Point], float]:
+        """Geometric stand-in for the paper's control propagation toward ``target``.
+
+        The paper propagates a control until it collides or the duration elapses, then
+        keeps the valid prefix. Here we walk the straight segment and keep its longest
+        collision-free prefix. A *partial* extension (one that stops before ``target``)
+        is only accepted if it covered at least ``min_valid_path_fraction`` of the way;
+        otherwise the motion is too stunted to be worth storing and we reject it.
+
+        Returns ``(last_valid_point, distance_traveled)``, or ``(None, .)`` on rejection.
+        """
         if target == from_pt:
             return None, 0.0
 
@@ -266,6 +404,15 @@ class KPIECEPlanner(BasePlanner):
         return last_valid, moved_dist
 
     def _apply_progress_penalty(self, cell: KPIECECell, coverage_delta: float, simulated_distance: float) -> None:
+        """Progress penalty ``P = alpha + beta * (deltaC / simulated_time)`` (Alg. 1 lines 16-17).
+
+        ``deltaC`` is how much coverage this expansion added and ``simulated_time`` is
+        the traveled distance (the 2D point-robot analogue of the paper's simulation
+        time). Only a *lack* of progress is penalized: if ``P < 1`` the cell's ``score``
+        is multiplied by ``P`` (lowering its future importance); if ``P >= 1`` the score
+        is left untouched -- the paper deliberately does not reward over and over a cell
+        that happens to make a lot of progress.
+        """
         if simulated_distance <= 1e-6:
             progress = self.progress_alpha
         else:
@@ -277,6 +424,13 @@ class KPIECEPlanner(BasePlanner):
     def _add_motion_chain(
         self, parent_idx: int, start: Point, end: Point
     ) -> Tuple[Optional[int], List[Edge], float]:
+        """Add the boundary-split extension as a chain of single-cell motions (Alg. 2).
+
+        Each piece returned by ``_split_segment_by_cells`` becomes one motion, chained
+        parent->child, so the stored tree never has a motion crossing a cell boundary.
+        Returns the last motion's index, the per-piece edges (for drawing), and the
+        total coverage added.
+        """
         segments = self._split_segment_by_cells(start, end)
         if not segments:
             return None, [], 0.0
@@ -296,6 +450,12 @@ class KPIECEPlanner(BasePlanner):
         return last_idx, edges, total_coverage_delta
 
     def _connect_goal(self, from_idx: int) -> Optional[Tuple[int, List[Edge]]]:
+        """Single-query goal connection: link a new motion straight to the goal if close.
+
+        Single-query 2D termination (the WAFR paper plans toward a goal *region*, not a
+        clicked point): if the new motion's endpoint is within ``goal_tolerance`` of the
+        goal and has a collision-free straight line to it, attach the goal and finish.
+        """
         from_pt = self.motions[from_idx].end
         if dist(from_pt, self.goal) > self.goal_tolerance:
             return None
@@ -325,15 +485,19 @@ class KPIECEPlanner(BasePlanner):
             self.done = True
             return StepResult(done=True, found_path=False)
 
+        # One KPIECE iteration (Alg. 1): select cell -> select motion -> select a state
+        # on it -> sample a Range-bounded target -> extend -> penalize progress.
         self.iteration += 1
-        cell = self._select_cell()
-        motion_idx = self._select_motion_index(cell)
-        source = self._select_state_on_motion(motion_idx)
+        cell = self._select_cell()                       # Alg. 1 line 5
+        motion_idx = self._select_motion_index(cell)     # Alg. 1 line 6
+        source = self._select_state_on_motion(motion_idx)  # Alg. 1 line 7
         target = self._sample_target(source)
         attempted_distance = max(dist(source, target), 1e-6)
         new_point, traveled = self._partial_extension(source, target)
 
         if new_point is None or new_point in self.point_set:
+            # Failed / duplicate extension: zero coverage gained, so the progress ratio
+            # is small and the cell's score is penalized for not advancing the frontier.
             self._apply_progress_penalty(cell, coverage_delta=0.0, simulated_distance=attempted_distance)
             return StepResult(rejected_point=target)
 

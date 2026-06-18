@@ -8,7 +8,6 @@ from .bitrrt import BiTRRTPlanner
 from .chomp import CHOMPPlanner
 from .dijkstra import DijkstraPlanner
 from .fmt_star import FMTStarPlanner
-from .genetic import GeneticPlanner
 from .gpmp import GPMPPlanner
 from .itomp import ITOMPPlanner
 from .kpiece import KPIECEPlanner
@@ -48,7 +47,6 @@ __all__ = [
     "ITOMPPlanner",
     "GPMPPlanner",
     "PSOPlanner",
-    "GeneticPlanner",
     "ALGORITHM_GROUPS", "ALGORITHM_INFO", "ANYTIME_ALGOS",
     "AVAILABLE_PLANNERS", "SAMPLING_BASED_ALGOS",
 ]

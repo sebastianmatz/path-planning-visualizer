@@ -10,7 +10,7 @@ Supported algorithms:
 - Graph Search: A*, Dijkstra
 - Potential Field: APF
 - Trajectory Optimization: CHOMP, STOMP, TrajOpt, ITOMP, GPMP
-- Metaheuristic: PSO, Genetic
+- Metaheuristic: PSO
 
 Usage:
     python -m path_planning_visualizer
@@ -77,7 +77,6 @@ from .planners import (
     ClassicPRMPlanner,
     DijkstraPlanner,
     FMTStarPlanner,
-    GeneticPlanner,
     GPMPPlanner,
     ITOMPPlanner,
     KPIECEPlanner,
@@ -145,7 +144,7 @@ __all__ = [
     "RRTPlanner", "RRTConnectPlanner", "BiTRRTPlanner", "KPIECEPlanner",
     "RRTStarPlanner", "PRMPlanner", "ClassicPRMPlanner", "SBLPlanner", "FMTStarPlanner", "BITStarPlanner",
     "AStarPlanner", "DijkstraPlanner", "APFPlanner", "CHOMPPlanner", "STOMPPlanner",
-    "TrajOptPlanner", "ITOMPPlanner", "GPMPPlanner", "PSOPlanner", "GeneticPlanner",
+    "TrajOptPlanner", "ITOMPPlanner", "GPMPPlanner", "PSOPlanner",
     # gui + entry
     "ImageCanvas", "MainWindow", "main",
 ]

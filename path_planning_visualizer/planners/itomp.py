@@ -155,6 +155,10 @@ class ITOMPPlanner(BasePlanner):
     def extract_path(self) -> List[Tuple[int, int]]:
         return [(int(p[0]), int(p[1])) for p in self.trajectory]
 
+    def extract_display_path(self) -> List[Tuple[float, float]]:
+        """Float trajectory for clean single-curve rendering (no accumulated edges)."""
+        return [(float(p[0]), float(p[1])) for p in self.trajectory]
+
     def get_status(self) -> str:
         status = "FOUND" if self.found_path else "optimizing"
         progress = self.exec_idx / (self.num_points - 1) * 100

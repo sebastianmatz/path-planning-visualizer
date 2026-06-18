@@ -19,7 +19,14 @@ from .base import BasePlanner, StepResult
 
 @dataclass
 class SBLSegmentState:
-    """Lazy collision-check state for an SBL segment."""
+    """Lazy collision-check state for one segment (TEST-SEGMENT, SL01 sec. 4.4).
+
+    - ``kappa``: the dyadic refinement level -- ``2^kappa + 1`` equally spaced points
+      along the segment are known to be collision-free.
+    - ``safe``: True once the segment has been refined to resolution
+      ``2^-kappa * length < epsilon`` (and the grid-soundness line check passed), so it
+      never needs testing again.
+    """
 
     kappa: int = 0
     safe: bool = False
@@ -27,7 +34,11 @@ class SBLSegmentState:
 
 @dataclass
 class SBLNode:
-    """Milestone node used by SBL."""
+    """A milestone (tree vertex). ``tree_id`` is 0 for the start tree, 1 for the goal tree.
+
+    A milestone can be *transferred* between trees after a path-collision (Fig. 4), so
+    ``tree_id``, ``parent``, and ``children`` are all mutable.
+    """
 
     point: Point
     tree_id: int
@@ -36,7 +47,52 @@ class SBLNode:
 
 
 class SBLPlanner(BasePlanner):
-    """SBL - Single-query bi-directional planner with lazy collision checking."""
+    """SBL - Single-query Bi-directional Lazy planner.
+
+    Faithful 2D-point-robot adaptation of Sanchez & Latombe (2001, ISRR; cite ``SL01``,
+    sections 4-4.5). Two trees are grown from start and goal; expansion stays cheap
+    because edge collision checking is *deferred* (lazy) and only paid -- with dyadic
+    refinement -- once a candidate solution path connecting the two trees is found.
+
+    Paper correspondence (Section 4):
+
+    - **PLANNER:** each iteration EXPAND-TREE then CONNECT-TREES; return the path when
+      a tested bridge survives -- ``step_once``.
+    - **EXPAND-TREE:** pick a tree (1/2 each); pick a milestone ``m`` with probability
+      ``pi(m) ~ 1/eta(m)`` (lower local density preferred); for ``i = 1..k`` sample
+      ``q`` in the L-infinity ball ``B(m, rho/i)`` and install the first collision-free
+      ``q`` as a child of ``m`` -- ``_expand_tree`` / ``_pick_node_by_density`` /
+      ``_sample_near``.
+    - **CONNECT-TREES:** take the newest milestone, find a near milestone in the other
+      tree (closest in the same cell, then a random one), and if within ``rho`` add a
+      *bridge* and TEST-PATH the ``q_init..q_goal`` chain -- ``_attempt_connection``.
+    - **TEST-SEGMENT(u):** lazy dyadic refinement -- each call tests only the *new*
+      midpoints of the next level, returns collision on a hit, else advances ``kappa``,
+      and marks the segment *safe* once ``2^-kappa * lambda(u) < epsilon`` --
+      ``_test_segment_once``.
+    - **TEST-PATH(tau):** a priority queue over not-yet-safe segments ordered by
+      *decreasing* ``2^-kappa * lambda(u)`` (most-likely-to-collide first); test one
+      level at a time, drop the roadmap edge on a collision -- ``_test_candidate_path``
+      / ``_segment_score``.
+    - **Milestone transfer (Fig. 4):** when a non-bridge segment of the candidate path
+      collides, the detached subtree is moved to the other tree and the parent links
+      along the bridge->collision chain are inverted -- ``_transfer_subtree_after_collision``.
+
+    Adaptations (stated for fidelity):
+
+    - 2D holonomic point robot on an integer pixel grid; ``C = [0, w] x [0, h]``.
+    - A single threshold ``rho`` serves both the expansion ball ``B(m, rho/i)`` and the
+      bridge closeness test (the paper's ``rho`` and ``zeta`` -- the same "closeness"
+      notion).
+    - **Grid-soundness guard:** at the ``kappa`` where ``2^-kappa * lambda < epsilon`` a
+      segment is additionally verified with an exhaustive ``line_collision_free`` before
+      being marked safe, so a sub-``epsilon`` 1-pixel obstacle can never slip between the
+      dyadic samples. This only makes acceptance stricter (never returns a colliding path).
+    - A lightweight random shortcut optimizer (~16 passes) post-processes the solution
+      (sec. 4.5, "typically 10-20").
+
+    See ``literature/fidelity/sbl.md`` and ``tests/test_sbl_fidelity.py``.
+    """
 
     name = "SBL"
     description = "Bi-directional lazy roadmap planner with deferred collision checking and a lightweight post-optimizer"
@@ -83,6 +139,12 @@ class SBLPlanner(BasePlanner):
         return frozenset((a, b))
 
     def _cell_for_point(self, p: Point) -> Tuple[int, int]:
+        """Map a point to its density-grid cell.
+
+        The ``grid_cells x grid_cells`` partition of C underlies both the
+        ``1/eta(m)`` density milestone selection (sparse cells preferred) and the
+        same-cell "closest milestone" connection heuristic (sec. 4.5).
+        """
         cx = min(int(p[0] * self.grid_cells / max(1, self.w)), self.grid_cells - 1)
         cy = min(int(p[1] * self.grid_cells / max(1, self.h)), self.grid_cells - 1)
         return (cx, cy)
@@ -113,6 +175,13 @@ class SBLPlanner(BasePlanner):
         self._add_to_cell_map(node_id)
 
     def _pick_node_by_density(self, tree_id: int) -> int:
+        """Pick a milestone with probability ``pi(m) ~ 1/eta(m)`` (EXPAND-TREE, sec. 4.5).
+
+        Realized on the grid: choose a non-empty cell uniformly at random, then a
+        milestone uniformly within it. Milestones in sparsely populated cells (low local
+        density ``eta``) are therefore more likely to be picked -- exactly the paper's
+        ``1/eta(m)`` weighting, which steers expansion toward under-explored regions.
+        """
         non_empty_cells = [cell for cell, ids in self.cell_maps[tree_id].items() if ids]
         if not non_empty_cells:
             return 0 if tree_id == 0 else 1
@@ -127,6 +196,12 @@ class SBLPlanner(BasePlanner):
         return ids[int(self.rng.integers(0, len(ids)))]
 
     def _sample_near(self, center: Point, radius: float) -> Point:
+        """Sample a point in the L-infinity ball ``B(center, radius)`` (EXPAND-TREE).
+
+        Called with ``radius = rho/i`` for ``i = 1..k`` in ``_expand_tree``, so the
+        candidate neighbourhood shrinks on each retry -- the paper's ``B(m, rho/i)``
+        shrinking-ball expansion (a near miss is retried closer to the milestone).
+        """
         radius = max(1.0, radius)
         iradius = max(1, int(np.ceil(radius)))
         for _ in range(40):
@@ -147,6 +222,16 @@ class SBLPlanner(BasePlanner):
         return node_id
 
     def _expand_tree(self) -> Tuple[Optional[int], Optional[Edge]]:
+        """EXPAND-TREE (sec. 4.5): grow one tree by one milestone.
+
+        Pick a tree at random (1/2 each), pick a milestone ``m`` by density
+        (``1/eta(m)``), then try ``k = max_candidates`` shrinking balls
+        ``B(m, rho/i)``, ``i = 1..k``, installing the *first* collision-free sample as a
+        child of ``m``. Note only the new milestone's *position* is checked free here --
+        the connecting edge is left for lazy TEST-SEGMENT later (the whole point of SBL).
+        The outer retry loop just resamples the tree/milestone if a milestone yields no
+        free candidate.
+        """
         tree_id = int(self.rng.integers(0, 2))
         for _ in range(60):
             parent_id = self._pick_node_by_density(tree_id)
@@ -173,6 +258,13 @@ class SBLPlanner(BasePlanner):
         return linf_dist(self.nodes[a].point, self.nodes[b].point)
 
     def _segment_new_points(self, a: Point, b: Point, level: int) -> List[Point]:
+        """The *new* equally spaced points introduced at dyadic ``level``.
+
+        Returns the odd-numerator interpolations ``k/2^level`` for odd ``k`` -- i.e. the
+        midpoints that ``sigma(u, level)`` adds over ``sigma(u, level-1)``. Testing only
+        these avoids re-checking points already verified at coarser levels, which is what
+        makes the refinement in TEST-SEGMENT incremental (SL01 sec. 4.4).
+        """
         denom = 2 ** level
         pts: List[Point] = []
         for odd in range(1, denom, 2):
@@ -185,6 +277,19 @@ class SBLPlanner(BasePlanner):
         return pts
 
     def _test_segment_once(self, edge_key: frozenset[int]) -> Optional[Point]:
+        """One TEST-SEGMENT call: refine the segment by one dyadic level (SL01 sec. 4.4).
+
+        This is SBL's defining lazy step. It tests *only* the new midpoints of level
+        ``kappa+1`` (the set ``sigma(u, kappa+1) \\ sigma(u, kappa)``) and returns the
+        colliding pixel on a hit. Otherwise ``kappa`` advances by one. Once the sample
+        spacing ``lambda(u) / 2^kappa`` drops below the resolution ``epsilon``
+        (``lazy_resolution``), the segment is confirmed with an exhaustive
+        ``line_collision_free`` -- the grid-soundness guard that closes the gap between
+        dyadic samples on a pixel grid -- and only then marked *safe* (never retested).
+
+        Returns the colliding pixel, or ``None`` meaning "no collision found at this
+        level" (the segment may still need more refinement before it is ``safe``).
+        """
         state = self.edge_states.setdefault(edge_key, SBLSegmentState())
         a_id, b_id = tuple(edge_key)
         a = self.nodes[a_id].point
@@ -198,6 +303,7 @@ class SBLPlanner(BasePlanner):
 
         state.kappa = next_level
         if self._segment_length(edge_key) / (2 ** next_level) < self.lazy_resolution:
+            # Reached resolution epsilon: do the exhaustive grid check before trusting it.
             if not line_collision_free(a, b, self.occ):
                 for p in segment_points(a, b):
                     if not self.is_free(p):
@@ -207,6 +313,13 @@ class SBLPlanner(BasePlanner):
         return None
 
     def _segment_score(self, edge_key: frozenset[int]) -> float:
+        """TEST-PATH priority key: ``lambda(u) / 2^kappa``, or ``-1`` once safe (sec. 4.4).
+
+        TEST-PATH tests the segment with the *largest* current sample spacing first
+        (coarsest, hence most likely to still hide a collision); ``_test_candidate_path``
+        takes the ``max`` of this score. Safe segments return ``-1`` so they sort last
+        and are skipped.
+        """
         state = self.edge_states[edge_key]
         if state.safe:
             return -1.0
@@ -265,7 +378,13 @@ class SBLPlanner(BasePlanner):
         return rebuilt
 
     def _optimize_solution_path(self, path: List[Point]) -> List[Point]:
-        """Apply the SBL-style lightweight random path optimizer."""
+        """Lightweight random shortcut optimizer (SL01 sec. 4.5, "typically 10-20").
+
+        Each of ~16 passes picks two points at random arclengths along the path and, if
+        the straight chord between them is collision-free, splices it in -- shortening
+        the path while keeping the endpoints fixed. This is the paper's cheap
+        post-processing step, not a separate optimal planner.
+        """
         if len(path) < 3:
             return list(path)
 
@@ -299,6 +418,11 @@ class SBLPlanner(BasePlanner):
         goal_chain: List[int],
         bridge_key: frozenset[int],
     ) -> List[frozenset[int]]:
+        """The ordered edges of the candidate path ``q_init .. bridge .. q_goal``.
+
+        Walks the start tree root->bridge, the bridge, then the goal tree bridge->root,
+        as the segment set ``tau`` that TEST-PATH must certify collision-free.
+        """
         segments: List[frozenset[int]] = []
         for i in range(1, len(start_chain)):
             segments.append(self._edge_key(start_chain[i - 1], start_chain[i]))
@@ -313,6 +437,14 @@ class SBLPlanner(BasePlanner):
         goal_chain: List[int],
         bridge_key: frozenset[int],
     ) -> Tuple[Optional[frozenset[int]], Optional[Point]]:
+        """TEST-PATH(tau) (SL01 sec. 4.4): certify the candidate path, coarsest-first.
+
+        Repeatedly take the not-yet-safe segment with the largest sample spacing
+        (``max`` of ``_segment_score`` -- the most-likely-to-collide first) and refine it
+        one dyadic level. The first collision aborts and is reported back to the caller
+        (which then drops that roadmap edge and transfers the subtree). The path is
+        accepted only when every segment has been refined to ``safe``.
+        """
         path_segments = self._candidate_path_segments(start_chain, goal_chain, bridge_key)
         for seg in path_segments:
             self.edge_states.setdefault(seg, SBLSegmentState())
@@ -351,6 +483,17 @@ class SBLPlanner(BasePlanner):
         new_tree: int,
         bridge_key: frozenset[int],
     ) -> None:
+        """Milestone transfer after a path collision (SL01 Fig. 4).
+
+        TEST-PATH found a colliding non-bridge edge at ``chain[edge_index-1] ->
+        chain[edge_index]``. SBL does not discard the work done past the collision:
+        it removes that one roadmap edge, then re-roots the detached subtree (everything
+        from ``chain[edge_index]`` onward, toward the bridge) into the *other* tree and
+        *inverts* the parent links along the bridge->collision chain, so those milestones
+        now hang off the opposite bridge endpoint. The bridge edge itself becomes a real
+        tree edge of ``new_tree``. Net effect: a useful chain of milestones is salvaged
+        into the other tree instead of being thrown away.
+        """
         parent = chain[edge_index - 1]
         child = chain[edge_index]
         collision_key = self._edge_key(parent, child)
@@ -392,6 +535,14 @@ class SBLPlanner(BasePlanner):
         goal_chain: List[int],
         bridge_key: frozenset[int],
     ) -> None:
+        """Dispatch a TEST-PATH collision (SL01 sec. 4.4 / Fig. 4).
+
+        A *bridge* collision is the simple case: just drop the bridge (the two trees
+        stay as they were). A collision on a real tree edge triggers the Fig. 4 subtree
+        transfer -- on the start chain the freed subtree moves to the goal tree
+        (``new_tree=1``) and vice versa. The final branch handles a stray edge that is in
+        neither chain by simply severing the parent link.
+        """
         self.raw_solution_path = []
         self.solution_path = []
         if collision_key == bridge_key:
@@ -430,6 +581,15 @@ class SBLPlanner(BasePlanner):
         self.edge_states.pop(collision_key, None)
 
     def _attempt_connection(self, new_node_id: int) -> Optional[StepResult]:
+        """CONNECT-TREES (SL01 sec. 4.5): try to bridge the newest milestone to the other tree.
+
+        Following the paper's "closest-milestone" heuristic, the candidates in the other
+        tree are: the closest milestone *in the same grid cell*, then a random milestone.
+        A bridge is only attempted when the pair is within ``rho`` (L-infinity). On a
+        viable bridge, TEST-PATH the whole ``q_init..q_goal`` chain: if it survives, the
+        path is found (and run through the shortcut optimizer); if it collides, drop the
+        offending edge / transfer the subtree (Fig. 4) and report the rejection.
+        """
         this_tree = self.nodes[new_node_id].tree_id
         other_tree = 1 - this_tree
         new_point = self.nodes[new_node_id].point
@@ -449,6 +609,8 @@ class SBLPlanner(BasePlanner):
         last_rejected_point: Optional[Point] = None
         for other_id in candidate_ids:
             other_point = self.nodes[other_id].point
+            # Bridge only between sufficiently close milestones (the paper's d(m,m') < zeta;
+            # here the single threshold rho doubles as zeta).
             if linf_dist(new_point, other_point) >= self.rho:
                 continue
 
@@ -495,6 +657,7 @@ class SBLPlanner(BasePlanner):
             self.done = True
             return StepResult(done=True, found_path=False)
 
+        # One PLANNER iteration (SL01 sec. 4.5): EXPAND-TREE then CONNECT-TREES.
         self.iteration += 1
 
         new_node_id, expansion_edge = self._expand_tree()

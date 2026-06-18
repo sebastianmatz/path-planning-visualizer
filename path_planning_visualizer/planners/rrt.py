@@ -9,7 +9,6 @@ from ..geometry import (
     line_collision_free,
     round_point,
     select_holonomic_input,
-    smooth_display_path,
 )
 from ..types import FloatPoint, OccupancyGrid, Point
 from ._spatial import GridIndex
@@ -166,12 +165,13 @@ class RRTPlanner(BasePlanner):
         return path
 
     def extract_display_path(self) -> List[Tuple[float, float]]:
-        """Return a smoothed display-only version of the current path."""
-        path = self.extract_path()
-        if len(path) < 3:
-            return [(float(p[0]), float(p[1])) for p in path]
-        spacing = max(2.0, min(4.0, self.delta_t / 4.0))
-        return smooth_display_path(path, self.occ, spacing=spacing, iterations=1)
+        """The genuine RRT path: the polyline through the tree vertices, unsmoothed.
+
+        RRT paths are jagged by nature (they follow the random tree); smoothing the
+        displayed path would misrepresent the algorithm's actual output — and visually
+        blur the difference from the optimizing variants (RRT*/BIT*).
+        """
+        return [(float(p[0]), float(p[1])) for p in self.extract_path()]
 
     def get_status(self) -> str:
         return (

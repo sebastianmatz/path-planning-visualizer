@@ -704,6 +704,15 @@ class ImageCanvas(QLabel):
         focus_point: Optional[Tuple[float, float]] = None,
         animate: bool = False,
     ) -> None:
+        """Set the live path, recording the previous one and optionally tweening to it.
+
+        The previously shown path is kept in ``previous_path`` (drawn as a dashed
+        before/after comparison), and for the optimizer styles a short trail of recent
+        iterates is kept in ``path_history`` (faded contour lines). By default a new path
+        appears immediately, since optimizer iterations are discrete frames; only with
+        ``animate=True`` (e.g. the final converged frame) does the path morph smoothly
+        from the current one via the animation timer, so it doesn't visibly jump.
+        """
         next_path = list(path)
         current_draw_path = self.animated_path if len(self.animated_path) >= 2 else self.current_path
         if current_draw_path and len(current_draw_path) >= 2:

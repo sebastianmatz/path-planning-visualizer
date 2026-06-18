@@ -10,7 +10,6 @@ from .bitrrt import BiTRRTPlanner
 from .chomp import CHOMPPlanner
 from .dijkstra import DijkstraPlanner
 from .fmt_star import FMTStarPlanner
-from .genetic import GeneticPlanner
 from .gpmp import GPMPPlanner
 from .itomp import ITOMPPlanner
 from .kpiece import KPIECEPlanner
@@ -28,7 +27,7 @@ ALGORITHM_GROUPS: List[Tuple[str, List[str]]] = [
     ('Graph Search', ['A*', 'Dijkstra']),
     ('Potential Field', ['APF']),
     ('Trajectory Optimization', ['CHOMP', 'STOMP', 'TrajOpt', 'ITOMP', 'GPMP']),
-    ('Metaheuristic', ['PSO', 'Genetic']),
+    ('Metaheuristic', ['PSO']),
 ]
 
 
@@ -52,7 +51,6 @@ AVAILABLE_PLANNERS: Dict[str, Type[BasePlanner]] = {
     'ITOMP': ITOMPPlanner,
     'GPMP': GPMPPlanner,
     'PSO': PSOPlanner,
-    'Genetic': GeneticPlanner,
 }
 
 
@@ -62,6 +60,25 @@ SAMPLING_BASED_ALGOS: Set[str] = {
 
 
 ANYTIME_ALGOS: Set[str] = {'RRT*', 'BIT*'}
+
+
+# Planners that produce a single *evolving path* — a deforming trajectory
+# (trajectory optimizers) or an improving best candidate (metaheuristics) — rather
+# than a search tree or roadmap. The GUI shows their current path cleanly instead of
+# accumulating every per-step segment as if it were tree structure (which renders as a
+# chaotic scribble for these methods).
+TRAJECTORY_OPTIMIZER_ALGOS: Set[str] = {'CHOMP', 'GPMP', 'STOMP', 'TrajOpt', 'ITOMP'}
+METAHEURISTIC_ALGOS: Set[str] = {'PSO'}
+PATH_DISPLAY_ALGOS: Set[str] = TRAJECTORY_OPTIMIZER_ALGOS | METAHEURISTIC_ALGOS
+
+
+# "Experimental" planners (ALGORITHM_AUDIT.md, stricter classification): faithful
+# implementations that are *local / best-effort* — trajectory optimizers and the
+# potential field depend on the initialization and can stall at local minima, and the
+# metaheuristic (PSO) is a faithful but best-effort optimizer, not a complete planner.
+# They are hidden by default in the GUI and revealed via the "Show experimental" toggle.
+# The remaining planners (graph search + sampling-based) are the reliable, default-visible set.
+EXPERIMENTAL_ALGOS: Set[str] = TRAJECTORY_OPTIMIZER_ALGOS | METAHEURISTIC_ALGOS | {'APF'}
 
 
 ALGORITHM_INFO: Dict[str, Tuple[str, str]] = {
@@ -140,9 +157,5 @@ ALGORITHM_INFO: Dict[str, Tuple[str, str]] = {
     'PSO': (
         "Particle Swarm Optimization over waypoint paths. The default velocity update is the exact Kennedy & Eberhart (1995) form v ← v + 2r₁(pbest − x) + 2r₂(gbest − x) with a V<sub>max</sub> clamp and full momentum (no inertia weight, w = 1.0); an off-by-default safeguards toggle adds adaptive inertia/social gain, diversity injection, random immigrants, and swarm restart for cluttered maps. A metaheuristic, not a complete planner.",
         "Kennedy & Eberhart, 1995"
-    ),
-    'Genetic': (
-        "Experimental waypoint-path optimizer based on a Genetic Algorithm.",
-        "Holland, 1975"
     ),
 }

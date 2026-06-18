@@ -20,7 +20,7 @@ from .base import BasePlanner, StepResult
 
 @dataclass
 class BiTRRTMotion:
-    """Single motion/node in a BiTRRT exploration tree."""
+    """A node in a BiTRRT tree. ``state_cost`` is the clearance-derived cost c(q) at ``point``."""
 
     point: Point
     parent: Optional[int]
@@ -28,7 +28,42 @@ class BiTRRTMotion:
 
 
 class BiTRRTPlanner(BasePlanner):
-    """BiTRRT - Bidirectional Transition-based Rapidly-exploring Random Trees."""
+    """BiTRRT - Bidirectional Transition-based RRT.
+
+    Faithful 2D-point-robot adaptation of Devaurs, Simeon & Cortes (2013, IEEE ICRA;
+    cite ``DSC13``). A bidirectional RRT whose extensions must pass a *transition test*
+    that filters moves by cost, so the trees prefer low-cost (here: high-clearance)
+    regions while an auto-tuned temperature ``T`` keeps the search from stalling on a
+    cost barrier.
+
+    Paper correspondence:
+
+    - **transitionTest (Alg. 2):** reject if ``c_j > c_max``; accept downhill
+      (``c_j <= c_i``); for uphill accept iff ``exp(-(c_j - c_i)/T) > 0.5`` and then
+      *cool* ``T /= 2^((c_j - c_i)/(0.1*costRange))``; else reject and *heat*
+      ``T *= 2^(T_rate)`` -- ``_transition_test``.
+    - **refinementControl (Alg. 3):** an extension shorter than the step size ``delta``
+      is a "refinement" node; reject it once refinement nodes exceed
+      ``rho * total nodes`` -- ``_min_expansion_control``.
+    - **Bidirectional T-RRT (Alg. 4):** extend one tree toward a random sample (subject
+      to refinement control + transition test), attemptLink to the other tree, then
+      swap which tree grows -- ``step_once``.
+    - **attemptLink (Alg. 5):** only if the trees are within ``10*delta``; extend the
+      target tree toward the source along flat/downhill slopes only (no transition
+      test), merging if it reaches the source -- ``_connect_trees``.
+
+    The deterministic ``exp(-(c_j - c_i)/T) > 0.5`` acceptance is the paper's
+    improvement (1) over the original stochastic Metropolis test.
+
+    Adaptations (stated for fidelity):
+
+    - **Clearance-derived cost** ``c(.) = 100 / (1 + clearance)`` in place of the
+      paper's generic user cost; the ``c_max`` thresholding and ``costRange`` are kept.
+    - 2D holonomic point robot; grid raster collision checks; one ``GridIndex`` nearest-
+      neighbour structure per tree.
+
+    See ``literature/fidelity/bitrrt.md`` and ``tests/test_bitrrt_fidelity.py``.
+    """
 
     name = "BiTRRT"
     description = "Bidirectional cost-aware RRT with transition tests and frontier control"
@@ -100,10 +135,23 @@ class BiTRRTPlanner(BasePlanner):
         self.connection_goal_idx: Optional[int] = None
 
     def _state_cost(self, point: Point) -> float:
+        """State cost c(q): the clearance-derived ``100 / (1 + clearance)`` at ``point``.
+
+        Low cost in open space (high clearance), high cost near obstacles -- the 2D-grid
+        stand-in for the paper's generic user-supplied cost map c(.).
+        """
         x, y = point
         return float(self.cost_field[y, x])
 
     def _motion_cost(self, from_pt: Point, to_pt: Point) -> float:
+        """Edge cost for ``from_pt -> to_pt`` -- the ``c_j - c_i`` fed to the transition test.
+
+        Accumulates only the *positive* increments of the state cost along the
+        rasterized segment (the "mechanical work" done climbing the cost field; downhill
+        stretches are free). This is the directional edge cost the paper's transitionTest
+        compares against the temperature, so a move into a steep cost rise is dear while
+        coasting downhill costs nothing.
+        """
         pixels = segment_points(from_pt, to_pt)
         if len(pixels) < 2:
             return 0.0
@@ -138,6 +186,17 @@ class BiTRRTPlanner(BasePlanner):
         return len(motions) - 1
 
     def _transition_test(self, motion_cost: float) -> bool:
+        """transitionTest (DSC13 Alg. 2): accept/reject an extension by its cost ``c_j - c_i``.
+
+        - ``c_j - c_i >= c_max``: hard reject (the user cost ceiling).
+        - ``c_j - c_i ~ 0`` (flat or downhill): always accept, no temperature change.
+        - uphill: accept iff ``exp(-(c_j - c_i)/T) > 0.5`` -- the paper's *deterministic*
+          threshold (improvement (1) over the stochastic Metropolis rule). On accept,
+          *cool* the temperature; on reject, *heat* it (see below), so a barrier that
+          keeps getting rejected gradually becomes easier to cross.
+
+        Both temperature updates are **base 2** as written in the paper.
+        """
         if motion_cost >= self.cost_threshold:
             return False
         if motion_cost < 1e-4:
@@ -145,18 +204,25 @@ class BiTRRTPlanner(BasePlanner):
 
         transition_probability = float(np.exp(-motion_cost / max(self.temp, 1e-9)))
         if transition_probability > 0.5:
-            # Accept uphill: decrease T by 2^((c_j - c_i)/(0.1*costRange)) (Alg. 2 line 4).
+            # Accept uphill: cool T /= 2^((c_j - c_i)/(0.1*costRange)) (Alg. 2 line 4).
             cost_range = self.worst_cost - self.best_cost
             if abs(cost_range) > 1e-4:
                 self.temp /= float(np.power(2.0, motion_cost / (0.1 * cost_range)))
             return True
 
+        # Reject: heat T *= 2^(T_rate) so future crossings here are likelier (Alg. 2 line 6).
         self.temp *= self.temp_change_multiplier
         return False
 
     def _min_expansion_control(self, distance_from_nearest: float) -> bool:
-        # refinementControl (Alg. 3): an extension shorter than delta is a refinement
-        # node; reject it once refinement nodes exceed rho * total nodes.
+        """refinementControl (DSC13 Alg. 3): cap the fraction of short "refinement" nodes.
+
+        An extension that reached at least the step size ``delta`` (``frontier_threshold``)
+        is a *frontier* node and is always allowed -- it pushes into new space. A shorter
+        extension is a *refinement* node; it is allowed only while refinement nodes stay
+        below ``rho`` (``frontier_node_ratio``) of all nodes, so the tree does not drown in
+        tiny in-place refinements instead of exploring.
+        """
         if distance_from_nearest > self.frontier_threshold:
             self.frontier_count += 1
             return True
@@ -175,6 +241,15 @@ class BiTRRTPlanner(BasePlanner):
         target: Point,
         tree_is_start: bool,
     ) -> Tuple[int, Optional[int], Optional[Edge], Optional[Point]]:
+        """Extend ``motions`` from its nearest node toward ``target`` (the RRT EXTEND, gated by Alg. 2 + 3).
+
+        Steer at most ``delta`` toward the target, reject if the new point is blocked or
+        the edge collides, then apply the two BiTRRT gates: the transition test (cost)
+        and refinement control (frontier ratio). ``tree_is_start`` flips the cost
+        direction so ``c_j - c_i`` is always measured along the direction of travel away
+        from that tree's root. Returns ``SUCCESS`` if the target was reached, ``ADVANCED`` if
+        we stepped toward it, or ``FAILED``.
+        """
         q_near = motions[nearest_idx].point
         d = dist(q_near, target)
         reach = d <= self.max_distance
@@ -204,6 +279,14 @@ class BiTRRTPlanner(BasePlanner):
         target_motions: List[BiTRRTMotion],
         target_tree_is_start: bool,
     ) -> Tuple[bool, List[Edge], Optional[int], Optional[Point]]:
+        """attemptLink (DSC13 Alg. 5): try to join the two trees at the new milestone.
+
+        Only attempted when the trees are within ``10*delta`` (``connection_range``,
+        Alg. 5 line 1). The target tree is then greedily extended toward ``source_point``
+        in ``delta`` steps, accepting *only* flat/downhill steps (``c(q_new) <= c(q_near)``)
+        and with **no transition test** -- the junction must not climb cost. If it
+        reaches the source the trees merge (success); any blocked/uphill step aborts.
+        """
         source_point = source_motions[source_idx].point
         nearest_idx = self._nearest_index(target_motions, source_point)
         nearest_point = target_motions[nearest_idx].point
@@ -252,6 +335,8 @@ class BiTRRTPlanner(BasePlanner):
             self.done = True
             return StepResult(done=True, found_path=False)
 
+        # One Bidirectional T-RRT iteration (Alg. 4): grow the active tree toward a
+        # random sample, attemptLink it to the other tree, then swap which tree grows.
         self.iteration += 1
         q_rand = self._sample_uniform()
 

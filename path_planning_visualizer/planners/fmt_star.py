@@ -14,12 +14,44 @@ from .base import BasePlanner, StepResult
 
 
 class FMTStarPlanner(BasePlanner):
-    """FMT* - Fast Marching Tree algorithm.
-    
-    Samples points first, then grows a tree using dynamic-programming-style
-    wavefront expansion with lazy collision checking.
+    """FMT* - Fast Marching Tree.
+
+    Faithful 2D-point-robot adaptation of Janson, Schmerling, Clark & Pavone (2015,
+    IJRR 34(7); cite ``JSC15``, sec. 3.1, Algorithm 1). FMT* samples a batch of free
+    states up front, then grows a single tree outward as a *lazy* dynamic-programming
+    wavefront: it repeatedly expands the lowest-cost node on the frontier, connecting
+    each newly reached node to its locally optimal already-reached neighbour and
+    collision-checking only that one candidate edge.
+
+    Paper correspondence (Algorithm 1):
+
+    1. ``x_init`` starts in ``V_open``, every other sample in ``V_unvisited``; tree
+       rooted at ``x_init`` -- ``__init__``.
+    2. ``z`` = lowest-cost node in ``V_open`` -- the ``open_heap`` pop in ``step_once``.
+    3-6. for each ``V_unvisited`` neighbour ``x`` of ``z``, choose the parent
+       ``y_min = argmin_{y in V_open cap N(x)} cost(y) + ||y - x||`` and, *only if*
+       ``(y_min, x)`` is collision-free, add the edge -- ``step_once``.
+    7-8. connected ``x`` move ``V_unvisited -> V_open``; ``z`` moves
+       ``V_open -> V_closed``.
+    9. terminate when ``V_open`` empties (failure) or the lowest-cost node *popped*
+       from ``V_open`` is the goal (success) -- ``step_once``.
+
+    The single-best-edge collision check -- with **no fallback** to other neighbours
+    when ``y_min`` is blocked -- is FMT*'s defining "lazy" step.
+
+    Radius ``r_n = gamma (log n / n)^(1/d)`` with the paper's
+    ``gamma > 2 (1/d)^(1/d) (mu(X_free)/zeta_d)^(1/d)``; see ``rgg_radius``.
+
+    Adaptations (stated for fidelity):
+
+    - 2D holonomic point robot: neighbours lie in the Euclidean ``r_n``-disk,
+      ``Cost(y, x) = ||y - x||``, edges are raster line checks on the grid.
+    - ``n`` in ``r_n`` is the requested sample count; the goal region is the single
+      goal sample (a ``xi``-regular goal region reduced to a point).
+
+    See ``literature/fidelity/fmt_star.md`` and ``tests/test_fmt_star_fidelity.py``.
     """
-    
+
     name = "FMT*"
     description = "Fast Marching Tree with uniform free-space sampling and lazy wavefront expansion"
     
@@ -71,6 +103,12 @@ class FMTStarPlanner(BasePlanner):
         return rgg_radius(self.num_samples, self.free_space_volume, plus_one=False)
 
     def _precompute_neighbors(self) -> Dict[int, List[Tuple[int, float]]]:
+        """Precompute each sample's neighbours within the connection radius ``r_n``.
+
+        The ``r_n``-disk adjacency (Euclidean distance ``<= self.radius``) is fixed once
+        and reused every iteration; lists are sorted by distance. This is the disk graph
+        over which FMT*'s wavefront runs.
+        """
         coords = np.array(self.samples, dtype=np.float64)
         neighborhoods: Dict[int, List[Tuple[int, float]]] = {}
         for idx in range(self.num_nodes):
@@ -86,6 +124,12 @@ class FMTStarPlanner(BasePlanner):
         return [(other_idx, dist) for other_idx, dist in self.neighbors[idx] if other_idx in candidate_set]
 
     def _collision_free_indices(self, a_idx: int, b_idx: int) -> bool:
+        """Cached collision check for the edge between two samples (Alg. 1 line 6).
+
+        These are the *only* collision checks FMT* performs -- one per locally optimal
+        candidate edge -- so the result is cached by unordered index pair to avoid
+        re-rasterizing an edge that comes up again.
+        """
         key = (a_idx, b_idx) if a_idx <= b_idx else (b_idx, a_idx)
         cached = self.collision_cache.get(key)
         if cached is not None:
@@ -122,6 +166,8 @@ class FMTStarPlanner(BasePlanner):
             self.done = True
             return StepResult(done=True, found_path=True)
 
+        # Alg. 1 lines 3-6: for each unvisited neighbour x of z, connect it to the
+        # locally optimal one-step parent y_min in V_open, then lazily check that one edge.
         z_neighbors = self._neighbors_in_set(z, self.V_unvisited)
 
         edges: List[Edge] = []
@@ -132,6 +178,8 @@ class FMTStarPlanner(BasePlanner):
             if not x_open_neighbors:
                 continue
 
+            # y_min = argmin over V_open neighbours of cost-to-arrive + edge length
+            # (Alg. 1 lines 4-5). Costs of V_open nodes are already final (no rewiring).
             y_min = None
             c_min = float('inf')
             for y, dist_yx in x_open_neighbors:
@@ -143,6 +191,8 @@ class FMTStarPlanner(BasePlanner):
             if y_min is None:
                 continue
 
+            # Lazy step (Alg. 1 line 6): check *only* the best edge. If it collides, skip
+            # x entirely (no fallback to a worse neighbour) -- it may be reached later.
             if not self._collision_free_indices(y_min, x):
                 continue
 

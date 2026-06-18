@@ -371,3 +371,54 @@ def test_save_map_round_trips(qapp, monkeypatch, tmp_path):
         assert np.array_equal(on_disk, occupancy_to_image(occ))
     finally:
         win.close()
+
+
+def test_sampling_defaults_rescale_with_map_size(qapp, monkeypatch, tmp_path):
+    """PRM/sPRM/FMT* default sample count scales up on a large map (so the roadmap
+    stays connected) but respects a user override on the next map load."""
+    small = tmp_path / "small.png"   # ~ reference density -> keeps the base default
+    big = tmp_path / "big.png"       # 4x the linear size -> ~16x area -> scaled up
+    cv2.imwrite(str(small), np.full((300, 300), 255, dtype=np.uint8))
+    cv2.imwrite(str(big), np.full((1200, 1200), 255, dtype=np.uint8))
+
+    win = MainWindow()
+    try:
+        prm, fmt = win.params_widgets["sPRM"], win.params_widgets["FMT*"]
+        base_prm, base_fmt = prm.spin_num_samples.value(), fmt.spin_num_samples.value()
+
+        win._load_image_from_path(str(big))
+        big_prm = prm.spin_num_samples.value()
+        assert big_prm > base_prm                      # scaled up for the larger map
+        assert fmt.spin_num_samples.value() > base_fmt
+
+        # A deliberate user override survives a subsequent (smaller) map load...
+        prm.spin_num_samples.setValue(777)
+        win._load_image_from_path(str(small))
+        assert prm.spin_num_samples.value() == 777     # user choice respected
+        # ...while an untouched panel still rescales (down toward its base here).
+        assert fmt.spin_num_samples.value() < fmt.spin_num_samples.maximum()
+    finally:
+        win.close()
+
+
+def test_change_map_loads_bundled_map(qapp, monkeypatch):
+    from path_planning_visualizer.resources import asset_path, list_maps
+
+    maps = list_maps()
+    assert "maze.png" in maps and len(maps) >= 2  # bundled example maps are discoverable
+
+    win = MainWindow()
+    try:
+        target = asset_path("maze 2.png")
+        expected = image_to_occupancy(cv2.imread(target, cv2.IMREAD_GRAYSCALE))
+
+        monkeypatch.setattr(mw.MapPickerDialog, "choose", staticmethod(lambda parent=None: target))
+        win.change_map()
+        assert win.occ is not None and np.array_equal(win.occ, expected)
+
+        # Cancelling the picker (choose -> None) leaves the current map untouched.
+        monkeypatch.setattr(mw.MapPickerDialog, "choose", staticmethod(lambda parent=None: None))
+        win.change_map()
+        assert np.array_equal(win.occ, expected)
+    finally:
+        win.close()

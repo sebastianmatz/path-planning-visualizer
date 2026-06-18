@@ -223,6 +223,10 @@ class STOMPPlanner(BasePlanner):
     def extract_path(self) -> List[Tuple[int, int]]:
         return [(int(p[0]), int(p[1])) for p in self.trajectory]
 
+    def extract_display_path(self) -> List[Tuple[float, float]]:
+        """Float trajectory for clean single-curve rendering (no accumulated edges)."""
+        return [(float(p[0]), float(p[1])) for p in self.trajectory]
+
     def get_status(self) -> str:
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
         return f"STOMP: iter {self.iteration}/{self.max_iters}, obs: {self.obs_cost:.1f}, ctrl: {self.smooth_cost:.1f}, {status}"

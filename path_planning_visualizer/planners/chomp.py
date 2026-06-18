@@ -12,7 +12,6 @@ from ..geometry import (
     bilinear_sample_vector,
     line_collision_free,
     make_distance_field,
-    smooth_float_polyline,
 )
 from ..types import Point
 from .base import BasePlanner, StepResult
@@ -527,12 +526,13 @@ class CHOMPPlanner(BasePlanner):
         return [self._rounded_trajectory_point(i) for i in range(len(self.trajectory))]
 
     def extract_display_path(self) -> List[Tuple[float, float]]:
-        """Extract the floating-point trajectory for rendering."""
-        path = [(float(p[0]), float(p[1])) for p in self.trajectory]
-        if len(path) < 3:
-            return path
-        spacing = max(1.0, self._trajectory_length() / max(24.0, len(path) * 1.5))
-        return smooth_float_polyline(path, spacing=spacing, iterations=2)
+        """The optimized trajectory itself — the genuine CHOMP output, unsmoothed.
+
+        CHOMP already minimizes a smoothness objective, so the trajectory is smooth by
+        construction; no extra display smoothing is applied (it would alter the shown
+        result away from what the optimizer actually produced).
+        """
+        return [(float(p[0]), float(p[1])) for p in self.trajectory]
     
     def get_status(self) -> str:
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")

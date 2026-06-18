@@ -209,6 +209,10 @@ class TrajOptPlanner(BasePlanner):
     def extract_path(self) -> List[Tuple[int, int]]:
         return [(int(np.rint(p[0])), int(np.rint(p[1]))) for p in self.trajectory]
 
+    def extract_display_path(self) -> List[Tuple[float, float]]:
+        """Float trajectory for clean single-curve rendering (no accumulated edges)."""
+        return [(float(p[0]), float(p[1])) for p in self.trajectory]
+
     def get_status(self) -> str:
         status = "converged" if self.converged else ("FOUND" if self.found_path else "optimizing")
         return (f"TrajOpt: iter {self.iteration}, mu {self.mu:.0f}, trust {self.trust_size:.2f}, "

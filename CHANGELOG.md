@@ -2,7 +2,103 @@
 
 This file tracks release notes for published versions of the project.
 
-## [Unreleased]
+**Versioning.** Semantic versioning with Python-compatible pre-release tags: betas follow
+`0.1.0b1`, `0.1.0b2`, …; the first stable release will be `0.1.0`, with bugfix releases continuing
+as `0.1.1`, `0.1.2`, and so on.
+
+## [0.1.0b12] - 2026-06-18
+
+### Removed
+
+- **Removed the Genetic Algorithm planner.** It was the only planner with no canonical
+  source paper (Holland 1975 is the *origin* of genetic algorithms, not a path-planning
+  reference), so unlike every other planner it could not be held to — or cited against — a
+  defining publication. For a citable academic artifact that made it a soundness liability
+  rather than an asset, and it was already hidden behind the "Show experimental algorithms"
+  toggle. The app now bundles **19** planners. The planner module, its GUI parameter panel,
+  the registry/`__init__` entries, and the benchmark/test hooks are all removed. (The
+  earlier audit's Genetic findings are preserved as a dated record in
+  `literature/fidelity/ALGORITHM_AUDIT.md`.)
+
+### Fixed
+
+- **Displayed paths are now the genuine algorithm output (no beautifying smoothing).**
+  RRT and BIT* were drawing a Chaikin-corner-cut version of their path, and PSO smoothed
+  its result *and its reported metrics*. The shown (and measured) path is now each
+  planner's raw output: RRT's jagged tree-vertex polyline reads as jagged (faithful, and
+  visibly distinct from the optimizing RRT*/BIT*), PSO's metrics reflect the actual swarm
+  best, and CHOMP shows its true optimized trajectory. Removing BIT*'s float smoothing
+  also eliminates the old display-only corner-grazing on thin walls.
+- **PSO shows its evolving best path from the start and stops when it converges.** It
+  used to display nothing until a collision-free path appeared and then spin until
+  `max_iters`. Now the current global-best is shown immediately as a translucent
+  "optimizing" path (like the trajectory optimizers' deforming curve), and the run stops
+  once a valid path exists and the swarm's best stops improving. Genetic got the same
+  convergence stop.
+- **Trajectory optimizers and metaheuristics no longer render as a chaotic scribble.**
+  STOMP, TrajOpt, ITOMP, PSO and Genetic were drawing every per-iteration segment (and
+  PSO's rejected midpoints) *permanently* into the search-tree layer, so a deforming
+  trajectory or a whole particle swarm smeared blue/cyan lines and red/orange dots across
+  the map. These methods produce a single *evolving path* (a deforming curve, or an
+  improving best candidate), not a search tree — they are now shown that way, exactly like
+  CHOMP/GPMP already were: one clean current path that updates each frame, and a clean
+  final path. Metaheuristics only display a path once it is collision-free (never a
+  through-obstacle "solution"). Search/sampling planners (tree/roadmap) are unchanged.
+
+### Added
+
+- **Accurate vs. experimental algorithm split with a "Show experimental" toggle.** The
+  algorithm dropdown now lists only the reliable graph-search and sampling-based planners
+  by default (A\*, Dijkstra, RRT, RRT-Connect, BiTRRT, KPIECE, RRT\*, PRM, sPRM, SBL, FMT\*,
+  BIT\*). A checkbox reveals the experimental planners — the local trajectory optimizers
+  (CHOMP, STOMP, TrajOpt, ITOMP, GPMP), the potential field (APF), and the metaheuristics
+  (PSO, Genetic) — which are faithful implementations but optimize/descend rather than
+  search, so they can stall or fail to reach the goal on cluttered maps. (Rationale and
+  the per-planner classification are in the algorithm audit.)
+- **"Change Map" picker for the bundled example maps.** A new toolbar button opens a
+  dialog of thumbnail previews of the maps shipped in `assets/` (`maze*.png`) and loads
+  the chosen one — no need to hunt for the files on disk, and it works from the frozen
+  `.exe` (maps are resolved via the bundled-resource path). "Load Image" (load an
+  arbitrary file from disk) moved into the Map Tools panel alongside New/Save Map.
+
+### Changed
+
+- **Roadmap planners no longer fragment on large maps.** PRM/sPRM and FMT* used a fixed
+  default sample count (500 / 400) calibrated for the bundled ~600 px maps; on a much
+  larger map that collapsed milestone density and the roadmap shattered into disconnected
+  components (e.g. on a 2048×2048 map sPRM dropped to avg degree 4 across 64 components
+  instead of one connected graph). The recommended default now scales with the map's
+  free-space area to hold density roughly constant, set when a map is loaded and still
+  fully editable in the parameter panel (a user-set value is preserved across map loads).
+  The planners themselves are unchanged — sample count is the user-chosen workspace
+  parameter; `max_edge_dist` is deliberately not scaled because constant density keeps
+  milestone spacing constant.
+
+### Fixed
+
+- **PRM/sPRM roadmap construction is ~30× faster on large maps.** The connecting phase
+  scanned every node to find each milestone's neighbours (O(n²)); it now queries the
+  shared uniform-grid index for the nodes within `max_edge_dist` (the paper's `N_c`
+  candidate set). Because roadmap nodes are integer pixels and `max_edge_dist` is
+  integer-valued, the grid's `dx²+dy² ≤ r²` test selects exactly the same candidates, and
+  the index returns them in ascending order so the distance-sort tie-break is identical —
+  the resulting roadmap is byte-for-byte the same (verified by SHA over the edge set).
+  On a 2048×2048 map sPRM build dropped from ~138 s to ~4.6 s, Classic PRM ~54 s to ~1.8 s.
+- **Sampling planners are ~50× faster on large maps.** The uniform-grid
+  nearest-neighbour index (`GridIndex`) generated each expanding search ring by
+  scanning the full (2k+1)² cell box with an `abs`/`max` filter — O(k²) per ring — so on
+  a large/sparse map (few nodes over a big grid) a single nearest-neighbour query blew
+  up to ~O(K³) (hundreds of millions of `abs`/`max` calls). It now emits the ring
+  perimeter directly in O(k). On a 2048×2048 map RRT dropped from ~47 ms/iter to
+  ~0.9 ms/iter; results are identical (same cell set, order-independent query). Benefits
+  every grid-indexed planner (RRT, RRT*, RRT-Connect, FMT*, BiTRRT, …).
+- **PSO is ~8.5× faster** (and Genetic ~1.2×). Both rasterized every collision/clearance
+  sample with a scalar `int(np.clip(round(...)))` inside a per-point Python loop (PSO
+  ~15M, Genetic ~14M `np.clip` calls). The rounding/clamping is now done once over a
+  numpy array per segment, and the clearance cost is summed vectorized; same sample
+  points and same collision early-out, so results are unchanged. Also dropped redundant
+  per-segment sample-count computations that fed `line_collision_free` (which now uses
+  exact voxel traversal and ignores the count). PSO 168 s → 20 s over 500 iterations.
 
 ## [0.1.0b11] - 2026-06-16
 

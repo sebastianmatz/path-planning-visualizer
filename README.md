@@ -3,10 +3,10 @@
 [![CI](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml/badge.svg)](https://github.com/sebastianmatz/path-planning-visualizer/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Status](https://img.shields.io/badge/status-beta%20(0.1.0b11)-orange)
+![Status](https://img.shields.io/badge/status-beta%20(0.1.0b12)-orange)
 [![Download](https://img.shields.io/github/v/release/sebastianmatz/path-planning-visualizer?include_prereleases&label=download%20(Windows))](https://github.com/sebastianmatz/path-planning-visualizer/releases/latest)
 
-An interactive desktop application for **exploring, comparing, and tuning path-planning algorithms** for a 2D point robot on occupancy-grid maps. It bundles 20 planners — sampling-based, graph-search, potential-field, trajectory-optimization, and metaheuristic — behind one UI, with step-through visualization, live path metrics, an interactive map editor, and a reproducible headless benchmark.
+An interactive desktop application for **exploring, comparing, and tuning path-planning algorithms** for a 2D point robot on occupancy-grid maps. It bundles 19 planners — sampling-based, graph-search, potential-field, trajectory-optimization, and metaheuristic — behind one UI, with step-through visualization, live path metrics, and an interactive map editor.
 
 It is built as a **teaching and visualization environment**: each planner follows the defining mechanism of its source paper, adapted to a 2D occupancy grid, with the adaptations stated explicitly (see [Scientific scope](#scientific-scope)).
 
@@ -18,11 +18,9 @@ It is built as a **teaching and visualization environment**: each planner follow
 - [Using the app](#using-the-app)
 - [Algorithms](#algorithms)
 - [Scientific scope](#scientific-scope)
-- [Benchmarking](#benchmarking)
 - [Status panel reference](#status-panel-reference)
 - [Development](#development)
 - [Project layout](#project-layout)
-- [Versioning](#versioning)
 - [License](#license)
 
 ## Quick start
@@ -33,47 +31,40 @@ double-click it. It is a single self-contained file; on first launch Windows Sma
 about an unknown publisher (the build is unsigned) — choose *More info → Run anyway*. To run on
 macOS/Linux, or to develop, use the source install below.
 
-Each release executable is built by GitHub Actions and carries a [build-provenance
-attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds),
-so you can cryptographically verify it was produced from this repository's source by the official
-workflow (requires the [GitHub CLI](https://cli.github.com/)):
-
-```bash
-gh attestation verify PathPlanningVisualizer.exe --repo sebastianmatz/path-planning-visualizer
-```
-
 ### From source
 
-Requirements: **Python 3.11+** and a desktop environment capable of running PyQt6.
+Requirements: **Python 3.11+** and a desktop environment capable of running PyQt6. Create and
+activate a virtual environment first:
 
 ```bash
-# 1. create and activate a virtual environment
 python -m venv .venv
 .venv\Scripts\activate          # Windows
 # source .venv/bin/activate     # macOS / Linux
+```
 
-# 2. install (editable install also registers the console command)
-pip install -e .
+**Run it directly** — install the runtime dependencies and launch the package:
 
-# 3. run
+```bash
+pip install -r requirements.txt
 python -m path_planning_visualizer
 ```
 
-After `pip install -e .` you can also launch it with the console command:
+**Or install the package** — this also registers a `path-planning-visualizer` console command:
 
 ```bash
-path-planning-visualizer
+pip install -e .
+path-planning-visualizer        # equivalent to: python -m path_planning_visualizer
 ```
-
-> The project is a package, so the old `python path_planning_visualizer.py` entry point has been
-> replaced by `python -m path_planning_visualizer`. To install runtime dependencies without the
-> package, use `pip install -r requirements.txt`.
 
 ## Using the app
 
-1. A bundled example maze loads automatically on startup.
+1. A bundled example maze loads automatically on startup. Use **Change Map** to switch
+   between the bundled mazes (thumbnail picker), or **Map Tools → Load Image** for your own.
 2. Click a free (white) pixel to place the **start**, then another to place the **goal**.
 3. Pick an algorithm from the grouped dropdown and adjust its parameters in the left panel.
+   The dropdown shows the reliable graph-search and sampling-based planners by default;
+   tick **Show experimental algorithms** to also list the local trajectory optimizers,
+   the potential field, and the metaheuristic (PSO).
 4. **Step** advances the planner incrementally; **Run** plays it continuously; **Reset** clears the run.
    (Keyboard: Space = Run/Pause, `S` = Step, `R` = Reset, Esc = stop.)
 5. The **Status** panel shows live path metrics, compute times, and the planner's status string.
@@ -91,7 +82,7 @@ background thread, so the window stays responsive and shows a brief *Preparing�
 
 ## Algorithms
 
-20 planners across five families. Each row links the planner to the source paper it is modeled on
+19 planners across five families. Each row links the planner to the source paper it is modeled on
 (the same citation shown in the app's info panel).
 
 | Family | Algorithm | Reference |
@@ -108,14 +99,27 @@ background thread, so the window stays responsive and shows a brief *Preparing�
 | Sampling-based | `BIT*` | Gammell et al., 2015 |
 | Graph search | `A*` | Hart et al., 1968 |
 | Graph search | `Dijkstra` | Dijkstra, 1959 |
-| Potential field | `APF` | Khatib, 1986 |
-| Trajectory optimization | `CHOMP` | Ratliff et al., 2009 |
-| Trajectory optimization | `STOMP` | Kalakrishnan et al., 2011 |
-| Trajectory optimization | `TrajOpt` | Schulman et al., 2014 |
-| Trajectory optimization | `ITOMP` | Park et al., 2012 |
-| Trajectory optimization | `GPMP` | Mukadam et al., 2016 |
-| Metaheuristic | `PSO` | Kennedy & Eberhart, 1995 |
-| Metaheuristic | `Genetic` | Holland, 1975 |
+| Potential field | `APF`* | Khatib, 1986 |
+| Trajectory optimization | `CHOMP`* | Ratliff et al., 2009 |
+| Trajectory optimization | `STOMP`* | Kalakrishnan et al., 2011 |
+| Trajectory optimization | `TrajOpt`* | Schulman et al., 2014 |
+| Trajectory optimization | `ITOMP`* | Park et al., 2012 |
+| Trajectory optimization | `GPMP`* | Mukadam et al., 2016 |
+| Metaheuristic | `PSO`* | Kennedy & Eberhart, 1995 |
+
+\* **Experimental** — hidden by default; reveal them with the **Show experimental algorithms**
+toggle above the dropdown. (The `*` inside `RRT*`, `FMT*`, and `BIT*` is part of the algorithm
+name, not this marker — those three are default planners.)
+
+**Default vs. experimental.** By default the dropdown lists only the **reliable** planners — the
+graph-search and sampling-based families, which are complete, resolution-optimal, probabilistically
+complete, or asymptotically optimal, and reliably return a path when one exists. The trajectory
+optimizers (`CHOMP`, `STOMP`, `TrajOpt`, `ITOMP`, `GPMP`), the potential field (`APF`), and the
+metaheuristic (`PSO`) are marked **experimental** and hidden behind the **Show
+experimental algorithms** checkbox above the dropdown. They are faithful implementations of their
+papers, but *local / best-effort* methods that optimize or descend from an initial guess rather than
+search the configuration space — so they depend on the initialization and can stall at local minima
+or fail to reach the goal on cluttered maps (which is the nature of the method, not a defect).
 
 ## Scientific scope
 
@@ -144,16 +148,6 @@ Within that scope, each planner implements the defining mechanism of its paper. 
 | `CHOMP` | Paper-exact Ratliff et al. (2009) for a 2D point robot: a true signed distance field, the workspace cost `c(x)`, the obstacle functional gradient (Eq. 4), and the covariant step `ξ ← ξ − (1/λ)A⁻¹g` over the velocity prior. Also the *CHOMP Optimize* post-processor that refines sampling-based paths (not a full articulated configuration-space system). |
 | `STOMP`, `TrajOpt`, `ITOMP`, `GPMP` | Each implements its paper's defining mechanism for a 2D point robot — per-timestep probability-weighted STOMP updates (Eq. 11) with the M projection on a signed-distance obstacle cost (Eq. 13); TrajOpt (Schulman et al. 2013) sequential convex optimization — the displacement objective with ℓ1 collision penalties on the signed distance, in a trust region; incremental covariant ITOMP (Park et al. 2012) over a receding horizon with acceleration smoothness and a signed-distance obstacle cost (static-map adaptation; no dynamic obstacles); and GPMP (Mukadam, Yan & Boots 2016) — an LTI GP prior with GP interpolation, optimized by the covariant gradient update (gradient preconditioned by the GP covariance). |
 | `PSO` | Paper-exact Kennedy & Eberhart (1995) by default: `v ← w·v + 2·r₁·(pbest−x) + 2·r₂·(gbest−x)` with a `Vmax` clamp and full momentum (no inertia weight, `w = 1.0`), over a fixed-waypoint path encoding (fitness = length + clearance penalty + smoothness). Pure 1995 PSO can stall on cluttered maps (like pure APF); an off-by-default *safeguards* toggle adds adaptive inertia/social gain, diversity injection, random immigrants, and swarm restart. A metaheuristic, not a complete planner. |
-
-## Benchmarking
-
-For a reproducible, headless cross-planner comparison (success rate, path length, clearance, compute
-time, collision checks) across maps and seeds:
-
-```bash
-python -m path_planning_visualizer.benchmark
-python -m path_planning_visualizer.benchmark --planners "A*,RRT*,BIT*" --maps all --seeds 5 --csv results.csv
-```
 
 ## Status panel reference
 
@@ -193,8 +187,8 @@ path_planning_visualizer/      application package
 ├── planners/                  one module per planner (PyQt6-free), plus:
 │   ├── registry.py            planner registry, groups, and in-app citations
 │   └── _spatial, _rgg, _trajectory   shared helpers (spatial index, RGG radius, optimizer math)
-├── gui/                       ImageCanvas, MainWindow, param_panels, off-thread PlannerBuilder
-└── assets/                    bundled example maps (maze.png, maze 2.png, maze 3.png)
+├── gui/                       ImageCanvas, MainWindow, param_panels, map_picker, off-thread PlannerBuilder
+└── assets/                    bundled example maps (maze.png, maze 2.png, maze 3.png, maze 4.png)
 
 tests/                         pytest suite (planner behavior, optimality, GUI integration)
 assets/demo.gif                short walkthrough used in this README
@@ -202,12 +196,6 @@ pyproject.toml                 package metadata and installable script entry
 CHANGELOG.md                   release history
 LICENSE                        MIT
 ```
-
-## Versioning
-
-Semantic versioning with Python-compatible pre-release tags: betas follow `0.1.0b1`, `0.1.0b2`, …
-`0.1.0b9`; the first stable release will be `0.1.0`, with bugfix releases continuing as `0.1.1`,
-`0.1.2`, and so on. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## License
 

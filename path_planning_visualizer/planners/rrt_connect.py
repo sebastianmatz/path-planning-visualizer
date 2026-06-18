@@ -15,8 +15,41 @@ from .base import BasePlanner, StepResult
 
 
 class RRTConnectPlanner(BasePlanner):
-    """RRT-Connect: Bidirectional RRT that grows trees from start and goal."""
-    
+    """RRT-Connect - bidirectional RRT with a greedy CONNECT heuristic.
+
+    Faithful 2D-point-robot adaptation of Kuffner & LaValle (2000, IEEE ICRA;
+    cite ``KL00``). Two trees are grown -- one rooted at the start, one at the goal --
+    and the defining trick is asymmetry: each iteration one tree takes a single
+    ``EXTEND`` step toward a random sample, then the *other* tree ``CONNECT``s, i.e.
+    repeats ``EXTEND`` greedily until it reaches that new vertex or gets stuck. This
+    greedy CONNECT is what makes it markedly faster than plain bidirectional RRT.
+
+    Paper correspondence (Fig. 2 EXTEND, Fig. 5 CONNECT / RRT_CONNECT_PLANNER):
+
+    - **EXTEND(T, q)** -- ``_extend``: step ``eps`` (``step_size``) from the nearest
+      vertex toward ``q``; return *Reached* only when the new vertex equals ``q``
+      *exactly*, *Advanced* if a step was taken, *Trapped* if blocked.
+    - **CONNECT(T, q)** -- ``_connect``: repeat ``EXTEND`` until the result is no longer
+      *Advanced* (greedy growth straight toward ``q``).
+    - **RRT_CONNECT_PLANNER** -- ``step_once``: ``EXTEND`` tree A toward a random config;
+      if not *Trapped*, ``CONNECT`` tree B to the new vertex; on *Reached* the two trees
+      meet at a single shared, collision-checked vertex -> path found. Then ``SWAP`` the
+      roles of the two trees.
+    - **RANDOM_CONFIG** -- ``_sample``: uniform over the *whole* space ``C``. An occupied
+      sample is fine -- it is only a steering direction, and the new vertex is
+      collision-checked by EXTEND.
+
+    Adaptations (stated for fidelity):
+
+    - 2D holonomic point robot: ``NEW_CONFIG`` is a fixed ``step_size`` (= ``eps``) step
+      via ``steer`` validated by a raster line check; ``NEAREST_NEIGHBOR`` uses the
+      dependency-free ``GridIndex``.
+    - The canonical Fig. 5 variant (``EXTEND`` for the first tree, ``CONNECT`` for the
+      second).
+
+    See ``literature/fidelity/rrt_connect.md`` and ``tests/test_rrt_connect_fidelity.py``.
+    """
+
     name = "RRT-Connect"
     description = "Bidirectional RRT - grows two trees and connects them"
     

@@ -7,7 +7,6 @@ import numpy as np
 from ..geometry import (
     make_distance_field,
 )
-from ..types import Point
 from .base import BasePlanner, StepResult
 
 
@@ -96,6 +95,9 @@ class PSOPlanner(BasePlanner):
         self.zero_valid_iters = 0
         self.zero_valid_restart_window = 180
         self.restart_fraction = 0.55
+        # Stop once a valid path exists and the swarm's best has not improved for this
+        # many iterations (converged) — instead of spinning until max_iters.
+        self.convergence_patience = 60
 
         # Adaptive inertia: broad exploration early, stable convergence later.
         self.w_max = 0.90
@@ -115,49 +117,54 @@ class PSOPlanner(BasePlanner):
         """Wrap angle to [-pi, pi]."""
         return ((angle + np.pi) % (2.0 * np.pi)) - np.pi
 
-    def _segment_collision_samples(self, p1: np.ndarray, p2: np.ndarray) -> int:
-        """Adaptive samples based on segment length."""
-        seg_len = float(np.linalg.norm(p2 - p1))
-        return int(np.clip(np.ceil(seg_len * 0.75), 8, 80))
+    def _segment_grid_points(self, p1: np.ndarray, p2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Rasterize a segment to the grid cells it visits, as parallel (xs, ys) arrays.
 
-    def _segment_grid_points(self, p1: np.ndarray, p2: np.ndarray) -> List[Point]:
-        """Rasterize a segment and return all visited grid points for robust collision checks."""
-        x0 = int(np.clip(round(p1[0]), 0, self.w - 1))
-        y0 = int(np.clip(round(p1[1]), 0, self.h - 1))
-        x1 = int(np.clip(round(p2[0]), 0, self.w - 1))
-        y1 = int(np.clip(round(p2[1]), 0, self.h - 1))
+        Vectorized form of the old per-sample ``int(np.clip(round(...)))`` loop: same
+        endpoints, same rounded interpolation points, same consecutive-duplicate removal,
+        but the rounding/clamping is done once over a numpy array instead of millions of
+        scalar ``np.clip`` calls (the dominant PSO cost — see CHANGELOG).
+        """
+        w, h = self.w, self.h
+        x0 = int(round(float(p1[0]))); x0 = 0 if x0 < 0 else (w - 1 if x0 >= w else x0)
+        y0 = int(round(float(p1[1]))); y0 = 0 if y0 < 0 else (h - 1 if y0 >= h else y0)
+        x1 = int(round(float(p2[0]))); x1 = 0 if x1 < 0 else (w - 1 if x1 >= w else x1)
+        y1 = int(round(float(p2[1]))); y1 = 0 if y1 < 0 else (h - 1 if y1 >= h else y1)
 
         dx = x1 - x0
         dy = y1 - y0
-        steps = int(max(abs(dx), abs(dy)))
+        steps = abs(dx) if abs(dx) >= abs(dy) else abs(dy)
         if steps == 0:
-            return [(x0, y0)]
+            return np.array((x0,), dtype=np.intp), np.array((y0,), dtype=np.intp)
 
-        pts: List[Point] = []
-        for i in range(steps + 1):
-            t = i / steps
-            x = int(np.clip(round(x0 + t * dx), 0, self.w - 1))
-            y = int(np.clip(round(y0 + t * dy), 0, self.h - 1))
-            if not pts or pts[-1] != (x, y):
-                pts.append((x, y))
-        return pts
+        ts = np.arange(steps + 1) / steps
+        xs = np.rint(x0 + ts * dx)
+        ys = np.rint(y0 + ts * dy)
+        np.clip(xs, 0, w - 1, out=xs)
+        np.clip(ys, 0, h - 1, out=ys)
+        xs = xs.astype(np.intp)
+        ys = ys.astype(np.intp)
+        keep = np.empty(xs.shape[0], dtype=bool)
+        keep[0] = True
+        keep[1:] = (xs[1:] != xs[:-1]) | (ys[1:] != ys[:-1])
+        return xs[keep], ys[keep]
 
     def _segment_collision_free(self, p1: np.ndarray, p2: np.ndarray) -> bool:
-        return all(not self.occ[y, x] for x, y in self._segment_grid_points(p1, p2))
+        xs, ys = self._segment_grid_points(p1, p2)
+        return not bool(self.occ[ys, xs].any())
 
-    def _segment_cost_and_collision(self, p1: np.ndarray, p2: np.ndarray, samples: int) -> Tuple[float, bool]:
-        """Compute segment clearance/collision cost in a single sampling pass."""
-        cost = 0.0
-        for x, y in self._segment_grid_points(p1, p2):
+    def _segment_cost_and_collision(self, p1: np.ndarray, p2: np.ndarray) -> Tuple[float, bool]:
+        """Compute segment clearance/collision cost in a single vectorized pass."""
+        xs, ys = self._segment_grid_points(p1, p2)
+        if self.occ[ys, xs].any():
+            return self.collision_penalty, True
 
-            if self.occ[y, x]:
-                return self.collision_penalty, True
-
-            d = self.dist_field[y, x]
-            if d < self.clearance_distance:
-                delta = self.clearance_distance - d
-                cost += self.clearance_weight * delta * delta
-        return cost, False
+        d = self.dist_field[ys, xs]
+        mask = d < self.clearance_distance
+        if not mask.any():
+            return 0.0, False
+        delta = self.clearance_distance - d[mask]
+        return float(np.sum(self.clearance_weight * delta * delta)), False
 
     def _maybe_update_global_best(self, candidate: np.ndarray, cost: float, is_valid: bool) -> None:
         """Prefer valid global best paths; allow invalid only as fallback until a valid one exists."""
@@ -206,8 +213,7 @@ class PSOPlanner(BasePlanner):
         for i in range(len(path) - 1):
             p1 = path[i]
             p2 = path[i + 1]
-            samples = self._segment_collision_samples(p1, p2)
-            seg_cost, seg_collision = self._segment_cost_and_collision(p1, p2, samples)
+            seg_cost, seg_collision = self._segment_cost_and_collision(p1, p2)
             obstacle_cost += seg_cost
             if seg_collision:
                 collision_segments += 1
@@ -444,6 +450,11 @@ class PSOPlanner(BasePlanner):
         if self.iteration % 10 == 0:
             self._check_best_path()
 
+        # Converge: a valid path exists and the swarm's best has stopped improving.
+        if self.found_path and self.no_improve_iters >= self.convergence_patience:
+            self.done = True
+            return StepResult(done=True, found_path=True)
+
         if not self.g_best_is_valid:
             # While searching, visualize exploratory particle motion so progress remains visible.
             vis_particle_idx = self.iteration % self.num_particles
@@ -484,10 +495,13 @@ class PSOPlanner(BasePlanner):
         self.found_path = True
     
     def extract_path(self) -> List[Tuple[int, int]]:
-        path = self.g_best
-        if self.done and self.found_path:
-            path = self._smooth_path_for_display(path)
-        return [(int(p[0]), int(p[1])) for p in path]
+        # The genuine PSO result is the global-best waypoint path. No post-smoothing is
+        # applied, so the reported path (and its metrics) reflect the actual swarm output.
+        return [(int(p[0]), int(p[1])) for p in self.g_best]
+
+    def extract_display_path(self) -> List[Tuple[float, float]]:
+        """Float global-best waypoint path — the genuine PSO output, unsmoothed."""
+        return [(float(p[0]), float(p[1])) for p in self.g_best]
     
     def get_status(self) -> str:
         status = "FOUND" if self.found_path else "searching"

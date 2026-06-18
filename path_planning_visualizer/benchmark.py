@@ -103,7 +103,6 @@ PARAMS: Dict[str, dict] = {
     "ITOMP": dict(max_iters=600),
     "GPMP": dict(max_iters=200),
     "PSO": dict(max_iters=200),
-    "Genetic": dict(max_iters=200),
 }
 DEFAULT_PLANNERS = ["A*", "Dijkstra", "RRT", "RRT-Connect", "RRT*", "FMT*", "PRM", "BIT*"]
 

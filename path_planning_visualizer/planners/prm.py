@@ -10,6 +10,7 @@ from ..geometry import (
     line_collision_free,
 )
 from ..types import Edge, Point
+from ._spatial import GridIndex
 from .base import BasePlanner, StepResult
 
 
@@ -49,6 +50,11 @@ class PRMPlanner(BasePlanner):
         self.nodes: List[Point] = []
         self.edges: Dict[int, List[Tuple[int, float]]] = {}
         self.roadmap_size = 0
+        # Uniform-grid index over roadmap nodes, built once learning finishes, so the
+        # connecting phase finds each node's ``N_c`` candidates (neighbours within
+        # ``max_edge_dist``) in O(neighbours) instead of scanning all nodes (O(n^2)).
+        # Query nodes are not indexed (only 2 of them, and re-query strips/re-adds them).
+        self._grid: Optional[GridIndex] = None
         self.sample_pool: List[Point] = self._build_sample_pool()
 
         # Query nodes are added only after roadmap learning.
@@ -125,10 +131,34 @@ class PRMPlanner(BasePlanner):
         distances.sort(key=lambda item: item[0])
         return distances[:self.k_neighbors]
 
-    def _connect_node(self, node_idx: int, candidate_indices: List[int]) -> List[Edge]:
+    def _candidate_neighbors_grid(self, node_idx: int) -> List[Tuple[float, int]]:
+        """Same ``N_c`` candidate set as ``_candidate_neighbors`` for a roadmap node,
+        but found via the grid index instead of scanning every node.
+
+        Roadmap-node coordinates are integer pixels and ``max_edge_dist`` is an
+        integer-valued float, so ``GridIndex.within`` (``dx^2+dy^2 <= r^2``) selects
+        exactly the nodes with ``dist <= max_edge_dist``. ``within`` returns ascending
+        indices, so the stable distance-sort breaks ties by lowest index — identical to
+        scanning the ascending ``candidate_indices``. ``max_index`` reproduces the
+        incremental (Kavraki forest) restriction to earlier nodes; ``None`` is sPRM's
+        all-pairs set.
+        """
+        point = self.nodes[node_idx]
+        max_index = node_idx if self.remove_cycles else None
+        distances: List[Tuple[float, int]] = []
+        for idx in self._grid.within(point[0], point[1], self.max_edge_dist):
+            if idx == node_idx:
+                continue
+            if max_index is not None and idx >= max_index:
+                continue
+            distances.append((dist(point, self.nodes[idx]), idx))
+        distances.sort(key=lambda item: item[0])
+        return distances[:self.k_neighbors]
+
+    def _connect_node(self, node_idx: int, neighbors: List[Tuple[float, int]]) -> List[Edge]:
         node = self.nodes[node_idx]
         added_edges: List[Edge] = []
-        for edge_dist, neighbor_idx in self._candidate_neighbors(node, candidate_indices):
+        for edge_dist, neighbor_idx in neighbors:
             if neighbor_idx == node_idx or self._edge_exists(node_idx, neighbor_idx):
                 continue
             # Kavraki (1996) construction step: skip nodes already in the same
@@ -172,6 +202,10 @@ class PRMPlanner(BasePlanner):
         """Sample random points in free space."""
         if self.sample_idx >= len(self.sample_pool):
             self.roadmap_size = len(self.nodes)
+            # Index the finished roadmap so the connecting phase is O(n), not O(n^2).
+            self._grid = GridIndex(self.max_edge_dist)
+            for i in range(self.roadmap_size):
+                self._grid.add(self.nodes[i][0], self.nodes[i][1])
             self.phase = "connecting"
             return StepResult()
 
@@ -196,11 +230,7 @@ class PRMPlanner(BasePlanner):
             self.phase = "query_start"
             return StepResult()
 
-        if self.remove_cycles:
-            candidate_indices = list(range(self.connect_idx))  # incremental: already-placed nodes
-        else:
-            candidate_indices = [idx for idx in range(self.roadmap_size) if idx != self.connect_idx]
-        edges = self._connect_node(self.connect_idx, candidate_indices)
+        edges = self._connect_node(self.connect_idx, self._candidate_neighbors_grid(self.connect_idx))
         self.connect_idx += 1
         return StepResult(edge=edges[0] if len(edges) == 1 else None, edges=edges if len(edges) > 1 else None)
 
@@ -213,8 +243,10 @@ class PRMPlanner(BasePlanner):
 
         node_idx = self._add_node(query_point)
         # Query nodes connect to the previously built roadmap and, once available,
-        # to earlier query nodes as well (e.g. direct start-goal visibility).
-        edges = self._connect_node(node_idx, list(range(node_idx)))
+        # to earlier query nodes as well (e.g. direct start-goal visibility). Only two
+        # query nodes exist (and re-query strips/re-adds them), so a full scan is cheap
+        # and avoids indexing nodes the grid would never be able to remove.
+        edges = self._connect_node(node_idx, self._candidate_neighbors(query_point, list(range(node_idx))))
 
         if query_point == self.start:
             self.start_idx = node_idx
@@ -344,9 +376,9 @@ class PRMPlanner(BasePlanner):
         self.current_path = []
         self.found_path = False
         self.start_idx = self._add_node(new_start)
-        self._connect_node(self.start_idx, list(range(self.roadmap_size)))
+        self._connect_node(self.start_idx, self._candidate_neighbors(new_start, list(range(self.roadmap_size))))
         self.goal_idx = self._add_node(new_goal)
-        self._connect_node(self.goal_idx, list(range(self.goal_idx)))  # roadmap + start
+        self._connect_node(self.goal_idx, self._candidate_neighbors(new_goal, list(range(self.goal_idx))))  # roadmap + start
 
         # A* over the roadmap graph (synchronous; fast relative to learning).
         open_heap: List[Tuple[float, float, int]] = [(self._heuristic(self.start_idx), 0.0, self.start_idx)]

@@ -9,8 +9,41 @@ from .base import BasePlanner, StepResult
 
 
 class AStarPlanner(BasePlanner):
-    """A* - Classic heuristic search algorithm."""
-    
+    """A* - heuristic shortest-path search on an occupancy-grid graph.
+
+    Faithful adaptation of Hart, Nilsson & Raphael (1968, IEEE Trans. SSC 4(2);
+    cite ``HNR68``), Algorithm A* (sec. II-A). A* is Dijkstra guided by a heuristic:
+    it expands the open node with the smallest ``f = g + h`` (estimated *total* path
+    cost) rather than the smallest cost-so-far, so the search is pulled toward the goal.
+
+    Paper correspondence (Algorithm A*, sec. II-A):
+
+    - **Evaluation** ``f(n) = g(n) + h(n)`` (Eq. 2): ``g`` = best cost-to-come found so
+      far, ``h`` = estimated cost-to-go -- ``g_score`` / ``_heuristic`` / ``f_score``.
+    - **Step 2** (select the open node of smallest ``f``) = the ``heappop`` -- ``step_once``.
+    - **Step 3** (terminate when a goal node is selected) -- ``step_once``.
+    - **Step 4** (close ``n``, expand it, relax each successor with ``f = g + h``) --
+      ``step_once``.
+    - **No reopening:** a closed node is never revisited. This is correct *because* the
+      heuristic is **consistent** (Eq. 5, the triangle inequality
+      ``h(m) <= c(m, n) + h(n)``): under consistency every node is closed at its optimal
+      cost, so the paper's reopening provision (Lemma 2) is vacuous here.
+    - **Admissibility (Theorem 1):** ``h(n) <=`` true cost-to-go guarantees the returned
+      path is optimal -- so A* yields the same optimal cost as Dijkstra on the same graph
+      (``tests/test_planners.py::test_astar_matches_dijkstra_length``).
+
+    Adaptations (stated for fidelity) -- the same induced-grid model as ``DijkstraPlanner``:
+
+    - **Induced coarse grid** (``grid_size`` downsample; a supercell is an obstacle iff it
+      contains any obstacle pixel; clicked start/goal cells forced free). Optimal *on this
+      induced grid*, not the continuous pixel plane.
+    - 8- or 4-connected with Euclidean / Manhattan branch weights; no corner-cutting
+      through an occupied orthogonal neighbour; the path is stitched to the real
+      start/goal pixels.
+
+    See ``literature/fidelity/astar.md`` and ``tests/test_astar_fidelity.py``.
+    """
+
     name = "A*"
     description = "Grid-based heuristic search"
     
@@ -59,15 +92,27 @@ class AStarPlanner(BasePlanner):
         self.path_grid: List[Tuple[int, int]] = []
         
     def _heuristic(self, pos: Tuple[int, int]) -> float:
-        """Euclidean distance heuristic."""
+        """Cost-to-go estimate ``h`` (HNR68 Eq. 2): Euclidean (8-conn) or Manhattan (4-conn).
+
+        For its connectivity each form is both *admissible* (never overestimates the true
+        grid cost, Theorem 1) and *consistent* (satisfies the triangle inequality, Eq. 5).
+        That is exactly what makes the no-reopening policy in ``step_once`` correct and the
+        returned path optimal.
+        """
         dx = abs(pos[0] - self.goal_grid[0])
         dy = abs(pos[1] - self.goal_grid[1])
         if self.allow_diagonal:
             return self.grid_size * np.sqrt(dx*dx + dy*dy)
         return self.grid_size * (dx + dy)
-    
+
     def _get_neighbors(self, pos: Tuple[int, int]) -> List[Tuple[Tuple[int, int], float]]:
-        """Get valid neighbors with costs."""
+        """The graph branches out of ``pos``: (neighbour, branch length) pairs.
+
+        4- or 8-connected on the induced grid, with Euclidean branch lengths scaled by
+        ``grid_size``. A diagonal is dropped if either orthogonal cell it passes between is
+        occupied -- forbidding corner-cutting through an obstacle. This is the same graph
+        as ``DijkstraPlanner``; A* differs only in the ``f = g + h`` selection order.
+        """
         neighbors = []
         directions = [(0, 1), (1, 0), (0, -1), (-1, 0)]
         if self.allow_diagonal:
@@ -103,10 +148,11 @@ class AStarPlanner(BasePlanner):
             self.done = True
             return StepResult(done=True, found_path=False)
         
+        # Step 2: select the open node with the smallest f = g + h.
         _, current = heapq.heappop(self.open_set)
-        
+
+        # Step 3: a goal node was selected -> its f is optimal; reconstruct the path.
         if current == self.goal_grid:
-            # Reconstruct path
             self.path_grid = [current]
             while current in self.came_from:
                 current = self.came_from[current]
@@ -115,12 +161,16 @@ class AStarPlanner(BasePlanner):
             self.found_path = True
             self.done = True
             return StepResult(done=True, found_path=True)
-        
+
+        # Lazy deletion: a node already closed was reached again via a stale (larger-f)
+        # heap entry; skip it.
         if current in self.closed_set:
             return StepResult()
-        
-        self.closed_set.add(current)
-        
+
+        self.closed_set.add(current)  # Step 4: close n
+
+        # Step 4 (cont.): expand n and relax each successor. Closed successors are not
+        # reopened -- valid because the heuristic is consistent (Eq. 5 / Lemma 2).
         edges: List[Edge] = []
         for neighbor, cost in self._get_neighbors(current):
             if neighbor in self.closed_set:
@@ -128,6 +178,7 @@ class AStarPlanner(BasePlanner):
 
             tentative_g = self.g_score.get(current, float('inf')) + cost
 
+            # Relax: if this path to `neighbor` is cheaper, record it and recompute f = g + h.
             if tentative_g < self.g_score.get(neighbor, float('inf')):
                 self.came_from[neighbor] = current
                 self.g_score[neighbor] = tentative_g

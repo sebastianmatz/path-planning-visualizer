@@ -18,6 +18,21 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+# The sampling-roadmap defaults (PRM/sPRM 500 nodes, FMT* 400) are calibrated for the
+# bundled ~600 px demo maps (~290k free pixels). On a much larger map a *fixed* count
+# collapses the milestone density and the roadmap fragments into disconnected pieces, so
+# the recommended default scales with free-space area to hold density roughly constant.
+# This only sets the panel's default; the value stays user-overridable and the planner
+# itself is unchanged (sample count is the user-chosen workspace parameter N).
+_REF_FREE_AREA = 290_000
+
+
+def recommended_sample_count(base: int, free_area: int) -> int:
+    """Scale a base sample count to a map's free area, keeping density >= the base."""
+    if free_area <= 0:
+        return base
+    return max(base, round(base * free_area / _REF_FREE_AREA))
+
 
 class RRTParamsWidget(QWidget):
     """Widget for RRT parameterization."""
@@ -425,7 +440,11 @@ class PRMParamsWidget(QWidget):
         self.spin_num_samples = QSpinBox()
         self.spin_num_samples.setRange(50, 10000)
         self.spin_num_samples.setValue(500)
-        self.spin_num_samples.setToolTip("Number of random samples to generate")
+        self._base_samples = 500
+        self._auto_samples = 500
+        self.spin_num_samples.setToolTip(
+            "Number of random samples to generate (auto-scaled to map size; editable)"
+        )
         
         self.spin_k_neighbors = QSpinBox()
         self.spin_k_neighbors.setRange(3, 50)
@@ -456,6 +475,21 @@ class PRMParamsWidget(QWidget):
             'max_edge_dist': self.spin_max_edge_dist.value(),
             'seed': self.spin_seed.value(),
         }
+
+    def update_for_map(self, free_area: int) -> None:
+        """Set the recommended default sample count for a freshly loaded map.
+
+        Leaves the value alone if the user has overridden it (current value differs
+        from the last auto-set value). ``max_edge_dist`` is intentionally not scaled:
+        holding sample density constant keeps milestone spacing constant, so the same
+        connection radius stays valid across map sizes.
+        """
+        if self.spin_num_samples.value() != self._auto_samples:
+            return
+        rec = min(self.spin_num_samples.maximum(),
+                  recommended_sample_count(self._base_samples, free_area))
+        self.spin_num_samples.setValue(rec)
+        self._auto_samples = rec
 
 
 class SBLParamsWidget(QWidget):
@@ -525,7 +559,11 @@ class FMTStarParamsWidget(QWidget):
         self.spin_num_samples = QSpinBox()
         self.spin_num_samples.setRange(50, 5000)
         self.spin_num_samples.setValue(400)
-        self.spin_num_samples.setToolTip("Number of random samples (higher = more robust, slower)")
+        self._base_samples = 400
+        self._auto_samples = 400
+        self.spin_num_samples.setToolTip(
+            "Number of random samples (higher = more robust, slower; auto-scaled to map size, editable)"
+        )
         
         self.spin_radius = QDoubleSpinBox()
         self.spin_radius.setRange(0.0, 300.0)  # 0 = auto
@@ -550,6 +588,16 @@ class FMTStarParamsWidget(QWidget):
             'radius': self.spin_radius.value() if self.spin_radius.value() > 0 else None,
             'seed': self.spin_seed.value(),
         }
+
+    def update_for_map(self, free_area: int) -> None:
+        """Set the recommended default sample count for a freshly loaded map
+        (skipped if the user has overridden it). FMT*'s radius already auto-scales."""
+        if self.spin_num_samples.value() != self._auto_samples:
+            return
+        rec = min(self.spin_num_samples.maximum(),
+                  recommended_sample_count(self._base_samples, free_area))
+        self.spin_num_samples.setValue(rec)
+        self._auto_samples = rec
 
 
 class BITStarParamsWidget(QWidget):
@@ -1053,57 +1101,6 @@ class PSOParamsWidget(QWidget):
         }
 
 
-class GeneticParamsWidget(QWidget):
-    """Parameters widget for Genetic Algorithm planner."""
-    
-    def __init__(self):
-        super().__init__()
-        layout = QFormLayout()
-        
-        self.spin_pop_size = QSpinBox()
-        self.spin_pop_size.setRange(10, 200)
-        self.spin_pop_size.setValue(80)
-        self.spin_pop_size.setToolTip("Population size")
-        
-        self.spin_num_points = QSpinBox()
-        self.spin_num_points.setRange(5, 100)
-        self.spin_num_points.setValue(35)
-        self.spin_num_points.setToolTip("Waypoints per path")
-        
-        self.spin_max_iters = QSpinBox()
-        self.spin_max_iters.setRange(50, 5000)
-        self.spin_max_iters.setValue(2000)
-        self.spin_max_iters.setToolTip("Maximum generations")
-        
-        self.spin_mutation_rate = QDoubleSpinBox()
-        self.spin_mutation_rate.setRange(0.01, 0.5)
-        self.spin_mutation_rate.setSingleStep(0.05)
-        self.spin_mutation_rate.setValue(0.2)
-        self.spin_mutation_rate.setToolTip("Mutation rate")
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 10_000_000)
-        self.spin_seed.setValue(42)
-        self.spin_seed.setToolTip("Random seed for reproducibility")
-        
-        layout.addRow("Population:", self.spin_pop_size)
-        layout.addRow("Waypoints:", self.spin_num_points)
-        layout.addRow("Generations:", self.spin_max_iters)
-        layout.addRow("Mutation rate:", self.spin_mutation_rate)
-        layout.addRow("Seed:", self.spin_seed)
-        
-        self.setLayout(layout)
-    
-    def get_params(self) -> dict:
-        return {
-            'pop_size': self.spin_pop_size.value(),
-            'num_points': self.spin_num_points.value(),
-            'max_iters': self.spin_max_iters.value(),
-            'mutation_rate': self.spin_mutation_rate.value(),
-            'seed': self.spin_seed.value(),
-        }
-
-
 PARAM_PANELS: dict[str, type[QWidget]] = {
     'RRT': RRTParamsWidget,
     'RRT-Connect': RRTConnectParamsWidget,
@@ -1124,5 +1121,4 @@ PARAM_PANELS: dict[str, type[QWidget]] = {
     'ITOMP': ITOMPParamsWidget,
     'GPMP': GPMPParamsWidget,
     'PSO': PSOParamsWidget,
-    'Genetic': GeneticParamsWidget,
 }

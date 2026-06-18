@@ -9,8 +9,42 @@ from .base import BasePlanner, StepResult
 
 
 class DijkstraPlanner(BasePlanner):
-    """Dijkstra's Algorithm - Grid-based uniform-cost pathfinding."""
-    
+    """Dijkstra's algorithm - shortest path on an occupancy-grid graph.
+
+    Faithful adaptation of Dijkstra (1959, Numerische Mathematik 1; cite ``Dij59``),
+    *Problem 2* (the minimum-length path between two nodes P and Q).
+
+    Paper correspondence (Problem 2):
+
+    - **Set A** ("nodes whose minimal path from P is known") = ``closed_set``, finalized
+      in order of increasing distance from the start.
+    - **Frontier set B** ("connected to A, one tentative branch each") = the heap plus
+      the ``dist`` map (tentative cost-to-come per node).
+    - **Step 2** ("move the B node of minimum distance from P into A") = the
+      ``heappop`` of the lowest-distance entry -- ``step_once``.
+    - **Step 1** (relaxation: "for each branch from the new A node, replace the tentative
+      branch iff it is shorter") = the neighbour loop ``new = current_dist + cost``;
+      update ``came_from`` / ``dist`` and push when shorter -- ``step_once``.
+    - **Termination:** the search stops when Q (the goal cell) is moved to A (popped).
+    - Stale heap entries (a node already in A) are skipped on pop -- the modern
+      lazy-deletion equivalent of the paper's "one branch per B node, replaced when a
+      shorter one is found".
+
+    Adaptations (stated for fidelity):
+
+    - **Induced coarse grid:** search runs on a ``grid_size``-downsampled grid (a
+      supercell is an obstacle if it contains *any* obstacle pixel; the clicked
+      start/goal cells are forced free). The result is optimal *on this induced grid*,
+      not on the continuous pixel plane.
+    - 8- or 4-connected graph with Euclidean branch lengths
+      ``grid_size * sqrt(dx^2 + dy^2)``; corner-cutting through an occupied orthogonal
+      neighbour is forbidden. Dijkstra is exact on this graph.
+    - The returned path stitches the actual clicked start/goal pixels onto the
+      cell-center polyline.
+
+    See ``literature/fidelity/dijkstra.md`` and ``tests/test_dijkstra_fidelity.py``.
+    """
+
     name = "Dijkstra"
     description = "Grid-based uniform-cost search"
     
@@ -57,11 +91,19 @@ class DijkstraPlanner(BasePlanner):
         self.path_grid: List[Tuple[int, int]] = []
         
     def _get_neighbors(self, pos: Tuple[int, int]) -> List[Tuple[Tuple[int, int], float]]:
+        """The graph branches out of ``pos``: (neighbour, branch length) pairs.
+
+        4- or 8-connected on the induced grid. Branch lengths are Euclidean and scaled
+        by ``grid_size`` (``grid_size * sqrt(dx^2 + dy^2)``, so a diagonal costs sqrt(2)x
+        a straight step). A diagonal is dropped if *either* orthogonal cell it passes
+        between is occupied -- forbidding corner-cutting through an obstacle, which would
+        otherwise let the path squeeze through a diagonal gap a point robot cannot fit.
+        """
         neighbors = []
         directions = [(0, 1), (1, 0), (0, -1), (-1, 0)]
         if self.allow_diagonal:
             directions += [(1, 1), (1, -1), (-1, 1), (-1, -1)]
-        
+
         for dx, dy in directions:
             nx, ny = pos[0] + dx, pos[1] + dy
             if 0 <= nx < self.grid_w and 0 <= ny < self.grid_h:
@@ -76,7 +118,7 @@ class DijkstraPlanner(BasePlanner):
 
                 cost = self.grid_size * np.sqrt(dx*dx + dy*dy)
                 neighbors.append(((nx, ny), cost))
-        
+
         return neighbors
     
     def step_once(self) -> StepResult:
@@ -91,8 +133,12 @@ class DijkstraPlanner(BasePlanner):
             self.done = True
             return StepResult(done=True, found_path=False)
         
+        # Step 2: extract the frontier (B) node of minimum distance from P. It is now
+        # finalized -- its minimal path is known -- so it joins set A below.
         current_dist, current = heapq.heappop(self.open_set)
-        
+
+        # Termination: the goal Q has just been moved to A, so its distance is final;
+        # reconstruct the path by walking came_from back to the start.
         if current == self.goal_grid:
             self.path_grid = [current]
             while current in self.came_from:
@@ -102,12 +148,17 @@ class DijkstraPlanner(BasePlanner):
             self.found_path = True
             self.done = True
             return StepResult(done=True, found_path=True)
-        
+
+        # Lazy deletion: a node already in A was reached again by a stale (longer) heap
+        # entry; skip it. (The paper keeps a single branch per B node; the heap instead
+        # keeps duplicates and discards the obsolete ones here.)
         if current in self.closed_set:
             return StepResult()
-        
-        self.closed_set.add(current)
-        
+
+        self.closed_set.add(current)  # move `current` into set A
+
+        # Step 1: relax every branch out of the node just added to A. If a branch gives a
+        # neighbour a shorter path from P, replace its tentative branch (came_from/dist).
         edges: List[Edge] = []
         for neighbor, cost in self._get_neighbors(current):
             if neighbor in self.closed_set:

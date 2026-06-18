@@ -66,7 +66,6 @@ TUNED = {
     "ITOMP": dict(num_points=30, max_iters=400, seed=1),
     "GPMP": dict(num_points=25, max_iters=400),
     "PSO": dict(num_particles=30, num_points=20, max_iters=150, seed=1),
-    "Genetic": dict(pop_size=40, num_points=20, max_iters=150, seed=1),
 }
 
 # Planners that should always find a path on the simple wall map.

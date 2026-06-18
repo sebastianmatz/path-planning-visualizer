@@ -7,7 +7,6 @@ import numpy as np
 
 from ..geometry import (
     line_collision_free,
-    smooth_display_path,
 )
 from ..types import Edge, Point
 from ._rgg import rgg_radius
@@ -523,11 +522,13 @@ class BITStarPlanner(BasePlanner):
         return path
 
     def extract_display_path(self) -> List[Tuple[float, float]]:
-        path = self.extract_path()
-        if len(path) < 3:
-            return [(float(p[0]), float(p[1])) for p in path]
-        spacing = max(2.0, min(4.0, self.step_size / 4.0))
-        return smooth_display_path(path, self.occ, spacing=spacing, iterations=1)
+        """The genuine BIT* path: the polyline through the tree vertices, unsmoothed.
+
+        Showing the raw path is faithful to the algorithm's output and also avoids the
+        display-only corner grazing that float corner-smoothing could introduce on thin
+        walls (the raw extract_path is collision-free).
+        """
+        return [(float(p[0]), float(p[1])) for p in self.extract_path()]
 
     def extract_tree_edges(self) -> List[Edge]:
         # Served from the incrementally maintained edge map; only rebuilt when the
