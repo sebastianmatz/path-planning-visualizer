@@ -56,9 +56,13 @@ jobs:
           python -m pip install build
           python -m build --wheel
           python - <<'PY'
-          import glob, zipfile
+          import glob, os, zipfile
           whl = glob.glob("dist/*.whl")[0]
-          pngs = [n for n in zipfile.ZipFile(whl).namelist() if n.endswith(".png")]
-          assert len(pngs) == 3, f"expected 3 bundled maps in the wheel, found {pngs}"
-          print("wheel ships assets:", pngs)
+          in_wheel = sorted(os.path.basename(n) for n in zipfile.ZipFile(whl).namelist() if n.endswith(".png"))
+          in_source = sorted(os.path.basename(p) for p in glob.glob("path_planning_visualizer/assets/*.png"))
+          assert in_wheel, "no bundled maps found in the wheel"
+          # Compare against the source assets (not a hard-coded count) so adding/removing a
+          # bundled map never breaks CI, while still catching assets that fail to bundle.
+          assert in_wheel == in_source, f"bundled maps {in_wheel} != source maps {in_source}"
+          print("wheel ships assets:", in_wheel)
           PY
